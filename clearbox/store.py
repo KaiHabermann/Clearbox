@@ -105,6 +105,15 @@ CREATE TABLE IF NOT EXISTS node_files (
 );
 CREATE INDEX IF NOT EXISTS node_files_key ON node_files(key);
 
+-- Earlier nodes (same plan) whose result text this node wants in its prompt.
+-- Not an edge: ordering comes from edges alone; the engine checks reachability.
+CREATE TABLE IF NOT EXISTS node_results_from (
+    plan_id       INTEGER NOT NULL,
+    node_id       INTEGER NOT NULL,
+    from_node_id  INTEGER NOT NULL,
+    PRIMARY KEY (plan_id, node_id, from_node_id)
+);
+
 CREATE TABLE IF NOT EXISTS node_diffs (
     plan_id  INTEGER NOT NULL,
     node_id  INTEGER NOT NULL,
@@ -143,6 +152,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("nodes", "tokens_out", "INTEGER"),
     ("plans", "max_parallel", "INTEGER"),              # NULL = no plan-specific limit (root plans only)
     ("plans", "review_agent_profile_id", "INTEGER"),   # NULL = reviewing is off (the default)
+    ("nodes", "rework_brief", "TEXT"),                 # what the last rework asked for; NULL = never reworked
 ]
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps
@@ -425,6 +435,7 @@ class Store:
                 self._exec("DELETE FROM events WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM edges WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM node_files WHERE plan_id=?", (pid,))
+                self._exec("DELETE FROM node_results_from WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM node_diffs WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM reviews WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM nodes WHERE plan_id=?", (pid,))
@@ -438,12 +449,14 @@ class Store:
         description: str = "",
         agent_profile_id: int | None = None,
         files: list[str] | None = None,
+        results_from: list[int] | None = None,
     ) -> tuple[int, int]:
         with self._lock:
             p = self.get_plan(plan_id)
             if agent_profile_id is not None:
                 self.get_profile(agent_profile_id)
             entries = _normalize_files(files)  # validate before inserting anything
+            from_ids = self._check_results_from(plan_id, results_from)
             nid = p["next_node_id"]
             self._exec("UPDATE plans SET next_node_id=? WHERE id=?", (nid + 1, plan_id))
             self._exec(
@@ -452,6 +465,7 @@ class Store:
                 (plan_id, nid, title, description, agent_profile_id, time.time()),
             )
             self._write_files(plan_id, nid, entries)
+            self._write_results_from(plan_id, nid, from_ids)
             return plan_id, nid
 
     def get_node(self, plan_id: int, node_id: int) -> dict[str, Any]:
@@ -483,6 +497,11 @@ class Store:
             self._exec("DELETE FROM edges WHERE plan_id=? AND (src=? OR dst=?)", (plan_id, node_id, node_id))
             self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM node_files WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            # Both directions: a dangling from_node_id would silently drop context later.
+            self._exec(
+                "DELETE FROM node_results_from WHERE plan_id=? AND (node_id=? OR from_node_id=?)",
+                (plan_id, node_id, node_id),
+            )
             self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM reviews WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, node_id))
@@ -515,6 +534,48 @@ class Store:
         return self._q(
             "SELECT path, key FROM node_files WHERE plan_id=? AND node_id=? ORDER BY key", (plan_id, node_id)
         )
+
+    # ------------------------------------------------------- node results_from
+    def _check_results_from(self, plan_id: int, ids: list[int] | None) -> list[int]:
+        """Dedupe and sort `ids`, rejecting any that is not a node of this plan.
+
+        Only existence is checked here; whether each is a transitive dependency
+        is the engine's call (it owns the edge reachability).
+        """
+        out = sorted({int(i) for i in ids or []})
+        for i in out:
+            if self._one("SELECT 1 FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, i)) is None:
+                raise PlanError(f"results_from: unknown node ({plan_id}, {i})")
+        return out
+
+    def _write_results_from(self, plan_id: int, node_id: int, ids: list[int]) -> None:
+        with self._lock:
+            self._exec("DELETE FROM node_results_from WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            for i in ids:
+                self._exec(
+                    "INSERT INTO node_results_from(plan_id, node_id, from_node_id) VALUES (?,?,?)",
+                    (plan_id, node_id, i),
+                )
+
+    def set_node_results_from(self, plan_id: int, node_id: int, ids: list[int] | None) -> list[int]:
+        """Replace the set of earlier nodes whose result text this node gets (None or [] clears it).
+
+        Only while the node is pending/ready, like set_node_files: the prompt is
+        built when the node starts.
+        """
+        with self._lock:
+            n = self.get_node(plan_id, node_id)
+            if n["status"] not in ("pending", "ready"):
+                raise PlanError(f"node ({plan_id}, {node_id}) is {n['status']}; cannot change its results_from")
+            self._write_results_from(plan_id, node_id, self._check_results_from(plan_id, ids))
+            return self.node_results_from(plan_id, node_id)
+
+    def node_results_from(self, plan_id: int, node_id: int) -> list[int]:
+        rows = self._q(
+            "SELECT from_node_id FROM node_results_from WHERE plan_id=? AND node_id=? ORDER BY from_node_id",
+            (plan_id, node_id),
+        )
+        return [r["from_node_id"] for r in rows]
 
     def files_of_plan_tree(self, root_plan_id: int) -> dict[tuple[int, int], list[dict[str, Any]]]:
         """{(plan_id, node_id): [{path, key}, ...]} for every node in the tree that declares files.

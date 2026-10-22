@@ -30,6 +30,8 @@ async def main():
         cc = (await call("add_node", plan_id=p, title="C"))[1]
         await call("add_edge", plan_id=p, from_node_id=a, to_node_id=b)
         await call("add_edge", plan_id=p, from_node_id=b, to_node_id=cc)
+        # an edge only orders work; B must ask for A's result to be given it
+        await call("set_node_results_from", plan_id=p, node_id=b, node_ids=[a])
         try:
             await call("add_edge", plan_id=p, from_node_id=cc, to_node_id=a); print("FAIL no cycle error")
         except RuntimeError as e:

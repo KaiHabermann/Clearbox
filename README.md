@@ -64,12 +64,13 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 | Tool | What it does |
 | --- | --- |
 | `create_plan(title, description="", parent_plan_id=None, parent_node_id=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. |
-| `add_node(plan_id, title, description="", agent=None, files=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). |
-| `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. |
+| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier nodes whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). |
+| `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
 | `remove_edge`, `remove_node` | Corrections while building. |
-| `update_node(plan_id, node_id, title=None, description=None, files=None)` | Change only what you pass; `files` omitted keeps the current set, `[]` clears it. |
+| `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None)` | Change only what you pass; `files` / `results_from` omitted keeps the current value, `[]` clears it. |
 | `set_node_files(plan_id, node_id, files)` | Replace a node's declared files on their own, without touching title/description; `[]` or `null` clears them. Only before the node has run. |
-| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)). |
+| `set_node_results_from(plan_id, node_id, node_ids)` | Replace the earlier nodes whose result text the node receives; `[]` or `null` clears them. Each must be a node it already depends on through edges. Only before the node has run. |
+| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)) and `results_from`. |
 | `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default). |
 | `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="")` | New agent profile. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
 | `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field, `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
@@ -78,12 +79,13 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 | `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
 | `test_agent(agent)` | Liveness check: for `openai` lists the endpoint's models (falls back to a tiny completion) → `{ok, detail, reachable, model_listed, models_sample, credential}`. |
 | `start_plan(plan_id, executor="builtin" \| "external")`, `stop_plan(plan_id)` | Run / pause a top-level plan. |
-| `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node (with full context). |
+| `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node, with the same prompt a built-in agent would get. |
 | `report_progress(plan_id, node_id, message, kind="text")` | Append to the node's live transcript. |
 | `complete_node(plan_id, node_id, result)`, `fail_node(plan_id, node_id, error)` | Finish a claimed node. |
 | `set_plan_review_agent(plan_id, agent)` | Name (or `null` to clear) the agent profile that automatically reviews this plan's steps and, once it finishes, the plan as a whole; see [Reviewing](#reviewing). |
 | `review_node(plan_id, node_id, agent=None)`, `review_plan(plan_id, agent=None)` | Review a done node's diff, or a finished plan's steps as a whole, right now; `agent` is a one-off override, used for this run only. |
 | `get_reviews(plan_id)` | Every review recorded for this plan: the plan-level one plus each node's verdict and findings. |
+| `rework_node(plan_id, node_id, instructions=None)` | Re-run one finished (`done` or `failed`) step with its review findings, or your `instructions`, in its prompt; dependants are left alone. It is reviewed again by itself afterwards, see [Rework](#rework-closing-the-review-loop). |
 
 ## How execution works
 
@@ -92,8 +94,10 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 * **builtin** executor: the service starts one agent session per ready node (up to
   `--max-concurrency` in total, and up to each agent profile's `max_parallel`), on the harness the
   node's agent profile names (see [Agents and harnesses](#agents-and-harnesses)). The prompt contains the overall goal, the chain of parent nodes for
-  subplans, the other nodes of the plan, and the **results of the prerequisite nodes**. The agent's
-  final message becomes the node's result and is handed downstream.
+  subplans, a one-line list of the other nodes of the plan, the node's own task, its file scope, and
+  **only the earlier results it asked for** (see [Inherited results](#inherited-results-edges-order-results_from-passes)).
+  The agent's final message becomes the node's result; it reaches a later node only if that node
+  requests it.
 * **external** executor: ready nodes wait until something calls `claim_next_node`.
 * **Subplans**: a node with a subplan skips the agent; when it is reached its subplan runs, and the
   node is done once the whole subplan is done (its result summarises the subplan's final nodes).
@@ -115,6 +119,12 @@ same time — in practice they overwrite each other's work. `files` on a node li
 **create or modify**; reading a file never needs declaring, since reads cannot clobber anything.
 Declare nothing and a node behaves exactly as before — no conflicts, no waiting; this is also how
 every plan made before this feature keeps working unchanged.
+
+Declaring `files` buys three things: conflicting nodes are serialized (below), the agent is told its
+scope, and the node gets a **complete diff** for review. Before a node starts, Clearbox snapshots
+every declared path and compares it again when the node finishes, so a change shows up however it
+was made, from the shell as well as from the file tools. A node that declares nothing only gets the
+writes made through its file tools (see [Reviewing](#reviewing)).
 
 Two nodes that could otherwise run at the same time and declare a shared file never actually run
 together: they run one after the other, **lowest node number first**. This spans the whole plan
@@ -152,6 +162,46 @@ dependency edge; a node waiting on one says so in its drawer ("waiting for 3 "Pa
 release `src/parser.py`"), and the drawer's **Files** row lets you view and edit a node's declared
 files directly (disabled once it has started).
 
+### Inherited results: edges order, `results_from` passes
+
+An edge means "runs after" and nothing more. A node starts with **no earlier results** in its prompt
+unless it asks for them with `results_from=[…]`, so every description must be self-contained: what to
+change, where, and any decision an earlier node made that this one has to follow. This is deliberate.
+Predecessor summaries run to hundreds of words each; a node handed three of them spends its budget
+reading them, and then re-verifying them in the code, instead of doing its own task. Most nodes need
+nothing beyond their description.
+
+What a node's prompt contains, in order: the overall goal (plan title and description, plus the parent
+chain for subplans), the other nodes of the plan as one-liners (so nodes don't overlap), the requested
+results, if any, then its own task and its file scope. The requested results are introduced as finished
+work to build on, not to redo.
+
+`results_from` only *passes*; it never orders. A node may only request nodes of its own plan that it
+already depends on, directly or through other nodes — anything else might not have a result yet when
+it runs, and is rejected with a message saying which edge is missing. `add_node` accepts the list
+before the edges exist (you add those next), so the check runs when the edges are known:
+`set_node_results_from`, `update_node` and `start_plan` reject it. Like `files`, it can only change
+while the node is `pending` or `ready`.
+
+The useful pattern: implementation nodes request nothing and start with a short prompt; a final docs or
+summary node depends on all of them and requests every result, writing from them instead of
+rediscovering the work:
+
+```
+store   = add_node(p, "Store: add the column", …, files=["clearbox/store.py"])
+engine  = add_node(p, "Engine: use it", …, files=["clearbox/engine.py"])
+docs    = add_node(p, "Docs", "Document the change in README.md …", files=["README.md"],
+                   results_from=[store[1], engine[1]])
+add_edge(p, store[1], engine[1]); add_edge(p, engine[1], docs[1])   # docs depends on store via engine
+```
+
+REST: `PUT /api/plans/{plan_id}/nodes/{node_id}/results-from` (body `{"node_ids": [...]}`), and
+`GET /api/plans/{plan_id}/nodes/{node_id}/context` → `{"context": "…"}`, the exact prompt the node gets,
+built from the plan as it is now (for a node that already ran: what it got, unless the plan changed
+since). In the UI, the node drawer's **Inherits results from** row shows and edits the list (checkboxes
+offer only the node's dependencies; editable while pending or ready), the **Depends on** row is marked
+"ordering only", and the collapsed **Prompt** block shows that same context.
+
 ## Reviewing
 
 Reviewing is a second, separate layer on top of execution: it never edits anything, never fails a
@@ -165,9 +215,16 @@ There are two levels, deliberately kept apart so each stays inside a context it 
 * **Step review** (`review_node` / `POST /api/plans/{id}/nodes/{node_id}/review`): once a node is
   `done`, a reviewer looks at *that node's* captured diff against *that node's* task description —
   one diff, one task, nothing else. It runs in the background after the node has already finished,
-  so it never delays whatever depends on it. The diff comes only from the file tools (`write_file`,
-  `edit_file`, the Claude harness's own edit tools); anything a node wrote through `bash` is
-  invisible to it, and the reviewer is told to say so rather than assume the diff is complete.
+  so it never delays whatever depends on it. The diff has two sources: a snapshot of the node's
+  declared `files` taken before it starts, compared again when it finishes (directories are walked,
+  so added and deleted files show up too), plus every write the node makes through the file tools
+  (`write_file`, `edit_file`, the Claude harness's own edit tools). Within the declared scope the
+  diff is therefore complete, including changes made through `bash`, `sed -i` or a heredoc; outside
+  it, and for a node that declares nothing, it is best-effort and covers file-tool writes only. The
+  reviewer is told which case applies, so it can treat a missing change in the declared scope as
+  not made and stays cautious elsewhere. Agents are still asked to edit through the file tools: those
+  edits show up in the transcript as reviewable steps, and they are the only ones captured outside
+  the declared scope.
 * **Plan review** (`review_plan` / `POST /api/plans/{id}/review`): once every node in the tree is
   done, one reviewer looks at the plan as a whole — every node's title, description, result and
   step-review verdict — and asks what was missed, contradicted or left out across steps. This is
@@ -181,6 +238,37 @@ reviewing existed can still be reviewed after the fact. `get_reviews(plan_id)` /
 `GET /api/plans/{id}` read every verdict and finding back. The intended loop: read the plan-level
 review's oversights, then turn each one into a follow-up node (or plan) rather than editing by
 hand — reviews describe gaps, they don't fill them.
+
+### Rework: closing the review loop
+
+For a single step, the loop closes in place: **step runs → step review → rework with the findings →
+automatic re-review**. `rework_node(plan_id, node_id, instructions=None)` (MCP) /
+`POST /api/plans/{id}/nodes/{node_id}/rework` (body `{"instructions": "…"}`, optional) re-runs that
+one node's agent. Its prompt is the node's normal context plus a final **REWORK** section: the
+previous attempt is already in the working tree, so do not redo the step from scratch, address
+exactly what is listed and change only what that needs. What is listed is your `instructions`
+or, if you leave them out, the review's verdict, summary and findings. "Re-run this step and fix X"
+works without any review too. With neither instructions nor a review the call is refused; use
+retry or a new node instead.
+
+* **Always explicit.** Nothing in Clearbox re-runs a node because a review disliked it. Reviews stay
+  advisory, and a rework is always something a person or a planning model asked for.
+* **One node only.** Only a `done` or `failed` node can be reworked. A running one has to be stopped
+  first, and a node that wraps a subplan is refused: rework a step inside it instead. Nodes that depend on it are
+  **not** reset or re-run, even though they may have built on the old output. That limit is
+  deliberate: cascading resets would discard finished work that may be fine, and deciding what
+  needs redoing is a judgement for whoever asked for the rework. The node view lists its
+  `started_dependants` (direct dependants that already ran or are running), and the UI warns when
+  some are done, so you know what you are choosing. If they need redoing, rework them too or add
+  follow-up nodes.
+* **Re-review by itself.** A rework is just another run of the node: its transcript, token counters,
+  diff and file locks reset as on any start, and it finishes through the normal path. So if the plan
+  has a review agent and the run captured a diff, a new step review is queued with no extra trigger.
+  Read it with `get_reviews` and repeat if needed. Without a review agent, trigger one with
+  `review_node`.
+
+The brief stays on the node as `rework_brief` after the run (so a retry of a failed rework still
+carries it); the next rework replaces it, and **Reset** clears it.
 
 ## Agents and harnesses
 
@@ -324,7 +412,8 @@ the whole flow can be watched for free.
   layer that share a declared file are nudged down a step each and joined by a dashed connector —
   the file stagger, see [File scoping](#file-scoping-avoiding-clobbered-edits).
 * Click a node: task, prerequisites, result/error, the **agent** that runs it (with where that
-  came from, and a select to override it), the **Files** row (its declared paths, which other nodes
+  came from, and a select to override it), **Inherits results from** and the **Prompt** block (the
+  exact prompt it gets, see [Inherited results](#inherited-results-edges-order-results_from-passes)), the **Files** row (its declared paths, which other nodes
   share one, and — while waiting — which node to wait for) and the **live agent session**
   (messages, thinking, tool calls with their results, final result with turns / time / cost).
 * Nodes whose agent differs from the plan's default carry a coloured chip naming it; a dot marks
@@ -335,6 +424,10 @@ the whole flow can be watched for free.
   **Review** tab shows the verdict, summary and findings and a button to (re-)review it on demand.
   A review chip next to the plan status does the same for the plan-level review, see
   [Reviewing](#reviewing).
+* **⟲ Rework this step** (in the Review tab and the drawer of a finished step) opens a box
+  pre-filled with the review's findings. Edit it or clear it to fall back on the findings, then
+  **Re-run with these instructions**. A line warns when later steps that depend on it are already
+  done and will not be re-run, see [Rework](#rework-closing-the-review-loop).
 * URLs are deep-linkable: `/#/plan/2/node/3`, `/#/agents`, `/#/agents/4`.
 
 ## Developing Clearbox with Clearbox

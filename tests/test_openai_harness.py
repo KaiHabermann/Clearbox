@@ -29,12 +29,19 @@ async def run(fake, script, cwd, **params):
     # contract checks that hold for every run
     kinds = [k for k, _ in events]
     assert kinds[0] == "system" and kinds.count("result") == 1 and kinds[-1] == "result", kinds
+    # "usage" is a per-turn token delta the engine folds into the node's live counters rather
+    # than a transcript entry, so it is checked on its own and kept out of the sequence below
+    for k, d in events:
+        if k == "usage":
+            assert {"tokens_in", "tokens_out"} <= set(d), d
+    kinds = [k for k in kinds if k != "usage"]
     dumped = json.dumps(events)  # must be JSON-serialisable
     assert "Traceback" not in dumped and SECRET not in dumped, dumped
     for k, d in events:
         if k == "tool_result":
             assert {"tool_use_id", "content", "is_error", "parent_tool_use_id"} <= set(d), d
-    return kinds, events, events[-1][1]
+    # callers index the event list positionally, so hand back the transcript events only
+    return kinds, [e for e in events if e[0] != "usage"], events[-1][1]
 
 
 def check_failed(res, *needles):
@@ -61,7 +68,7 @@ async def main():
         assert ev[2][1]["tool_use_id"] == ev[1][1]["id"] and not ev[2][1]["is_error"], ev[2]
         assert "hello from the fake model" in ev[4][1]["content"], ev[4]
         assert res["is_error"] is False and res["text"] == "Wrote out/hello.txt and verified it.", res
-        assert res["num_turns"] == 3 and res["prompt_tokens"] == 30, res
+        assert res["num_turns"] == 3 and res["tokens_in"] == 30, res
         assert all(r["stream"] for r in fake.requests)
         tool_msgs = [m for m in fake.requests[1]["messages"] if m["role"] == "tool"]
         assert tool_msgs and tool_msgs[0]["tool_call_id"] == ev[1][1]["id"], fake.requests[1]["messages"]

@@ -119,6 +119,12 @@ class FilesBody(BaseModel):
     files: list[str] = []
 
 
+class ResultsFromBody(BaseModel):
+    """Replace the earlier nodes (same plan, must be dependencies) whose result text a node receives; [] clears."""
+
+    node_ids: list[int] = []
+
+
 class ReviewBody(BaseModel):
     """Optional one-off agent for a manual review trigger; null/omitted falls back to the plan's
     review agent (set with PUT .../review-agent). Used for this run only, it does not change that
@@ -132,6 +138,12 @@ class ReviewAgentBody(BaseModel):
     once it finishes, the plan as a whole. Manual review triggers keep working while this is unset."""
 
     agent: int | str | None = None
+
+
+class ReworkBody(BaseModel):
+    """What a rework should address; null/omitted uses the node's review summary and findings."""
+
+    instructions: str | None = None
 
 
 @dataclass
@@ -281,8 +293,20 @@ def create_app(settings: Settings) -> FastAPI:
             "agent": harnesses.source_for(plan_id, n["node_id"]),
             "agent_override": n.get("agent_profile_id"),
             "review": review_view(scope.reviews.get((plan_id, n["node_id"]))),
+            "results_from": store.node_results_from(plan_id, n["node_id"]),
+            "started_dependants": started_dependants(plan_id, n["node_id"]),
             **file_fields(plan_id, n, scope),
         }
+
+    def started_dependants(plan_id: int, node_id: int) -> list[dict[str, Any]]:
+        """Direct dependants that already ran (or are running) -- what a rework of this node
+        would leave built on its old output."""
+        return store._q(
+            "SELECT n.node_id, n.title, n.status FROM edges e JOIN nodes n "
+            "ON n.plan_id=e.plan_id AND n.node_id=e.dst "
+            "WHERE e.plan_id=? AND e.src=? AND n.status NOT IN ('pending', 'ready') ORDER BY n.node_id",
+            (plan_id, node_id),
+        )
 
     def agent_view(p: dict[str, Any], default_id: int | None, usage: dict[int, int]) -> dict[str, Any]:
         """The only shape an agent profile leaves this API in (public_profile drops api_key)."""
@@ -397,6 +421,14 @@ def create_app(settings: Settings) -> FastAPI:
             "predecessors": store.predecessors(plan_id, node_id),
             "events": store.events(plan_id, node_id, after),
         }
+
+    @app.get("/api/plans/{plan_id}/nodes/{node_id}/context")
+    def get_node_context(plan_id: int, node_id: int) -> dict[str, Any]:
+        """The prompt build_context makes for this node from the plan as it is now."""
+        try:
+            return {"context": engine.build_context(plan_id, node_id)}
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
 
     @app.get("/api/plans/{plan_id}/nodes/{node_id}/diffs")
     def get_node_diffs(plan_id: int, node_id: int) -> dict[str, Any]:
@@ -518,6 +550,20 @@ def create_app(settings: Settings) -> FastAPI:
             raise _err(e) from e
         return {"ok": "retrying"}
 
+    @app.post("/api/plans/{plan_id}/nodes/{node_id}/rework")
+    def rework(plan_id: int, node_id: int, body: ReworkBody | None = None) -> dict[str, Any]:
+        """Re-run this one finished node to address its review findings (or body.instructions).
+
+        Dependants are left as they are; a step review runs again when it finishes if the plan
+        has a review agent. 400 when the node is running or there is nothing to address.
+        """
+        try:
+            engine.rework_node(plan_id, node_id, body.instructions if body else None)
+            n = store.get_node(plan_id, node_id)
+        except PlanError as e:
+            raise _err(e) from e
+        return {"node": node_view(plan_id, n)}
+
     @app.post("/api/plans/{plan_id}/nodes/{node_id}/complete")
     async def complete_node(plan_id: int, node_id: int, body: CompleteBody | None = None) -> dict[str, str]:
         """Stop the node's agent and mark it done, so its dependants start.
@@ -617,6 +663,18 @@ def create_app(settings: Settings) -> FastAPI:
         engine.notify_plan(plan_id)
         # A narrower set can release a held-back node right away.
         engine.kick()
+        return node_view(plan_id, n)
+
+    @app.put("/api/plans/{plan_id}/nodes/{node_id}/results-from")
+    async def set_node_results_from(plan_id: int, node_id: int, body: ResultsFromBody) -> dict[str, Any]:
+        """Replace the earlier nodes whose result text a node receives; only while it is pending or ready."""
+        try:
+            engine.check_results_from(plan_id, node_id, body.node_ids)
+            store.set_node_results_from(plan_id, node_id, body.node_ids)
+            n = store.get_node(plan_id, node_id)
+        except PlanError as e:
+            raise _err(e) from e
+        engine.notify_plan(plan_id)
         return node_view(plan_id, n)
 
     @app.put("/api/plans/{plan_id}/agent")

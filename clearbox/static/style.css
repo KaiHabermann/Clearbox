@@ -239,14 +239,24 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .review-pane { display: flex; flex-direction: column; gap: 8px; }
 .review-running { display: flex; align-items: center; gap: 8px; color: var(--running); font-size: 13px; }
 .spinner-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--running); animation: pulse-dot 1.4s ease-in-out infinite; }
-.review-verdict { display: inline-flex; align-items: center; gap: 6px; font-weight: 650; font-size: 14px; width: fit-content; }
+.review-verdict { display: flex; align-items: center; gap: 6px; font-weight: 650; font-size: 14px; }
 .review-verdict .rv-glyph { font-size: 13px; }
+.review-verdict .copy-review { margin-left: auto; font-weight: 400; font-size: 11.5px; color: var(--muted);
+  background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+.review-verdict .copy-review:hover { color: var(--fg); background: rgba(255,255,255,.05); }
 .review-verdict.ok { color: var(--done); }
 .review-verdict.concerns { color: var(--concerns); }
 .review-verdict.error { color: var(--faint); }
 .review-meta { color: var(--faint); font-size: 12px; }
 .review-summary, .review-findings { white-space: pre-wrap; word-break: break-word; }
 .review-findings { border-top: 1px solid var(--line); padding-top: 8px; }
+#full-review .review-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+/* rework: editable instructions (pre-filled with the findings) before a finished step is re-run */
+.rework-form { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.rework-form textarea { resize: vertical; font-size: 13px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.rework-form textarea:focus { outline: none; border-color: var(--ready); }
+.rework-warn { color: var(--concerns); font-size: 12.5px; }
+.rework-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .diffs-row { display: flex; flex-direction: column; gap: 6px; }
 .diff-file { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .diff-file summary { list-style: none; cursor: pointer; padding: 6px 10px; font-family: var(--mono); font-size: 12px; background: rgba(255,255,255,.02); }
@@ -262,6 +272,12 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .file-item .fshared { font-family: var(--sans); color: var(--muted); font-size: 12px; }
 .nref { color: var(--muted); text-decoration: none; cursor: pointer; }
 .nref:hover { color: var(--text); text-decoration: underline; }
+.hint { color: var(--faint); font-size: 12px; }
+.rf-edit { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; align-items: flex-start; font-size: 12.5px; }
+.rf-opt { display: flex; gap: 6px; align-items: center; color: var(--muted); cursor: pointer; }
+.prompt-block summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.prompt-pre { white-space: pre-wrap; font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; max-height: 360px; overflow: auto; margin: 6px 0 0; }
+#full-info-col .prompt-pre { max-height: none; }
 .files-edit-row { display: flex; gap: 8px; align-items: flex-start; }
 .files-edit-row textarea { flex: 1; resize: vertical; font-family: var(--mono); font-size: 12.5px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 .files-edit-row textarea:disabled { opacity: .5; cursor: not-allowed; }

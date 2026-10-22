@@ -172,18 +172,23 @@ class HarnessRegistry:
 
         A reviewer must never edit files, so its own ``tools``/``permission_mode`` and the
         clearbox MCP tools are ignored here: Claude Agent SDK sessions get ``permission_mode
-        "plan"`` plus a fixed read-only tool list, and OpenAI-compatible ones get the
-        ``"readonly"`` tools preset.
+        "plan"`` plus a fixed tool list, and OpenAI-compatible ones get the ``"readonly"``
+        tools preset.
+
+        Shell access is part of that list because a reviewer has to be able to run the test
+        suite; the prompt forbids using it to change anything, and the node's diff would show
+        it if one tried.
         """
         d = self.defaults
         kind = profile["harness"]
         if kind == "claude-sdk":
             return ClaudeSdkHarness(
                 permission_mode="plan", model=profile.get("model") or d.model, max_turns=d.max_turns,
-                mcp_url=None, allowed_tools=["Read", "Grep", "Glob"],
+                mcp_url=None, allowed_tools=["Read", "Grep", "Glob", "Bash"],
             )
         if kind == "openai":
-            return OpenAiHarness(profile={**profile, "tools": {"preset": "readonly"}}, mcp_url=None)
+            return OpenAiHarness(
+                profile={**profile, "tools": {"preset": "readonly", "allow": ["bash"]}}, mcp_url=None)
         if kind == "mock":
             params = _as_json(profile.get("params"), {}) or {}
             return MockHarness(speed=float(params.get("speed") or d.mock_speed))

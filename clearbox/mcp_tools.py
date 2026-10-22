@@ -231,6 +231,9 @@ Building a plan:
   will CREATE or MODIFY (reads need no declaration). Two nodes that could run at the same time
   and declare the same file then run one after the other, lowest node number first, instead of
   clobbering each other; get_plan shows each node's `conflicts`.
+  Results: an edge only orders work, it passes NOTHING. Nodes start with no earlier results in
+  their prompt, so keep descriptions self-contained; when a node really needs an earlier node's
+  output, list it in results_from=[...] (it must be a node it already depends on via edges).
   4. start_plan(plan_id, executor="builtin") lets the service run an agent per node,
      or executor="external" lets outside agents pick nodes up with claim_next_node.
 
@@ -253,7 +256,10 @@ Reviews (optional, advisory only -- never blocks a node or edits a file):
   review agent set -- diffs are captured for every node regardless, so a finished plan can be
   reviewed after the fact by passing an agent to the trigger. get_reviews(plan_id) reads the
   verdicts and findings back, most useful for turning the plan-level review's oversights into
-  new add_node/add_edge calls.
+  new add_node/add_edge calls. To act on a step review: get_reviews -> decide ->
+  rework_node(plan_id, node_id) re-runs that step with the findings (or your own instructions)
+  -> get_reviews again for the new verdict. Rework is never automatic and never touches
+  dependent nodes.
 """.strip()
 
 
@@ -341,6 +347,7 @@ def build_mcp(engine: Engine) -> MCPServer:
                     "subplan_id": store.subplan_of(plan_id, n["node_id"]),
                     "files": [f["path"] for f in tree.get((plan_id, n["node_id"]), [])],
                     "conflicts": _conflicts(plan_id, n["node_id"], tree, cache),
+                    "results_from": store.node_results_from(plan_id, n["node_id"]),
                     "result": n["result"],
                     "error": n["error"],
                 }
@@ -444,6 +451,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         description: str = "",
         agent: str | int | None = None,
         files: list[str] | None = None,
+        results_from: list[int] | None = None,
     ) -> tuple[int, int]:
         """Add a node (one piece of work) to a plan. Returns (plan_id, node_id).
 
@@ -456,10 +464,16 @@ def build_mcp(engine: Engine) -> MCPServer:
         Example: files=["clearbox/store.py", "tests/"]. Two nodes that could otherwise run in
         parallel and declare the same file run one after the other (lowest node number first)
         instead of editing it at the same time. Nodes without files never wait for each other.
+        results_from (optional): node ids in this plan whose result text this node receives. An edge
+        only means "runs after" and passes NOTHING, so a node starts with no earlier results unless
+        it asks. Most nodes need none; a final documentation or summary node asks for every earlier
+        node. Each one must be a node this node depends on (directly or through other nodes): add
+        those edges too; start_plan refuses a request from a node that is not a dependency.
         """
         profile_id = _profile_id(agent)
         try:
-            ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id, files=files)
+            ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id, files=files,
+                                 results_from=results_from)
         except PlanError as e:
             raise _files_error(plan_id, e) from e
         if files:
@@ -509,14 +523,18 @@ def build_mcp(engine: Engine) -> MCPServer:
         title: str | None = None,
         description: str | None = None,
         files: list[str] | None = None,
+        results_from: list[int] | None = None,
     ) -> str:
-        """Change the title, description and/or declared files of a node; only what you pass changes.
+        """Change the title, description, declared files and/or results_from of a node; only what you
+        pass changes.
 
-        files: omit it (or pass null) to KEEP the node's current files; a list REPLACES the whole
-        set; [] clears it. Files can only change before the node has run. See add_node.
+        files, results_from: omit (or pass null) to KEEP the current value; a list REPLACES it; []
+        clears it. Both can only change before the node has run. See add_node.
         """
         try:
             store.get_node(plan_id, node_id)
+            if results_from is not None:
+                _set_results_from(plan_id, node_id, results_from)
             if files is not None:
                 store.set_node_files(plan_id, node_id, files)
         except PlanError as e:
@@ -545,6 +563,26 @@ def build_mcp(engine: Engine) -> MCPServer:
         engine.kick()  # a cleared or narrowed set may let a held-back node start
         return [f["path"] for f in stored]
 
+    def _set_results_from(plan_id: int, node_id: int, ids: list[int] | None) -> list[int]:
+        engine.check_results_from(plan_id, node_id, ids)
+        return store.set_node_results_from(plan_id, node_id, ids)
+
+    @mcp.tool()
+    def set_node_results_from(plan_id: int, node_id: int, node_ids: list[int] | None) -> list[int]:
+        """Replace the earlier nodes whose result text this node receives; returns the stored ids.
+        [] or null clears it.
+
+        An edge only means "runs after" and passes nothing; ask for a result only when the node
+        needs that output, e.g. a final summary node asking for every earlier node. Each id must be
+        a node this node already depends on through edges. Only for nodes that have not run yet.
+        """
+        try:
+            stored = _set_results_from(plan_id, node_id, node_ids)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.notify_plan(plan_id)
+        return stored
+
     @mcp.tool()
     def get_plan(plan_id: int) -> dict[str, Any]:
         """Return a plan with its nodes (status, results, subplan ids) and edges.
@@ -554,6 +592,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         shows `default_agent` (its plan-wide default, or null). `files` lists the files the node
         declared; `conflicts` the [plan_id, node_id] of other nodes in the plan tree that share one
         of them and could run at the same time -- those run one at a time, lowest number first.
+        `results_from` lists the earlier nodes whose result text the node receives.
         """
         try:
             return _plan_view(plan_id)
@@ -812,6 +851,23 @@ def build_mcp(engine: Engine) -> MCPServer:
             raise ToolError(str(e)) from e
         return {"plan_review": plan_review, "node_reviews": node_reviews}
 
+    @mcp.tool()
+    def rework_node(plan_id: int, node_id: int, instructions: str | None = None) -> str:
+        """Re-run one finished (done or failed) step with its review findings in the prompt, so
+        its agent fixes what the reviewer raised on top of the work already in the tree.
+
+        instructions (optional): what to address instead of the review findings, e.g. "fix X";
+        needed when the node has no review. Only this one step re-runs: nodes that depend on it
+        are left untouched, even if they built on the old output. If the plan has a review agent,
+        the step is reviewed again automatically when the rework finishes -- read the new
+        verdict with get_reviews.
+        """
+        try:
+            engine.rework_node(plan_id, node_id, instructions)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        return f"node ({plan_id}, {node_id}) queued for rework"
+
     # ----------------------------------------------------------- execution
     @mcp.tool()
     def start_plan(plan_id: int, executor: str = "builtin") -> str:
@@ -821,6 +877,11 @@ def build_mcp(engine: Engine) -> MCPServer:
         executor="external": nodes wait to be picked up via claim_next_node.
         """
         try:
+            # add_node takes results_from before the edges exist, so the dependency check waits until here.
+            for pid in store.descendant_plans(plan_id):
+                for n in store.nodes(pid):
+                    if n["status"] in ("pending", "ready"):
+                        engine.check_results_from(pid, n["node_id"], store.node_results_from(pid, n["node_id"]))
             engine.start_plan(plan_id, executor)
         except PlanError as e:
             raise ToolError(str(e)) from e
@@ -837,7 +898,7 @@ def build_mcp(engine: Engine) -> MCPServer:
     def claim_next_node(agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
         """Claim the next ready node of a plan started with executor="external".
 
-        Returns the node with full context (overall goal, prerequisite results, instructions)
+        Returns the node with full context (overall goal, requested earlier results, instructions)
         or null if nothing is ready right now. Optionally restrict to one plan tree.
         """
         try:

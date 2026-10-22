@@ -404,11 +404,46 @@ function renderReviewPane(review, running) {
   }
   const vi = verdictInfo(review.verdict);
   wrap.append(
-    el("div", { class: `review-verdict ${review.verdict}` }, el("span", { class: "rv-glyph" }, vi.glyph), vi.label),
+    el("div", { class: `review-verdict ${review.verdict}` }, el("span", { class: "rv-glyph" }, vi.glyph), vi.label,
+      el("button", { class: "copy-review", title: "copy this review as text",
+        onclick: (e) => copyText(reviewAsText(review), e.target) }, "Copy")),
     el("div", { class: "review-meta" }, [review.agent, review.when && fmtTime(review.when)].filter(Boolean).join(" · ")),
     el("div", { class: "review-summary", html: md(review.summary) }),
     review.findings && el("div", { class: "review-findings", html: md(review.findings) }));
   return wrap;
+}
+
+// Reviews get pasted into a chat to act on, so copy the markdown the reviewer wrote rather than
+// the rendered DOM: the verdict line, the summary and the findings, in that order.
+function reviewAsText(review) {
+  return [
+    `VERDICT: ${review.verdict}`,
+    (review.summary || "").trim(),
+    (review.findings || "").trim(),
+  ].filter(Boolean).join("\n\n");
+}
+
+async function copyText(text, btn) {
+  const done = (ok) => {
+    if (!btn) return;
+    const was = btn.textContent;
+    btn.textContent = ok ? "Copied" : "Copy failed";
+    setTimeout(() => { btn.textContent = was; }, 1400);
+  };
+  try {
+    await navigator.clipboard.writeText(text);
+    done(true);
+  } catch {
+    // clipboard API needs a secure context; plain http://127.0.0.1 counts, but fall back anyway
+    const ta = el("textarea", { style: "position:fixed;opacity:0" });
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+    done(ok);
+  }
 }
 
 // Plan-level review: shown where the plan's own status lives, next to #plan-status. A button-
@@ -881,6 +916,14 @@ function renderFullReview() {
   const s = state.sel, n = state.nodeData;
   if (!s || !n) return;
   box.append(renderReviewPane(n.review, reviewActivity.has(reviewKey(s.plan_id, s.node_id))));
+  if (n.status === "done" && !n.subplan_id) {
+    box.append(el("div", { class: "review-actions" }, reviewButton(s.plan_id, n), reworkButton(s.plan_id, n)));
+    const form = state.fullOpen && reworkForm(s.plan_id, n);
+    if (form) {
+      $("#node-info .rework-form")?.remove();  // drawn in the drawer before the full view opened
+      box.append(form);
+    }
+  }
 }
 function openFullView(push = true) {
   if (!state.sel || state.fullOpen) return;
@@ -968,9 +1011,12 @@ function renderNodeInfo(r) {
   }
   info.append(renderFilesRow(pid, n));
   if (r.predecessors.length) {
-    const titles = r.predecessors.map((p) => { const x = state.data.nodes.find((m) => m.node_id === p); return x ? `[${p}] ${x.title}` : `[${p}]`; });
-    info.append(el("div", {}, el("div", { class: "k" }, "Depends on"), el("div", { class: "v" }, titles.join(", "))));
+    const v = el("div", { class: "v" });
+    r.predecessors.forEach((p, i) => { if (i) v.append(", "); v.append(planNodeLink(pid, p)); });
+    v.append(el("span", { class: "hint" }, " — ordering only: runs after these, receives none of their results"));
+    info.append(el("div", {}, el("div", { class: "k" }, "Depends on"), v));
   }
+  if (!n.subplan_id) info.append(renderResultsFromRow(pid, n), renderPromptRow(pid, n));
   if (n.error) info.append(el("div", {}, el("div", { class: "k" }, "Error"), el("div", { class: "v err" }, n.error)));
   if (n.result) info.append(el("div", {}, el("div", { class: "k" }, "Result"), el("div", { class: "result-box" }, n.result)));
   if (!n.subplan_id) info.append(renderChangesRow(pid, n));
@@ -982,16 +1028,68 @@ function renderNodeInfo(r) {
     title: "stop whatever is working on this node and mark it done, so the nodes after it start",
     onclick: () => completeNode(pid, n),
   }, "✓ Mark done"));
+  let rework = null;
   if (n.status === "done" && !n.subplan_id) {
-    const reviewing = reviewActivity.has(reviewKey(pid, n.node_id));
-    actions.append(el("button", {
-      disabled: reviewing,
-      title: "ask a reviewer agent to check this node's diff against its task, now (uses the plan's review agent unless none is set)",
-      onclick: (e) => { e.target.disabled = true; e.target.textContent = "Reviewing…"; triggerNodeReview(pid, n.node_id); },
-    }, reviewing ? "Reviewing…" : n.review ? "↻ Re-review step" : "Review this step"));
+    actions.append(reviewButton(pid, n), reworkButton(pid, n));
+    if (!state.fullOpen) rework = reworkForm(pid, n);  // in full view the form lives in the Review tab
   }
   if (actions.children.length) info.append(actions);
+  if (rework) info.append(rework);
   relocateForFull();
+}
+
+function reviewButton(pid, n) {
+  const reviewing = reviewActivity.has(reviewKey(pid, n.node_id));
+  return el("button", {
+    disabled: reviewing,
+    title: "ask a reviewer agent to check this node's diff against its task, now (uses the plan's review agent unless none is set)",
+    onclick: (e) => { e.target.disabled = true; e.target.textContent = "Reviewing…"; triggerNodeReview(pid, n.node_id); },
+  }, reviewing ? "Reviewing…" : n.review ? "↻ Re-review step" : "Review this step");
+}
+
+// Rework: re-run a finished step's agent with the review findings (or the user's own
+// instructions) in its prompt. The form is pre-filled with the findings but editable, since the
+// reviewer's wording is often broader than what the user wants fixed. Drafts live in reworkDrafts
+// (present = form open) so they survive the re-renders that SSE events trigger.
+const reworkDrafts = new Map();  // reviewKey -> instructions being edited
+function reworkButton(pid, n) {
+  const key = reviewKey(pid, n.node_id);
+  return el("button", {
+    title: "re-run this step's agent to fix what the review raised (or what you write); the steps after it are not re-run",
+    onclick: () => {
+      if (!reworkDrafts.has(key)) reworkDrafts.set(key, n.review?.findings || "");
+      if (state.fullOpen) setFullTab("review");
+      renderNodeInfo(state.nodeInfoResp);
+    },
+  }, "⟲ Rework this step");
+}
+function reworkForm(pid, n) {
+  const key = reviewKey(pid, n.node_id);
+  if (!reworkDrafts.has(key)) return null;
+  const ta = el("textarea", { rows: 6, placeholder: "what to fix -- leave empty to use the review findings" });
+  ta.value = reworkDrafts.get(key);
+  ta.addEventListener("input", () => reworkDrafts.set(key, ta.value));
+  // every dependant that already started: a running or failed one was built on the output this
+  // rework replaces just as much as a finished one, and REST sends exactly that set
+  const ran = n.started_dependants || [];
+  const stillGoing = ran.filter((d) => d.status === "running").length;
+  return el("div", { class: "rework-form" },
+    el("div", { class: "k" }, "Rework instructions"),
+    ta,
+    ran.length ? el("div", { class: "rework-warn" },
+      `${ran.length} later step${ran.length > 1 ? "s" : ""} (${ran.map((d) => `${d.title} — ${d.status}`).join(", ")}) `
+      + `already ran on the current output and will not be re-run.`
+      + (stillGoing ? ` ${stillGoing === 1 ? "One is" : `${stillGoing} are`} still running right now.` : "")) : null,
+    el("div", { class: "rework-actions" },
+      el("button", { class: "primary", onclick: (e) => { e.target.disabled = true; reworkNode(pid, n.node_id, ta.value.trim()); } }, "Re-run with these instructions"),
+      el("button", { onclick: () => { reworkDrafts.delete(key); renderNodeInfo(state.nodeInfoResp); } }, "Cancel")));
+}
+async function reworkNode(pid, nid, instructions) {
+  try { await post(`/api/plans/${pid}/nodes/${nid}/rework`, { instructions: instructions || null }); }
+  catch (e) { alert(e.message); renderNodeInfo(state.nodeInfoResp); return; }
+  reworkDrafts.delete(reviewKey(pid, nid));
+  await refreshNodeInfo();
+  refreshPlan(); loadPlans();
 }
 
 function nodeLink(ref) {
@@ -1045,6 +1143,68 @@ function renderFilesRow(pid, n) {
   });
   wrap.append(v, el("div", { class: "files-edit-row" }, ta, save), err);
   return wrap;
+}
+
+function planNodeLink(pid, id) {
+  const x = state.data?.nodes.find((m) => m.node_id === id);
+  return nodeLink({ plan_id: pid, node_id: id, title: x ? x.title : "?" });
+}
+// Every node this one transitively depends on, by id: the only nodes results_from may name.
+function ancestorsOf(nodeId) {
+  const seen = new Set(), stack = [nodeId];
+  while (stack.length) {
+    const b = stack.pop();
+    for (const [x, y] of state.data?.edges || []) if (y === b && !seen.has(x)) { seen.add(x); stack.push(x); }
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+// Inherits-results row: which earlier nodes' result text goes into this node's prompt. Empty by
+// default; edges alone pass nothing. Editable while pending/ready, as checkboxes over the node's
+// (transitive) dependencies since those are the only valid choices.
+function renderResultsFromRow(pid, n) {
+  const wanted = n.results_from || [];
+  const v = el("div", { class: "v files-row" });
+  if (!wanted.length) v.append(el("div", { class: "files-empty" }, "none; starts with only its own task"));
+  else {
+    const line = el("div", {});
+    wanted.forEach((id, i) => { if (i) line.append(", "); line.append(planNodeLink(pid, id)); });
+    v.append(line);
+  }
+  const wrap = el("div", {}, el("div", { class: "k" }, "Inherits results from"), v);
+  const editable = n.status === "pending" || n.status === "ready", cands = ancestorsOf(n.node_id);
+  if (!editable || !cands.length) return wrap;
+  const boxes = cands.map((id) => {
+    const x = state.data.nodes.find((m) => m.node_id === id);
+    const cb = el("input", { type: "checkbox", value: id });
+    cb.checked = wanted.includes(id);
+    return el("label", { class: "rf-opt" }, cb, ` [${id}] ${x ? truncate(x.title, 40) : ""}`);
+  });
+  const err = el("div", { class: "fld-err" });
+  const save = el("button", {}, "Save");
+  save.addEventListener("click", async () => {
+    const node_ids = boxes.map((b) => b.firstChild).filter((c) => c.checked).map((c) => +c.value);
+    save.disabled = true; err.textContent = "";
+    try { await put(`/api/plans/${pid}/nodes/${n.node_id}/results-from`, { node_ids }); await refreshPlan(); }
+    catch (e) { err.textContent = e.message; save.disabled = false; }
+  });
+  wrap.append(el("div", { class: "rf-edit" }, ...boxes, save), err);
+  return wrap;
+}
+
+// Prompt row: the exact context string the engine hands this node's agent (build_context),
+// built from the plan as it is now. Collapsed and fetched on open, since it can be long.
+function renderPromptRow(pid, n) {
+  const pre = el("pre", { class: "prompt-pre" }, "loading…");
+  const d = el("details", { class: "prompt-block" }, el("summary", {}, "Show the prompt this node gets"), pre);
+  d.addEventListener("toggle", () => {
+    if (!d.open) return;
+    api(`/api/plans/${pid}/nodes/${n.node_id}/context`).then((r) => {
+      pre.textContent = r.context;
+      d.querySelector("summary").textContent = `Show the prompt this node gets (${r.context.length.toLocaleString()} chars)`;
+    }).catch(() => { pre.textContent = "could not load the prompt"; });
+  });
+  return el("div", {}, el("div", { class: "k" }, "Prompt"), el("div", { class: "v" }, d));
 }
 
 // Changes row: the file diffs captured from this node's Write/Edit/MultiEdit/NotebookEdit tool
