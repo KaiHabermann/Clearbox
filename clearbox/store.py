@@ -112,7 +112,26 @@ CREATE TABLE IF NOT EXISTS node_diffs (
     diff     TEXT NOT NULL,   -- unified diff text; absent files are never stored, not even as empty
     PRIMARY KEY (plan_id, node_id, path)
 );
+
+CREATE TABLE IF NOT EXISTS reviews (
+    plan_id     INTEGER NOT NULL,
+    node_id     INTEGER,            -- NULL = the plan-level review (titles/descriptions/results as a whole)
+    verdict     TEXT NOT NULL,      -- 'ok' | 'concerns' | 'error' (reviewer couldn't form a verdict)
+    summary     TEXT NOT NULL DEFAULT '',
+    findings    TEXT,               -- reviewer's prose, or a JSON list of {severity, file, note}; not over-modeled
+    agent_name  TEXT,
+    tokens_in   INTEGER,
+    tokens_out  INTEGER,
+    created_at  REAL NOT NULL
+);
+-- One row per node and one per plan (node_id NULL); SQLite's PRIMARY KEY can't
+-- enforce that across a nullable column, so two partial unique indexes do it
+-- instead, same trick as plans_parent above.
+CREATE UNIQUE INDEX IF NOT EXISTS reviews_node ON reviews(plan_id, node_id) WHERE node_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS reviews_plan ON reviews(plan_id) WHERE node_id IS NULL;
 """
+
+REVIEW_VERDICTS = ("ok", "concerns", "error")
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS never alters
 # an existing table, so Store._migrate adds whichever of these are missing.
@@ -123,6 +142,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("nodes", "tokens_in", "INTEGER"),                 # NULL = unknown (mock runs, older nodes)
     ("nodes", "tokens_out", "INTEGER"),
     ("plans", "max_parallel", "INTEGER"),              # NULL = no plan-specific limit (root plans only)
+    ("plans", "review_agent_profile_id", "INTEGER"),   # NULL = reviewing is off (the default)
 ]
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps
@@ -406,6 +426,7 @@ class Store:
                 self._exec("DELETE FROM edges WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM node_files WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM node_diffs WHERE plan_id=?", (pid,))
+                self._exec("DELETE FROM reviews WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM nodes WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM plans WHERE id=?", (pid,))
 
@@ -463,6 +484,7 @@ class Store:
             self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM node_files WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            self._exec("DELETE FROM reviews WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, node_id))
 
     # --------------------------------------------------------------- node files
@@ -618,6 +640,47 @@ class Store:
     def clear_node_diffs(self, plan_id: int, node_id: int) -> None:
         self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
 
+    # ---------------------------------------------------------------- reviews
+    def set_review(
+        self,
+        plan_id: int,
+        node_id: int | None,
+        verdict: str,
+        summary: str = "",
+        findings: str | None = None,
+        agent_name: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+    ) -> None:
+        """Record a review, replacing any existing one for this (plan_id, node_id).
+
+        node_id=None is the plan-level review (the whole plan, not one step).
+        """
+        if verdict not in REVIEW_VERDICTS:
+            raise PlanError(f"unknown review verdict {verdict!r}; expected one of {', '.join(REVIEW_VERDICTS)}")
+        with self._lock:
+            self.clear_review(plan_id, node_id)
+            self._exec(
+                "INSERT INTO reviews(plan_id, node_id, verdict, summary, findings, agent_name, tokens_in, "
+                "tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (plan_id, node_id, verdict, summary, findings, agent_name, tokens_in, tokens_out, time.time()),
+            )
+
+    def review(self, plan_id: int, node_id: int | None = None) -> dict[str, Any] | None:
+        if node_id is None:
+            return self._one("SELECT * FROM reviews WHERE plan_id=? AND node_id IS NULL", (plan_id,))
+        return self._one("SELECT * FROM reviews WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+
+    def reviews_of_plan(self, plan_id: int) -> list[dict[str, Any]]:
+        """Every review of this plan: each node's review plus the plan-level one, if present."""
+        return self._q("SELECT * FROM reviews WHERE plan_id=? ORDER BY node_id", (plan_id,))
+
+    def clear_review(self, plan_id: int, node_id: int | None = None) -> None:
+        if node_id is None:
+            self._exec("DELETE FROM reviews WHERE plan_id=? AND node_id IS NULL", (plan_id,))
+        else:
+            self._exec("DELETE FROM reviews WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+
     # ----------------------------------------------------------- agent profiles
     @staticmethod
     def _profile_row(r: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -694,6 +757,9 @@ class Store:
             self._exec(
                 "UPDATE plans SET default_agent_profile_id=NULL WHERE default_agent_profile_id=?", (profile_id,)
             )
+            self._exec(
+                "UPDATE plans SET review_agent_profile_id=NULL WHERE review_agent_profile_id=?", (profile_id,)
+            )
             self._exec("DELETE FROM agent_profiles WHERE id=?", (profile_id,))
 
     def set_node_profile(self, plan_id: int, node_id: int, profile_id: int | None) -> None:
@@ -709,6 +775,14 @@ class Store:
             if profile_id is not None:
                 self.get_profile(profile_id)
             self._exec("UPDATE plans SET default_agent_profile_id=? WHERE id=?", (profile_id, plan_id))
+
+    def set_plan_review_agent(self, plan_id: int, profile_id: int | None) -> None:
+        """Set the agent that reviews this plan's steps; None (the default) turns reviewing off."""
+        with self._lock:
+            self.get_plan(plan_id)
+            if profile_id is not None:
+                self.get_profile(profile_id)
+            self._exec("UPDATE plans SET review_agent_profile_id=? WHERE id=?", (profile_id, plan_id))
 
     def profile_for_node(self, plan_id: int, node_id: int) -> dict[str, Any] | None:
         """The profile that should run a node, or None (= use the server-wide default).

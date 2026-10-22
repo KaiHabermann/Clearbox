@@ -81,6 +81,9 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 | `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node (with full context). |
 | `report_progress(plan_id, node_id, message, kind="text")` | Append to the node's live transcript. |
 | `complete_node(plan_id, node_id, result)`, `fail_node(plan_id, node_id, error)` | Finish a claimed node. |
+| `set_plan_review_agent(plan_id, agent)` | Name (or `null` to clear) the agent profile that automatically reviews this plan's steps and, once it finishes, the plan as a whole; see [Reviewing](#reviewing). |
+| `review_node(plan_id, node_id, agent=None)`, `review_plan(plan_id, agent=None)` | Review a done node's diff, or a finished plan's steps as a whole, right now; `agent` is a one-off override, used for this run only. |
+| `get_reviews(plan_id)` | Every review recorded for this plan: the plan-level one plus each node's verdict and findings. |
 
 ## How execution works
 
@@ -148,6 +151,36 @@ joined by a dashed connector, so the stagger is visible at a glance even though 
 dependency edge; a node waiting on one says so in its drawer ("waiting for 3 "Parse config" to
 release `src/parser.py`"), and the drawer's **Files** row lets you view and edit a node's declared
 files directly (disabled once it has started).
+
+## Reviewing
+
+Reviewing is a second, separate layer on top of execution: it never edits anything, never fails a
+node and never blocks a dependent — it only records a verdict (`ok` | `concerns` | `error`) and
+findings for a human to act on. Reviewing is **off** for a plan until it names a review agent with
+`set_plan_review_agent` (MCP) / `PUT /api/plans/{id}/review-agent`; a plan that never sets one
+behaves exactly as it did before reviewing existed, and nobody pays for review tokens by accident.
+
+There are two levels, deliberately kept apart so each stays inside a context it can actually judge:
+
+* **Step review** (`review_node` / `POST /api/plans/{id}/nodes/{node_id}/review`): once a node is
+  `done`, a reviewer looks at *that node's* captured diff against *that node's* task description —
+  one diff, one task, nothing else. It runs in the background after the node has already finished,
+  so it never delays whatever depends on it. The diff comes only from the file tools (`write_file`,
+  `edit_file`, the Claude harness's own edit tools); anything a node wrote through `bash` is
+  invisible to it, and the reviewer is told to say so rather than assume the diff is complete.
+* **Plan review** (`review_plan` / `POST /api/plans/{id}/review`): once every node in the tree is
+  done, one reviewer looks at the plan as a whole — every node's title, description, result and
+  step-review verdict — and asks what was missed, contradicted or left out across steps. This is
+  explicitly **not** a code review: it never reads diffs or source, only reads what the step
+  reviews and results already say.
+
+Both levels run automatically once `set_plan_review_agent` names an agent (the plan review fires
+once, right after the last node completes), and both can also be triggered on demand with an
+optional one-off `agent=` override, whether or not the plan has one set — so a plan finished before
+reviewing existed can still be reviewed after the fact. `get_reviews(plan_id)` /
+`GET /api/plans/{id}` read every verdict and finding back. The intended loop: read the plan-level
+review's oversights, then turn each one into a follow-up node (or plan) rather than editing by
+hand — reviews describe gaps, they don't fill them.
 
 ## Agents and harnesses
 
@@ -298,6 +331,10 @@ the whole flow can be watched for free.
   an override set on the node itself. The topbar sets the plan's default agent.
 * **Agents** in the sidebar manages the profiles: add one, pick its harness, model, endpoint and
   key, choose its toolset, cap its parallelism, and **Test connection** before trusting it.
+* A reviewed node carries a small verdict marker (✓ / ! / ?) in its top-right corner; its full-view
+  **Review** tab shows the verdict, summary and findings and a button to (re-)review it on demand.
+  A review chip next to the plan status does the same for the plan-level review, see
+  [Reviewing](#reviewing).
 * URLs are deep-linkable: `/#/plan/2/node/3`, `/#/agents`, `/#/agents/4`.
 
 ## Developing Clearbox with Clearbox

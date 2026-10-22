@@ -27,8 +27,10 @@
     <header id="topbar">
       <nav id="crumbs"></nav>
       <span id="plan-status" class="pill"></span>
+      <span id="plan-review" class="menu"></span>
       <span id="plan-workdir" class="workdir-ctl"></span>
       <span id="plan-agent" class="agent-ctl"></span>
+      <span id="plan-review-agent" class="agent-ctl"></span>
       <div class="spacer"></div>
       <div id="controls"></div>
     </header>
@@ -93,6 +95,7 @@
         <button class="ftab" data-tab="task" role="tab" title="task, agent and result (1)">Task</button>
         <button class="ftab" data-tab="changes" role="tab" title="file diffs (2)">Changes</button>
         <button class="ftab" data-tab="output" role="tab" title="agent session (3)">Agent output</button>
+        <button class="ftab" data-tab="review" role="tab" title="review verdict and findings (4)">Review</button>
       </div>
       <div class="spacer"></div>
       <button id="full-exit" class="close" title="exit full screen (Esc)">⤡ Exit full screen</button>
@@ -104,6 +107,7 @@
         <div id="full-diff"></div>
       </section>
       <section class="fpane" data-pane="output"><div id="full-transcript-col"></div></section>
+      <section class="fpane" data-pane="review"><div id="full-review"></div></section>
     </div>
   </div>
 

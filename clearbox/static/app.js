@@ -26,6 +26,22 @@ const state = {
   nodeInfoResp: null,  // last /nodes/:id response, used to rebuild #node-info when full view closes
 };
 
+// ----------------------------------------------------------------- reviews
+// A review (per-node or, with node_id 0, per-plan) is advisory: verdict/summary/findings written
+// by a separate reviewer agent, never blocking or editing anything. Manual triggers (POST
+// .../review) await the finished review and return it directly; the engine's own automatic
+// reviews run in the background and are only visible through review-tagged transcript events
+// (data.review === true, same plan_id/node_id as the thing being reviewed, node_id 0 for a
+// plan-level review) -- reviewActivity tracks those so the UI can say "running" meanwhile.
+const reviewActivity = new Set();
+const reviewKey = (planId, nodeId) => `${planId}:${nodeId}`;
+const VERDICT_INFO = {
+  ok: { glyph: "✓", label: "ok" },
+  concerns: { glyph: "!", label: "concerns" },
+  error: { glyph: "?", label: "couldn't review" },
+};
+function verdictInfo(v) { return VERDICT_INFO[v] || { glyph: "?", label: v }; }
+
 // ------------------------------------------------------------------ utils
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function el(tag, attrs = {}, ...kids) {
@@ -236,7 +252,7 @@ const loadPlansSoon = debounce(loadPlans, 400);
 function renderEmpty(html) {
   $("#nodes").innerHTML = ""; $("#edges").innerHTML = "";
   const e = $("#empty"); e.innerHTML = html; e.classList.remove("hidden");
-  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-workdir").innerHTML = "";
+  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-review-agent").innerHTML = ""; $("#plan-review").innerHTML = ""; $("#plan-workdir").innerHTML = "";
 }
 
 // Working-directory pill: shows the resolved directory (hover for the full path), clickable to
@@ -312,6 +328,22 @@ function renderHeader() {
     agentSelect(own, own == null && eff ? `— ${inherit}: ${eff.name} —` : `— ${inherit} —`,
       async (id) => { await put(`/api/plans/${d.plan.id}/agent`, { agent: id }); await refreshPlan(); }));
 
+  // reviewer agent: off unless set here (or, for a subplan, on an ancestor -- the API has no
+  // resolved "effective reviewer" the way it does for the default agent, so that case is only
+  // hinted at, not named)
+  const ra = $("#plan-review-agent");
+  ra.innerHTML = "";
+  const revOwn = d.review_agent_profile_id ?? null;
+  const revAgent = revOwn != null ? state.agents.find((p) => p.id === revOwn) : null;
+  ra.className = `agent-ctl${revOwn == null ? " review-off" : ""}`;
+  ra.title = "Agent that reviews this plan's finished steps, and the plan as a whole once it is done. Advisory only -- it never blocks or edits anything."
+    + (revOwn == null ? (d.ancestors.length ? "\nOff here (may still be set on an ancestor plan)." : "\nOff: this plan is not reviewed.") : `\nNow: ${revAgent ? revAgent.name : `profile #${revOwn}`}`);
+  ra.append(el("i", { class: "hsw" }), el("span", { class: "lbl" }, revOwn == null ? "Review: off" : "Review agent"),
+    agentSelect(revOwn, d.ancestors.length ? "— off (or inherited) —" : "— off —",
+      async (id) => { await put(`/api/plans/${d.plan.id}/review-agent`, { agent: id }); await refreshPlan(); }));
+
+  renderPlanReview(d);
+
   const c = $("#controls");
   c.innerHTML = "";
   const rid = d.root.id;
@@ -358,6 +390,63 @@ function renderHeader() {
 async function act(p) {
   try { await p; } catch (e) { alert(e.message); }
   refreshPlan(); loadPlans();
+}
+
+// Shared body for a review's verdict/summary/findings, used by the full-view Review tab and the
+// plan-level review popover. `review` is the {verdict, summary, findings, agent, when} shape from
+// review_view(), or null if nothing has run yet.
+function renderReviewPane(review, running) {
+  const wrap = el("div", { class: "review-pane" });
+  if (running) wrap.append(el("div", { class: "review-running" }, el("i", { class: "spinner-dot" }), "Review running…"));
+  if (!review) {
+    if (!running) wrap.append(el("div", { class: "files-empty" }, "Not reviewed yet."));
+    return wrap;
+  }
+  const vi = verdictInfo(review.verdict);
+  wrap.append(
+    el("div", { class: `review-verdict ${review.verdict}` }, el("span", { class: "rv-glyph" }, vi.glyph), vi.label),
+    el("div", { class: "review-meta" }, [review.agent, review.when && fmtTime(review.when)].filter(Boolean).join(" · ")),
+    el("div", { class: "review-summary", html: md(review.summary) }),
+    review.findings && el("div", { class: "review-findings", html: md(review.findings) }));
+  return wrap;
+}
+
+// Plan-level review: shown where the plan's own status lives, next to #plan-status. A button-
+// triggered popover (same pattern as the Start menu) since findings need room to be read, not a pill.
+function renderPlanReview(d) {
+  const box = $("#plan-review");
+  box.innerHTML = "";
+  const key = reviewKey(d.plan.id, 0), running = reviewActivity.has(key), rv = d.review;
+  const vi = rv && verdictInfo(rv.verdict);
+  const cls = running ? "running" : rv ? rv.verdict : "none";
+  const label = running ? "reviewing…" : rv ? `plan review: ${vi.label}` : "plan: not reviewed";
+  const pop = el("div", { class: "menu-pop review-pop hidden" },
+    renderReviewPane(rv, running),
+    el("div", { class: "review-actions" },
+      el("button", { disabled: running, onclick: (e) => { e.stopPropagation(); triggerPlanReview(d.plan.id); } },
+        running ? "Reviewing…" : rv ? "↻ Re-review plan" : "Review plan now")));
+  const btn = el("button", { class: `review-chip ${cls}`, title: "Review this plan as a whole for oversights -- titles, descriptions and results, never diffs or source.",
+    onclick: (e) => { e.stopPropagation(); pop.classList.toggle("hidden"); } },
+    el("span", { class: "rv-glyph" }, running ? "" : vi ? vi.glyph : "–"), label);
+  box.append(btn, pop);
+}
+
+async function triggerPlanReview(planId) {
+  reviewActivity.add(reviewKey(planId, 0));
+  if (state.data && state.data.plan.id === planId) renderPlanReview(state.data);
+  try { await post(`/api/plans/${planId}/review`); }
+  catch (e) { alert(e.message); }
+  finally { reviewActivity.delete(reviewKey(planId, 0)); }
+  if (state.planId === planId) await refreshPlan(); else loadPlans();
+}
+
+async function triggerNodeReview(planId, nodeId) {
+  reviewActivity.add(reviewKey(planId, nodeId));
+  renderFullReview();
+  try { await post(`/api/plans/${planId}/nodes/${nodeId}/review`); }
+  catch (e) { alert(e.message); }
+  finally { reviewActivity.delete(reviewKey(planId, nodeId)); }
+  if (state.sel && state.sel.plan_id === planId && state.sel.node_id === nodeId) await refreshNodeInfo();
 }
 
 // ---------------------------------------------------------------- layout
@@ -617,6 +706,17 @@ function renderGraph() {
     else if (n.status === "done") g.append(el("svg:path", { class: "check", d: `M${gx - 6},${gy} l4,4 l8,-8` }));
     else if (bb) g.append(el("svg:path", { class: "waitglyph", d: `M${gx},${gy - 4} v4 l3,2 M${gx + 7},${gy} a7,7 0 1,1 -14,0 a7,7 0 1,1 14,0` }));
     else if (n.status === "failed") g.append(el("svg:path", { class: "cross", d: `M${gx - 5},${gy - 5} l10,10 M${gx + 5},${gy - 5} l-10,10` }));
+
+    // review marker: quiet for ok, a plainer badge for concerns (advice, not a failure -- a
+    // failed node already has its own red state); nothing at all when the node has no review
+    if (n.review) {
+      const vi = verdictInfo(n.review.verdict), rx = NODE_W - 16, ry = 34;
+      const rg = el("svg:g", { class: `review-mark ${n.review.verdict}` },
+        el("svg:title", {}, `review (${vi.label}): ${n.review.summary}`),
+        el("svg:circle", { cx: rx, cy: ry, r: 6 }),
+        el("svg:text", { x: rx, y: ry + 3.5, "text-anchor": "middle" }, vi.glyph));
+      g.append(rg);
+    }
     gN.append(g);
     if (chip) {  // size the pill to its rendered text, never past the status glyph
       const t = chip.querySelector("text"), pad = +t.getAttribute("x") - 16;
@@ -706,7 +806,7 @@ const drawerSlots = {
 const drawerHome = new Map(Object.values(drawerSlots).map((el) => [el, { parent: el.parentNode, next: el.nextSibling }]));
 
 // Changes tab: file list on the left, the selected file's diff filling the rest of the screen.
-const FULL_TABS = ["task", "changes", "output"];
+const FULL_TABS = ["task", "changes", "output", "review"];
 function setFullTab(tab) {
   if (!FULL_TABS.includes(tab)) return;
   state.fullTab = tab;
@@ -768,6 +868,19 @@ async function loadFullChanges(pid, nodeId) {
 }
 function relocateForFull() {
   if (state.fullOpen && state.sel) loadFullChanges(state.sel.plan_id, state.sel.node_id);
+  renderFullReview();
+}
+
+// Review tab: verdict/summary/findings for the selected node, straight from state.nodeData (no
+// extra fetch -- node_view already carries it), plus a running indicator for an automatic review
+// still in flight (tracked in reviewActivity from review-tagged transcript events).
+function renderFullReview() {
+  const box = $("#full-review");
+  if (!box) return;
+  box.innerHTML = "";
+  const s = state.sel, n = state.nodeData;
+  if (!s || !n) return;
+  box.append(renderReviewPane(n.review, reviewActivity.has(reviewKey(s.plan_id, s.node_id))));
 }
 function openFullView(push = true) {
   if (!state.sel || state.fullOpen) return;
@@ -804,7 +917,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeFullView(); return; }
   if (e.key === "ArrowLeft" || e.key === "k") { e.preventDefault(); navFull(-1); }
   else if (e.key === "ArrowRight" || e.key === "j") { e.preventDefault(); navFull(1); }
-  else if (e.key >= "1" && e.key <= "3") { e.preventDefault(); setFullTab(FULL_TABS[+e.key - 1]); }
+  else if (e.key >= "1" && e.key <= "4") { e.preventDefault(); setFullTab(FULL_TABS[+e.key - 1]); }
 });
 
 async function refreshNodeInfo(withEvents = false) {
@@ -869,6 +982,14 @@ function renderNodeInfo(r) {
     title: "stop whatever is working on this node and mark it done, so the nodes after it start",
     onclick: () => completeNode(pid, n),
   }, "✓ Mark done"));
+  if (n.status === "done" && !n.subplan_id) {
+    const reviewing = reviewActivity.has(reviewKey(pid, n.node_id));
+    actions.append(el("button", {
+      disabled: reviewing,
+      title: "ask a reviewer agent to check this node's diff against its task, now (uses the plan's review agent unless none is set)",
+      onclick: (e) => { e.target.disabled = true; e.target.textContent = "Reviewing…"; triggerNodeReview(pid, n.node_id); },
+    }, reviewing ? "Reviewing…" : n.review ? "↻ Re-review step" : "Review this step"));
+  }
   if (actions.children.length) info.append(actions);
   relocateForFull();
 }
@@ -1326,6 +1447,15 @@ function connect() {
       }
     } else if (msg.type === "event") {
       const ev = msg.event;
+      if (ev.data && ev.data.review) {
+        // an automatic review's own transcript, tagged so it can be told apart from the node's
+        // own run: "running" from its first event to its tagged result, which is written to the
+        // store just before this arrives
+        const key = reviewKey(ev.plan_id, ev.node_id);
+        if (ev.kind === "result") reviewActivity.delete(key); else reviewActivity.add(key);
+        if (ev.node_id === 0 && state.data && state.data.plan.id === ev.plan_id) renderPlanReview(state.data);
+        else if (state.sel && ev.plan_id === state.sel.plan_id && ev.node_id === state.sel.node_id) renderFullReview();
+      }
       if (state.sel && ev.plan_id === state.sel.plan_id && ev.node_id === state.sel.node_id) {
         $("#transcript .typing")?.remove();
         appendEvent(ev);

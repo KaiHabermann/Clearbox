@@ -13,6 +13,7 @@
   --running: #f2b84b;
   --done: #4cc38a;
   --failed: #ef5f5f;
+  --concerns: #e0a93d;  /* review verdict: advice, not a failure -- amber, not red */
   --files: #7d86a0;   /* shares-files connector between staggered nodes */
 
   /* harness colours: agent chips, legend, transcript header */
@@ -112,6 +113,20 @@ button.danger:hover { border-color: var(--failed); color: var(--failed); }
 .workdir-input:focus { outline: none; border-color: var(--ready); }
 .workdir-err { color: var(--failed); font-size: 11.5px; }
 .agent-ctl .hsw { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--hc, var(--faint)); }
+.agent-ctl.review-off { opacity: .7; }
+.agent-ctl.review-off .hsw { background: var(--faint); }
+
+/* plan-level review: a button next to #plan-status (pill text is too narrow for findings), opening
+   a popover with the full verdict/summary/findings, same pattern as the Start menu */
+.review-chip { font-size: 12px; padding: 2px 10px; border-radius: 99px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.review-chip .rv-glyph { font-weight: 700; }
+.review-chip.ok { color: var(--done); border-color: rgba(76,195,138,.4); }
+.review-chip.concerns { color: var(--concerns); border-color: color-mix(in srgb, var(--concerns) 50%, transparent); }
+.review-chip.error { color: var(--faint); }
+.review-chip.running { color: var(--running); border-color: rgba(242,184,75,.4); }
+.review-pop { width: 340px; max-height: 60vh; overflow: auto; padding: 10px; }
+.review-actions { padding: 6px 2px 2px; }
+.review-actions button { width: auto; display: inline-block; }
 select.agent-sel { font: inherit; font-size: 12px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px; padding: 3px 6px; max-width: 230px; }
 select.agent-sel:hover:not(:disabled) { border-color: var(--faint); }
 select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
@@ -185,6 +200,16 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .check { fill: none; stroke: var(--done); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
 .cross { fill: none; stroke: var(--failed); stroke-width: 2.2; stroke-linecap: round; }
 
+/* review marker: quiet tick for ok, a plainer badge for concerns -- advisory, never a failure state */
+.review-mark circle { fill: var(--panel); stroke-width: 1.4; }
+.review-mark text { font-size: 9px; font-weight: 700; text-anchor: middle; }
+.review-mark.ok circle { stroke: rgba(76,195,138,.5); }
+.review-mark.ok text { fill: var(--done); }
+.review-mark.concerns circle { fill: color-mix(in srgb, var(--concerns) 18%, var(--panel)); stroke: var(--concerns); }
+.review-mark.concerns text { fill: var(--concerns); }
+.review-mark.error circle { stroke: var(--faint); }
+.review-mark.error text { fill: var(--faint); }
+
 /* ----------------------------------------------------------------- drawer */
 #drawer {
   width: 460px; flex: none; background: var(--panel); border-left: 1px solid var(--line);
@@ -209,6 +234,19 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 #node-info .result-box { background: rgba(76,195,138,.07); border: 1px solid rgba(76,195,138,.25); border-radius: 8px; padding: 8px 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
 .files-row { display: flex; flex-direction: column; gap: 4px; }
 .files-empty { color: var(--faint); font-size: 12.5px; }
+
+/* a review's verdict/summary/findings: shared by the full-view Review tab and the plan-level popover */
+.review-pane { display: flex; flex-direction: column; gap: 8px; }
+.review-running { display: flex; align-items: center; gap: 8px; color: var(--running); font-size: 13px; }
+.spinner-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--running); animation: pulse-dot 1.4s ease-in-out infinite; }
+.review-verdict { display: inline-flex; align-items: center; gap: 6px; font-weight: 650; font-size: 14px; width: fit-content; }
+.review-verdict .rv-glyph { font-size: 13px; }
+.review-verdict.ok { color: var(--done); }
+.review-verdict.concerns { color: var(--concerns); }
+.review-verdict.error { color: var(--faint); }
+.review-meta { color: var(--faint); font-size: 12px; }
+.review-summary, .review-findings { white-space: pre-wrap; word-break: break-word; }
+.review-findings { border-top: 1px solid var(--line); padding-top: 8px; }
 .diffs-row { display: flex; flex-direction: column; gap: 6px; }
 .diff-file { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .diff-file summary { list-style: none; cursor: pointer; padding: 6px 10px; font-family: var(--mono); font-size: 12px; background: rgba(255,255,255,.02); }
@@ -298,7 +336,7 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 #full-body { flex: 1; min-height: 0; display: flex; }
 #full-body .fpane { display: none; flex: 1; min-width: 0; min-height: 0; }
 #full-body .fpane.active { display: flex; }
-#full-body .fpane[data-pane="task"], #full-body .fpane[data-pane="output"] { flex-direction: column; overflow: auto; padding: 16px 20px; }
+#full-body .fpane[data-pane="task"], #full-body .fpane[data-pane="output"], #full-body .fpane[data-pane="review"] { flex-direction: column; overflow: auto; padding: 16px 20px; }
 #full-info-col #node-info { padding: 0; border: 0; }
 #full-info-col #changes-row { display: none; }  /* the Changes tab replaces the inline accordion */
 #full-info-col .result-box { max-height: none; }

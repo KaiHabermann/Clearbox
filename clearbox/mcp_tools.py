@@ -2,14 +2,217 @@
 
 from __future__ import annotations
 
+import re
+from contextlib import aclosing
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .engine import ConflictCache, Engine
-from .harness import HarnessError
+from .harness import AgentJob, ClaudeSdkHarness, Harness, HarnessError, MockHarness, OpenAiHarness
+from .harness.claude_sdk import _as_json
 from .store import PlanError, public_profile, validate_working_directory
+
+# --------------------------------------------------------------------- reviews
+# Shared by REST (app.py) and the MCP tools below: both are on-demand triggers for the
+# SAME review mechanism, so the prompt-building, parsing and session-running logic lives
+# here once. Reviews are advisory and read-only: the harness built for them never gets
+# write/exec tools or the clearbox MCP tools, regardless of the profile's own settings.
+
+REVIEW_SYSTEM_APPEND = """
+You are reviewing another agent's finished work inside Clearbox, a service that executes a plan
+(a DAG of work items) node by node. Your review is ADVISORY ONLY: you cannot edit files, your
+verdict never blocks or fails anything, and the user decides what to do with what you find. You
+have read-only tools -- look, don't fix.
+""".strip()
+
+REVIEW_FORMAT_HINT = """
+End your reply with exactly this shape, and nothing after it:
+
+VERDICT: ok | concerns | error
+SUMMARY: <one or two sentences>
+FINDINGS:
+<a short bullet list of concrete issues, or "none" if you found none>
+
+Use "error" only when you could not form a verdict at all (nothing to review, unreadable input) --
+never as a severity level; a real problem you did find is "concerns".
+""".strip()
+
+_VERDICT_RE = re.compile(r"(?im)^\s*verdict\s*:\s*(ok|concerns|error)\b")
+_SUMMARY_RE = re.compile(r"(?im)^\s*summary\s*:\s*")
+_FINDINGS_RE = re.compile(r"(?im)^\s*findings\s*:\s*$")
+
+
+def _parse_review(text: str) -> tuple[str, str, str | None]:
+    """Pull (verdict, summary, findings) out of a reviewer's free-form reply.
+
+    Reviewers are asked for the VERDICT/SUMMARY/FINDINGS shape above but are not forced into
+    it -- a model that ignores the hint (or the mock harness) still produces a usable review:
+    verdict falls back to "error" ("reviewer couldn't form a verdict") with the whole reply as
+    the summary, so the caller never has to special-case a parse failure.
+    """
+    text = (text or "").strip()
+    m = _VERDICT_RE.search(text)
+    if m is None:
+        return "error", text or "(reviewer produced no output)", None
+    verdict = m.group(1).lower()
+    rest = text[m.end():].strip()
+    fm = _FINDINGS_RE.search(rest)
+    if fm is not None:
+        before, findings = rest[: fm.start()].strip(), rest[fm.end():].strip() or None
+    else:
+        before, findings = rest, None
+    summary = _SUMMARY_RE.sub("", before, count=1).strip() or before
+    return verdict, summary, findings
+
+
+def _node_review_prompt(store: Any, plan_id: int, node_id: int) -> str:
+    n = store.get_node(plan_id, node_id)
+    diffs = store.node_diffs(plan_id, node_id)
+    parts = [
+        "Review one finished step of a larger plan against its own task description. This is a "
+        "per-step code review: judge the diff against what the node was asked to do.",
+        f"Node [{node_id}] {n['title']}",
+        f"Task description:\n{n['description'] or '(none)'}",
+        f"Agent's own closing summary:\n{(n['result'] or '(none)').strip()}",
+    ]
+    if diffs:
+        parts.append(
+            "Diffs captured for this node (file-tool writes only -- anything written via a shell "
+            "command is NOT included here; if the summary mentions files you cannot see here, say so "
+            "rather than assume the diff below is the total change):"
+        )
+        for d in diffs:
+            parts.append(f"--- {d['path']} ---\n{d['diff']}")
+    else:
+        parts.append(
+            "No diffs were captured for this node (no file-tool write was seen). The agent may still "
+            "have written files via a shell command, which this review cannot see; say so rather than "
+            "assume nothing changed."
+        )
+    parts.append(REVIEW_FORMAT_HINT)
+    return "\n\n".join(parts)
+
+
+def _plan_review_prompt(engine: Engine, plan_id: int) -> str:
+    store = engine.store
+    plan = store.get_plan(plan_id)
+    parts = [
+        "Review a finished plan as a whole for oversights: titles, descriptions, results and each "
+        "step's own review verdict (if any). This is explicitly NOT a code review -- do not ask for "
+        "diffs or source, reason only from the text below. What was missed, contradicted, or left "
+        "out across the plan as a whole?",
+        f"Plan {plan_id}: {plan['title']}\n{plan['description'] or '(no description)'}",
+    ]
+    for pid in store.descendant_plans(plan_id):
+        node_reviews = {r["node_id"]: r for r in store.reviews_of_plan(pid) if r["node_id"] is not None}
+        if pid != plan_id:
+            sub = store.get_plan(pid)
+            parts.append(f"Subplan {pid}: {sub['title']}\n{sub['description'] or '(no description)'}")
+        for n in store.nodes(pid):
+            lines = [
+                f"[{pid}:{n['node_id']}] {n['title']} ({n['status']})",
+                f"  description: {n['description'] or '(none)'}",
+                f"  result: {(n['result'] or '(none)').strip()}",
+            ]
+            if n["error"]:
+                lines.append(f"  error: {n['error']}")
+            rv = node_reviews.get(n["node_id"])
+            if rv is not None:
+                lines.append(f"  step review: {rv['verdict']} -- {rv['summary']}")
+            parts.append("\n".join(lines))
+    parts.append(REVIEW_FORMAT_HINT)
+    return "\n\n".join(parts)
+
+
+def _review_harness(engine: Engine, profile: dict[str, Any]) -> Harness:
+    """A read-only harness for a review session, independent of the profile's own tools/mcp
+    settings: no clearbox MCP tools (a reviewer must not mutate the plan) and only read/search
+    file tools (no write, no bash)."""
+    kind = profile["harness"]
+    defaults = engine.harnesses.defaults
+    if kind == "claude-sdk":
+        p = dict(profile)
+        p["tools"] = ["Read", "Grep", "Glob"]
+        return ClaudeSdkHarness(model=defaults.model, max_turns=defaults.max_turns, mcp_url=None, profile=p)
+    if kind == "openai":
+        p = dict(profile)
+        p["tools"] = {"preset": "readonly", "mcp": False}
+        return OpenAiHarness(profile=p, mcp_url=None)
+    if kind == "mock":
+        params = _as_json(profile.get("params"), {}) or {}
+        return MockHarness(speed=float(params.get("speed") or defaults.mock_speed))
+    raise HarnessError(f"agent profile {profile['name']!r}: unknown harness {kind!r}")
+
+
+async def _run_review_session(engine: Engine, plan_id: int, node_id: int | None, profile: dict[str, Any],
+                              prompt: str) -> dict[str, Any]:
+    harness = _review_harness(engine, profile)
+    job = AgentJob(
+        plan_id=plan_id,
+        node_id=node_id if node_id is not None else 0,
+        prompt=prompt,
+        system_append=REVIEW_SYSTEM_APPEND,
+        cwd=engine.plan_workdir(plan_id),
+        profile=public_profile(profile),
+        node_title="plan review" if node_id is None else f"review of node {node_id}",
+    )
+    result: dict[str, Any] | None = None
+    async with aclosing(harness.run(job)) as stream:
+        async for kind, data in stream:
+            if kind == "result":
+                result = data
+                break
+    return result or {"text": "", "is_error": True, "errors": ["reviewer produced no result"]}
+
+
+def _resolve_review_profile(engine: Engine, plan_id: int, agent: int | str | None) -> dict[str, Any]:
+    """The agent (raw profile row, with secrets) a review runs on: the explicit override, else
+    the plan's review agent. Raises PlanError when neither is set -- the one case a review
+    cannot fall back from, since reviewing is off by default."""
+    store = engine.store
+    if agent is not None:
+        return store.resolve_profile_ref(agent)
+    plan = store.get_plan(plan_id)
+    profile_id = plan.get("review_agent_profile_id")
+    if profile_id is None:
+        raise PlanError(
+            f"plan {plan_id} has no review agent set; pass agent=<name|id> to review it this once, "
+            "or set_plan_review_agent to enable automatic reviewing"
+        )
+    return store.get_profile(profile_id)
+
+
+async def run_node_review(engine: Engine, plan_id: int, node_id: int, agent: int | str | None = None) -> dict[str, Any]:
+    """Review one node against its own diff; the on-demand counterpart of automatic per-step
+    reviewing (works regardless of whether the plan has a review agent set). Replaces any
+    existing review of this node."""
+    store = engine.store
+    store.get_node(plan_id, node_id)
+    profile = _resolve_review_profile(engine, plan_id, agent)
+    prompt = _node_review_prompt(store, plan_id, node_id)
+    result = await _run_review_session(engine, plan_id, node_id, profile, prompt)
+    verdict, summary, findings = _parse_review(result.get("text", ""))
+    store.set_review(plan_id, node_id, verdict, summary, findings, agent_name=profile["name"],
+                     tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
+    engine.notify_plan(plan_id)
+    return store.review(plan_id, node_id)
+
+
+async def run_plan_review(engine: Engine, plan_id: int, agent: int | str | None = None) -> dict[str, Any]:
+    """Review a finished plan as a whole for oversights; the on-demand counterpart of the
+    automatic plan-level review. Replaces any existing plan-level review."""
+    store = engine.store
+    store.get_plan(plan_id)
+    profile = _resolve_review_profile(engine, plan_id, agent)
+    prompt = _plan_review_prompt(engine, plan_id)
+    result = await _run_review_session(engine, plan_id, None, profile, prompt)
+    verdict, summary, findings = _parse_review(result.get("text", ""))
+    store.set_review(plan_id, None, verdict, summary, findings, agent_name=profile["name"],
+                     tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
+    engine.notify_plan(plan_id)
+    return store.review(plan_id, None)
 
 INSTRUCTIONS = """
 Clearbox lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
@@ -42,6 +245,15 @@ Choosing agents (optional; without it every node runs on the server's default ag
 
 Working on nodes as an external agent:
   claim_next_node -> do the work -> report_progress (optional, repeatedly) -> complete_node / fail_node
+
+Reviews (optional, advisory only -- never blocks a node or edits a file):
+  set_plan_review_agent(plan_id, agent) names an agent that automatically reviews each step
+  against its own diff as it finishes, then the plan as a whole once every step is done. Any
+  plan can also be reviewed on demand with review_node / review_plan, whether or not it has a
+  review agent set -- diffs are captured for every node regardless, so a finished plan can be
+  reviewed after the fact by passing an agent to the trigger. get_reviews(plan_id) reads the
+  verdicts and findings back, most useful for turning the plan-level review's oversights into
+  new add_node/add_edge calls.
 """.strip()
 
 
@@ -530,6 +742,75 @@ def build_mcp(engine: Engine) -> MCPServer:
             return await registry.test(agent)  # shared with POST /api/agents/{id}/test
         except PlanError as e:
             return {"ok": False, "detail": f"{e}; list_agents shows the configured agent profiles", "models_sample": []}
+
+    # ------------------------------------------------------------ reviews
+    @mcp.tool()
+    def set_plan_review_agent(plan_id: int, agent: str | int | None) -> str:
+        """Set (or clear) the agent profile that AUTOMATICALLY reviews this plan's steps and,
+        once it finishes, the plan as a whole; null disables automatic reviewing (the default).
+
+        Reviews are advisory only: a reviewer records a verdict ('ok', 'concerns' or 'error') and
+        findings, but never fails a node, blocks a dependant, or edits a file -- the user decides
+        what to do with what it finds. Clearing this does not touch reviews already recorded, and
+        review_node/review_plan can still review this plan on demand by passing their own agent.
+        """
+        profile_id = _profile_id(agent)
+        try:
+            store.set_plan_review_agent(plan_id, profile_id)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.notify_plan(plan_id)
+        if profile_id is None:
+            return f"plan {plan_id} no longer reviews automatically"
+        return f"plan {plan_id} is automatically reviewed by agent {_profile_name(profile_id)!r}"
+
+    @mcp.tool()
+    async def review_node(plan_id: int, node_id: int, agent: str | int | None = None) -> dict[str, Any]:
+        """Review one node against its own diff right now (re-reviews if it already has one).
+
+        agent (optional): name or id of the agent profile to review with, used for this run only
+        -- it does not change the plan's automatic review agent. Falls back to the plan's review
+        agent when omitted; errors if neither is set. Works on any node with a captured diff,
+        including one from a plan that finished with no review agent set at all -- the whole
+        point is that a finished run can be reviewed afterwards just by pointing an agent at it.
+        """
+        try:
+            return await run_node_review(engine, plan_id, node_id, agent)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool()
+    async def review_plan(plan_id: int, agent: str | int | None = None) -> dict[str, Any]:
+        """Review a finished plan as a whole for oversights right now (re-reviews if it already
+        has one). Reads titles, descriptions, results and each step's own review verdict --
+        never diffs or source, that is review_node's job.
+
+        agent (optional): as in review_node, used for this run only. Falls back to the plan's
+        review agent when omitted; errors if neither is set.
+        """
+        try:
+            return await run_plan_review(engine, plan_id, agent)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool()
+    def get_reviews(plan_id: int) -> dict[str, Any]:
+        """The plan's review (if any) plus every node's review verdict and findings, across the
+        whole plan tree (including subplans).
+
+        Meant to be turned into follow-up work: read the plan-level review's findings for what
+        it says was missed or contradicted, and add_node/add_edge new nodes for it.
+        """
+        try:
+            store.get_plan(plan_id)
+            plan_review = store.review(plan_id, None)
+            node_reviews = [
+                r for pid in store.descendant_plans(plan_id)
+                for r in store.reviews_of_plan(pid) if r["node_id"] is not None
+            ]
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        return {"plan_review": plan_review, "node_reviews": node_reviews}
 
     # ----------------------------------------------------------- execution
     @mcp.tool()

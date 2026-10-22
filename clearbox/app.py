@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from . import bootstrap
 from .harness.registry import HarnessDefaults, HarnessRegistry
 from .engine import Bus, ConflictCache, Engine, EngineConfig
-from .mcp_tools import build_mcp
+from .mcp_tools import build_mcp, run_node_review, run_plan_review
 from .store import PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
@@ -119,17 +119,46 @@ class FilesBody(BaseModel):
     files: list[str] = []
 
 
+class ReviewBody(BaseModel):
+    """Optional one-off agent for a manual review trigger; null/omitted falls back to the plan's
+    review agent (set with PUT .../review-agent). Used for this run only, it does not change that
+    setting -- this is what makes reviewing a finished run practical even if it never had one."""
+
+    agent: int | str | None = None
+
+
+class ReviewAgentBody(BaseModel):
+    """Set (or null to clear) the agent profile that AUTOMATICALLY reviews a plan's steps and,
+    once it finishes, the plan as a whole. Manual review triggers keep working while this is unset."""
+
+    agent: int | str | None = None
+
+
 @dataclass
 class FileScope:
-    """One request's view of a plan tree's declared files, shared by every node_view call.
+    """One request's view of a plan tree's declared files and reviews, shared by every node_view call.
 
-    `/api/plans/{id}` renders all nodes at once, so the tree's file map is
-    fetched once and the dependency closures are memoized across nodes.
+    `/api/plans/{id}` renders all nodes at once, so the tree's file map and reviews are each
+    fetched once (one query apiece) and the dependency closures are memoized across nodes.
     """
 
     tree: dict[tuple[int, int], list[dict[str, Any]]]
     cache: ConflictCache
     titles: dict[tuple[int, int], str]
+    reviews: dict[tuple[int, int], dict[str, Any]]
+
+
+def review_view(r: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A review row as the UI/REST sees it: verdict, summary, findings, agent, when. None if unreviewed."""
+    if r is None:
+        return None
+    return {
+        "verdict": r["verdict"],
+        "summary": r["summary"],
+        "findings": r["findings"],
+        "agent": r["agent_name"],
+        "when": r["created_at"],
+    }
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -191,8 +220,14 @@ def create_app(settings: Settings) -> FastAPI:
 
     # ------------------------------------------------------------- views
     def file_scope(plan_id: int) -> FileScope:
-        tree = store.files_of_plan_tree(store.root_of(plan_id)["id"])
-        return FileScope(tree=tree, cache=ConflictCache(), titles={})
+        root_id = store.root_of(plan_id)["id"]
+        tree = store.files_of_plan_tree(root_id)
+        reviews = {
+            (pid, r["node_id"]): r
+            for pid in store.descendant_plans(root_id)
+            for r in store.reviews_of_plan(pid) if r["node_id"] is not None
+        }
+        return FileScope(tree=tree, cache=ConflictCache(), titles={}, reviews=reviews)
 
     def node_ref(scope: FileScope, ref: tuple[int, int], files: list[str]) -> dict[str, Any]:
         if ref not in scope.titles:
@@ -237,6 +272,7 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     def node_view(plan_id: int, n: dict[str, Any], scope: FileScope | None = None) -> dict[str, Any]:
+        scope = scope or file_scope(plan_id)
         sub = store.subplan_of(plan_id, n["node_id"])
         return {
             **n,
@@ -244,7 +280,8 @@ def create_app(settings: Settings) -> FastAPI:
             "progress": engine.rollup(sub) if sub is not None else None,
             "agent": harnesses.source_for(plan_id, n["node_id"]),
             "agent_override": n.get("agent_profile_id"),
-            **file_fields(plan_id, n, scope or file_scope(plan_id)),
+            "review": review_view(scope.reviews.get((plan_id, n["node_id"]))),
+            **file_fields(plan_id, n, scope),
         }
 
     def agent_view(p: dict[str, Any], default_id: int | None, usage: dict[int, int]) -> dict[str, Any]:
@@ -343,6 +380,8 @@ def create_app(settings: Settings) -> FastAPI:
             "progress": engine.rollup(plan_id),
             "ancestors": store.ancestors(plan_id),
             "active": active_nodes(root["id"]),
+            "review": review_view(store.review(plan_id)),
+            "review_agent_profile_id": p.get("review_agent_profile_id"),
             "nodes": [node_view(plan_id, n, scope) for n in store.nodes(plan_id)],
             "edges": store.edges(plan_id),
         }
@@ -366,6 +405,45 @@ def create_app(settings: Settings) -> FastAPI:
         except PlanError as e:
             raise HTTPException(404, str(e)) from e
         return {"diffs": store.node_diffs(plan_id, node_id)}
+
+    @app.put("/api/plans/{plan_id}/review-agent")
+    async def set_plan_review_agent(plan_id: int, body: ReviewAgentBody) -> dict[str, Any]:
+        """Set (or null to clear) the agent that automatically reviews this plan; manual triggers
+        (POST .../review, POST .../nodes/{node_id}/review) keep working either way."""
+        pid = profile_id_of(body.agent)
+        try:
+            store.set_plan_review_agent(plan_id, pid)
+            root_id = store.root_of(plan_id)["id"]
+        except PlanError as e:
+            raise _err(e) from e
+        bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
+        return {"ok": "set", "plan_id": plan_id, "review_agent_profile_id": pid}
+
+    @app.post("/api/plans/{plan_id}/nodes/{node_id}/review")
+    async def review_node_now(plan_id: int, node_id: int, body: ReviewBody | None = None) -> dict[str, Any]:
+        """Review this node against its own diff now; re-reviews if it already has one.
+
+        body.agent, if given, is used for this run only (see ReviewBody). Falls back to the
+        plan's review agent; 400s with a clear message if neither is set.
+        """
+        try:
+            r = await run_node_review(engine, plan_id, node_id, body.agent if body else None)
+        except PlanError as e:
+            raise _err(e) from e
+        return {"review": review_view(r)}
+
+    @app.post("/api/plans/{plan_id}/review")
+    async def review_plan_now(plan_id: int, body: ReviewBody | None = None) -> dict[str, Any]:
+        """Review this plan as a whole for oversights now; re-reviews if it already has one.
+
+        Reads titles, descriptions, results and each step's own review verdict -- never diffs or
+        source (that is the per-node review's job). body.agent as in review_node_now.
+        """
+        try:
+            r = await run_plan_review(engine, plan_id, body.agent if body else None)
+        except PlanError as e:
+            raise _err(e) from e
+        return {"review": review_view(r)}
 
     @app.patch("/api/plans/{plan_id}")
     def update_plan(plan_id: int, body: PlanPatch) -> dict[str, Any]:

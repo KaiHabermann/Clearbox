@@ -166,6 +166,29 @@ class HarnessRegistry:
             return MockHarness(speed=float(params.get("speed") or d.mock_speed))
         raise HarnessError(f"agent profile {profile['name']!r}: unknown harness {kind!r}")
 
+    def review_harness_for(self, profile: dict[str, Any]) -> Harness:
+        """A harness for a review session: same model/endpoint as ``profile``, but forced
+        read-only regardless of what the profile allows for normal node runs.
+
+        A reviewer must never edit files, so its own ``tools``/``permission_mode`` and the
+        clearbox MCP tools are ignored here: Claude Agent SDK sessions get ``permission_mode
+        "plan"`` plus a fixed read-only tool list, and OpenAI-compatible ones get the
+        ``"readonly"`` tools preset.
+        """
+        d = self.defaults
+        kind = profile["harness"]
+        if kind == "claude-sdk":
+            return ClaudeSdkHarness(
+                permission_mode="plan", model=profile.get("model") or d.model, max_turns=d.max_turns,
+                mcp_url=None, allowed_tools=["Read", "Grep", "Glob"],
+            )
+        if kind == "openai":
+            return OpenAiHarness(profile={**profile, "tools": {"preset": "readonly"}}, mcp_url=None)
+        if kind == "mock":
+            params = _as_json(profile.get("params"), {}) or {}
+            return MockHarness(speed=float(params.get("speed") or d.mock_speed))
+        raise HarnessError(f"agent profile {profile['name']!r}: unknown harness {kind!r}")
+
     # ------------------------------------------------------------- describing
     def agent_name(self, profile: dict[str, Any] | None) -> str:
         """What the UI shows as the node's agent: the profile name, or 'claude'/'mock'."""
