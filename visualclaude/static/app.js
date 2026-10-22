@@ -22,6 +22,7 @@ const state = {
   agentDirty: false,   // the open agent form has unsaved edits
   workdirEdit: false,  // the topbar working-directory pill is open as an editable input
   fullOpen: false,     // the full-screen node review is open
+  fullTab: "changes",  // which full-view tab is showing; kept across nodes while reviewing
   nodeInfoResp: null,  // last /nodes/:id response, used to rebuild #node-info when full view closes
 };
 
@@ -696,18 +697,77 @@ function closeDrawer(update = true) {
 // it physically relocates the live #drawer-head / #node-info / #transcript-head / #transcript
 // elements into the full-view layout (and back on close), so renderNodeInfo/appendEvent/etc keep
 // working unmodified via their existing #id selectors regardless of which container currently holds
-// them. The one exception is the Changes/diffs block (#changes-row, inside #node-info): it gets its
-// own wide column while full view is open, via relocateForFull(), called at the end of every
-// renderNodeInfo() so it follows node switches and live updates.
+// them. Three tabs share the screen so each gets the full width: Task (#node-info), Changes (its
+// own diff browser, below) and Agent output (the transcript). The drawer keeps its inline Changes
+// accordion; in full view that copy is hidden by CSS and the Changes tab is used instead.
 const drawerSlots = {
   head: $("#drawer-head"), info: $("#node-info"), thead: $("#transcript-head"), transcript: $("#transcript"),
 };
 const drawerHome = new Map(Object.values(drawerSlots).map((el) => [el, { parent: el.parentNode, next: el.nextSibling }]));
+
+// Changes tab: file list on the left, the selected file's diff filling the rest of the screen.
+const FULL_TABS = ["task", "changes", "output"];
+function setFullTab(tab) {
+  if (!FULL_TABS.includes(tab)) return;
+  state.fullTab = tab;
+  for (const b of document.querySelectorAll("#full-tabs .ftab")) b.classList.toggle("active", b.dataset.tab === tab);
+  for (const p of document.querySelectorAll("#full-body .fpane")) p.classList.toggle("active", p.dataset.pane === tab);
+}
+function diffStat(diff) {
+  let add = 0, del = 0;
+  for (const l of diff.split("\n")) {
+    if (l.startsWith("+") && !l.startsWith("+++")) add++;
+    else if (l.startsWith("-") && !l.startsWith("---")) del++;
+  }
+  return { add, del };
+}
+// Agents call the file tools with absolute paths, so strip the plan's working directory:
+// "…\VisualClaude\visualclaude\app.py" reads as "visualclaude/app.py" in the file list.
+function shortPath(p) {
+  const wd = state.data?.working_directory;
+  let s = String(p).replace(/\\/g, "/");
+  if (wd) {
+    const w = wd.replace(/\\/g, "/").replace(/\/$/, "");
+    if (s.toLowerCase().startsWith(w.toLowerCase() + "/")) s = s.slice(w.length + 1);
+  }
+  return s;
+}
+function showFullDiff(d) {
+  for (const b of document.querySelectorAll("#full-file-list .dfile")) b.classList.toggle("active", b.dataset.path === d.path);
+  const pane = $("#full-diff");
+  pane.innerHTML = "";
+  pane.append(
+    el("div", { class: "diff-title", title: d.path }, shortPath(d.path)),
+    el("pre", { class: "diff-pre full", html: diffHtml(d.diff) }));
+  pane.scrollTop = 0;
+}
+async function loadFullChanges(pid, nodeId) {
+  const list = $("#full-file-list"), pane = $("#full-diff");
+  list.innerHTML = ""; pane.innerHTML = "";
+  list.append(el("div", { class: "files-empty" }, "loading…"));
+  const tab = document.querySelector('#full-tabs .ftab[data-tab="changes"]');
+  let r;
+  try { r = await api(`/api/plans/${pid}/nodes/${nodeId}/diffs`); }
+  catch { list.innerHTML = ""; list.append(el("div", { class: "files-empty" }, "could not load diffs")); return; }
+  if (!state.fullOpen || !state.sel || state.sel.node_id !== nodeId) return;  // navigated away mid-fetch
+  list.innerHTML = "";
+  tab.textContent = r.diffs.length ? `Changes (${r.diffs.length})` : "Changes";
+  if (!r.diffs.length) {
+    list.append(el("div", { class: "files-empty" }, "no file changes captured"));
+    pane.append(el("div", { class: "files-empty pad" },
+      "This node recorded no file diffs. Files written by bash are not captured."));
+    return;
+  }
+  for (const d of r.diffs) {
+    const s = diffStat(d.diff);
+    list.append(el("button", { class: "dfile", "data-path": d.path, title: d.path, onclick: () => showFullDiff(d) },
+      el("span", { class: "dpath" }, shortPath(d.path)),
+      el("span", { class: "dstat" }, el("span", { class: "add" }, `+${s.add}`), " ", el("span", { class: "del" }, `−${s.del}`))));
+  }
+  showFullDiff(r.diffs[0]);
+}
 function relocateForFull() {
-  const cr = document.getElementById("changes-row"), col = $("#full-changes-col");
-  if (!col) return;
-  if (state.fullOpen) { if (cr && cr.parentNode !== col) { col.innerHTML = ""; col.append(cr); } }
-  else if (cr && cr.parentNode === col) $("#node-info").append(cr);  // info was just rebuilt without it
+  if (state.fullOpen && state.sel) loadFullChanges(state.sel.plan_id, state.sel.node_id);
 }
 function openFullView(push = true) {
   if (!state.sel || state.fullOpen) return;
@@ -715,6 +775,7 @@ function openFullView(push = true) {
   $("#full-head-slot").append(drawerSlots.head);
   $("#full-info-col").append(drawerSlots.info);
   $("#full-transcript-col").append(drawerSlots.thead, drawerSlots.transcript);
+  setFullTab(state.fullTab || "changes");
   relocateForFull();
   $("#full-view").classList.remove("closed");
   if (push) setHash();
@@ -737,11 +798,13 @@ function navFull(dir) {
 $("#full-exit").addEventListener("click", () => closeFullView());
 $("#full-prev").addEventListener("click", () => navFull(-1));
 $("#full-next").addEventListener("click", () => navFull(1));
+for (const b of document.querySelectorAll("#full-tabs .ftab")) b.addEventListener("click", () => setFullTab(b.dataset.tab));
 document.addEventListener("keydown", (e) => {
   if (!state.fullOpen || e.defaultPrevented || /^(input|textarea|select)$/i.test(e.target.tagName)) return;
   if (e.key === "Escape") { closeFullView(); return; }
   if (e.key === "ArrowLeft" || e.key === "k") { e.preventDefault(); navFull(-1); }
   else if (e.key === "ArrowRight" || e.key === "j") { e.preventDefault(); navFull(1); }
+  else if (e.key >= "1" && e.key <= "3") { e.preventDefault(); setFullTab(FULL_TABS[+e.key - 1]); }
 });
 
 async function refreshNodeInfo(withEvents = false) {

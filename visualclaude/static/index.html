@@ -89,13 +89,21 @@
       <button id="full-prev" class="nav-btn" title="previous node (k / ←)">‹</button>
       <div id="full-head-slot"></div>
       <button id="full-next" class="nav-btn" title="next node (j / →)">›</button>
+      <div id="full-tabs" role="tablist">
+        <button class="ftab" data-tab="task" role="tab" title="task, agent and result (1)">Task</button>
+        <button class="ftab" data-tab="changes" role="tab" title="file diffs (2)">Changes</button>
+        <button class="ftab" data-tab="output" role="tab" title="agent session (3)">Agent output</button>
+      </div>
       <div class="spacer"></div>
       <button id="full-exit" class="close" title="exit full screen (Esc)">⤡ Exit full screen</button>
     </div>
-    <div id="full-columns">
-      <div id="full-info-col"></div>
-      <div id="full-changes-col"></div>
-      <div id="full-transcript-col"></div>
+    <div id="full-body">
+      <section class="fpane" data-pane="task"><div id="full-info-col"></div></section>
+      <section class="fpane" data-pane="changes">
+        <div id="full-file-list"></div>
+        <div id="full-diff"></div>
+      </section>
+      <section class="fpane" data-pane="output"><div id="full-transcript-col"></div></section>
     </div>
   </div>
 
