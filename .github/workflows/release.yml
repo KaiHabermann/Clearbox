@@ -9,7 +9,7 @@
 #
 # Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in this repository.
 # One-time setup on PyPI -> your project -> Publishing -> Add a new publisher:
-#   Owner: kaihabermann   Repository: clearbox   Workflow: release.yml   Environment: pypi
+#   Owner: KaiHabermann   Repository: Clearbox   Workflow: release.yml   Environment: pypi
 # For the very first release the project does not exist on PyPI yet: add it as a *pending*
 # publisher under your account instead (Your projects -> Publishing), with the same four values.
 name: release

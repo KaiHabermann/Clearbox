@@ -539,7 +539,7 @@ PyPI, and only then creates the GitHub release with the artifacts attached. PyPI
 because an upload there is permanent, while a GitHub release can be deleted and recreated.
 
 Publishing uses **PyPI Trusted Publishing**, so there is no API token in the repository. Configure
-it once on PyPI under *Publishing* with: owner `kaihabermann`, repository `clearbox`, workflow
+it once on PyPI under *Publishing* with: owner `KaiHabermann`, repository `Clearbox`, workflow
 `release.yml`, environment `pypi`. Before the first release the project does not exist on PyPI
 yet — add it as a *pending publisher* on your account instead, with the same four values.
 
