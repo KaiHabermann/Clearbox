@@ -5,7 +5,7 @@ transcript events. The engine stores those events, fans them out over SSE and
 the UI renders them, all without knowing which harness produced them. That is
 why the event contract below is the integration seam: a new harness (OpenAI-
 compatible, local model, ...) only has to emit the same kinds and payload keys
-as the Claude Agent SDK harness, and the rest of VisualClaude just works.
+as the Claude Agent SDK harness, and the rest of Clearbox just works.
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ asks the registry per node. Resolution order:
    each ancestor plan's default;
 2. the server-wide default profile (``default_profile``, an id or name);
 3. the implicit harness configured on the command line (``claude`` or, with
-   ``--mock``, ``mock``) -- exactly what VisualClaude did before profiles existed.
+   ``--mock``, ``mock``) -- exactly what Clearbox did before profiles existed.
 
 Harness instances are cached per profile id together with the row they were
 built from; any edit (which also bumps ``updated_at``) makes the row differ, so

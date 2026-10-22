@@ -1,6 +1,6 @@
 """OpenAiHarness against the scripted fake endpoint (tests/fake_openai.py).
 
-No VisualClaude server and no database: the harness is constructed from a
+No Clearbox server and no database: the harness is constructed from a
 profile dict and run on a temp working directory, exactly as the engine would.
 Covers the full event sequence, real tool effects on disk, streamed tool-call
 fragments (single and interleaved parallel calls), the non-streaming path,
@@ -13,8 +13,8 @@ import asyncio, json, os, socket, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_openai import FakeOpenAI
-from visualclaude.harness.base import AgentJob
-from visualclaude.harness.openai_compat import OpenAiHarness
+from clearbox.harness.base import AgentJob
+from clearbox.harness.openai_compat import OpenAiHarness
 
 SECRET = "sk-test-0123456789abcdefSECRET"
 

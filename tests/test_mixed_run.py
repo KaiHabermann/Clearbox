@@ -8,7 +8,7 @@ started_at/finished_at windows must never overlap more than each cap allows.
 The server's --max-concurrency must be at least 3 (the default) so that the
 caps, not the global limit, are what holds the nodes back.
 
-Run:  uv run visualclaude --mock      (one shell)
+Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_mixed_run.py [http://127.0.0.1:8765]
 """
 import asyncio, json, sys, time, uuid

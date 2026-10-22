@@ -4,7 +4,7 @@ Covers create / list / patch (api_key kept, then cleared) / test / node + plan
 assignment with the resolved `agent.source` / delete, the "agents" SSE message,
 and -- explicitly -- that no response body ever contains `api_key` or the secret.
 
-Run:  uv run visualclaude --mock      (one shell)
+Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_agents_api.py [http://127.0.0.1:8765]
 """
 import asyncio, json, sys, threading, time, uuid

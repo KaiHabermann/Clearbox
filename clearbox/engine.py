@@ -44,7 +44,7 @@ from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
 from .store import PlanError, Store, validate_working_directory
 
-log = logging.getLogger("visualclaude")
+log = logging.getLogger("clearbox")
 
 
 @dataclass
@@ -55,7 +55,7 @@ class ConflictCache:
     reach: dict[int, dict[int, set[int]]] = field(default_factory=dict)
 
 SYSTEM_APPEND = """
-You are one worker inside VisualClaude, a service that executes a plan (a DAG of work items)
+You are one worker inside Clearbox, a service that executes a plan (a DAG of work items)
 node by node. You are responsible for exactly ONE node. Stay within its scope: other nodes are
 handled by other agents, before or after you. Results of prerequisite nodes are given to you.
 
@@ -78,7 +78,7 @@ decisions, findings). That final message is handed to the nodes that depend on y
 
 EXPAND_HINT = """
 If your node turns out to be too large for one session, you may break it down: call the
-visualclaude MCP tool create_plan with parent_plan_id={plan_id} and parent_node_id={node_id}, then
+clearbox MCP tool create_plan with parent_plan_id={plan_id} and parent_node_id={node_id}, then
 add_node / add_edge on the returned plan id. Those sub-nodes are executed by other agents after
 you finish, so in that case do only the groundwork yourself and describe the breakdown.
 """.strip()

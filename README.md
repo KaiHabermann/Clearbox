@@ -1,4 +1,6 @@
-# VisualClaude
+# Clearbox
+
+**Observable, reviewable agent work.** Big changes, broken into a graph you can watch and audit.
 
 A small service that lets a model **post a plan as a DAG of work items over MCP**, executes the
 plan node by node (roots first, then their dependents, in parallel where possible) with agent
@@ -9,7 +11,7 @@ worked on right now, and — on click — the agent's session in that node as it
  model ──MCP──►  create_plan / add_node / add_edge / start_plan
                          │
                  ┌───────▼────────┐  SQLite (plans, nodes, edges, agent profiles, transcripts)
-                 │  VisualClaude  │──► built-in agent per ready node, chosen by its agent profile:
+                 │    Clearbox    │──► built-in agent per ready node, chosen by its agent profile:
                  │   scheduler    │      · Claude Agent SDK
                  │                │      · OpenAI-compatible endpoints (OpenAI, vLLM, Ollama, …)
                  └───────┬────────┘◄── or external agents: claim_next_node / complete_node
@@ -22,8 +24,8 @@ worked on right now, and — on click — the agent's session in that node as it
 Needs Python ≥ 3.10. With [uv](https://docs.astral.sh/uv/):
 
 ```powershell
-cd VisualClaude
-uv run visualclaude --mock          # fake agents: try the UI without spending tokens
+cd Clearbox
+uv run clearbox --mock          # fake agents: try the UI without spending tokens
 uv run python examples/demo_plan.py --start
 ```
 
@@ -33,8 +35,8 @@ For real agents drop `--mock`. Built-in agents run through the Claude Agent SDK,
 own Claude Code CLI and uses your existing Claude login (or `ANTHROPIC_API_KEY`).
 
 ```powershell
-uv run visualclaude                                   # real Claude sessions, 3 in parallel
-uv run visualclaude --max-concurrency 5 --permission-mode acceptEdits
+uv run clearbox                                   # real Claude sessions, 3 in parallel
+uv run clearbox --max-concurrency 5 --permission-mode acceptEdits
 ```
 
 Nodes can also run on any OpenAI-compatible endpoint instead — a local Ollama or vLLM model, or
@@ -42,20 +44,20 @@ OpenAI itself — and one plan can mix them per node, see
 [Agents and harnesses](#agents-and-harnesses):
 
 ```powershell
-uv run visualclaude --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
+uv run clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
 ```
 
-Without uv: `pip install -e .` then `visualclaude ...` (or `python -m visualclaude ...`).
+Without uv: `pip install -e .` then `clearbox ...` (or `python -m clearbox ...`).
 
 ### Connect a model
 
 The MCP endpoint is `http://127.0.0.1:8765/mcp` (streamable HTTP).
 
 ```powershell
-claude mcp add --transport http visualclaude http://127.0.0.1:8765/mcp
+claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
 ```
 
-Then ask, e.g. *"Use visualclaude to make a plan for … and start it."*
+Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 
 ## MCP tools
 
@@ -100,7 +102,7 @@ Then ask, e.g. *"Use visualclaude to make a plan for … and start it."*
   (default `./workspace/plan-N`).
 * A failed node blocks its dependents. Use **Retry** in the UI. **Stop** cancels running built-in
   agents and re-queues their nodes; **Reset** clears all results and transcripts.
-* Everything is stored in `visualclaude.db`. Built-in sessions that were running when the service
+* Everything is stored in `clearbox.db`. Built-in sessions that were running when the service
   stopped are re-queued on the next start.
 
 ### File scoping: avoiding clobbered edits
@@ -122,7 +124,7 @@ cannot deadlock — the lower-numbered one always gets to start.
 
 Paths are relative to the plan tree's working directory, exactly like the ones a node's agent reads
 and writes; they may name a file that does not exist yet (the node is about to create it) or a
-directory, which claims everything under it (e.g. `files=["visualclaude/"]` for a node that
+directory, which claims everything under it (e.g. `files=["clearbox/"]` for a node that
 restructures a whole package). Matching is case-insensitive and treats `\` and `/` alike on every
 platform, not just Windows — `App.js` and `app.js` are treated as the same file even on a
 case-sensitive filesystem. That occasionally serializes two genuinely different files; the
@@ -158,7 +160,7 @@ transcript events, so the UI, the database and the live stream look identical wh
 | Harness | What runs the node | Tools |
 | --- | --- | --- |
 | `claude-sdk` | The Claude Agent SDK (its bundled Claude Code CLI, your Claude login or `ANTHROPIC_API_KEY`). | Its own (Bash, Read, Edit, …), gated by `permission_mode`. |
-| `openai` | Any endpoint speaking the OpenAI chat-completions API, driven by VisualClaude's own agent loop (ask → run the tool calls → feed results back → repeat until a reply without tool calls). | VisualClaude's built-in toolset (below) + the MCP tools. |
+| `openai` | Any endpoint speaking the OpenAI chat-completions API, driven by Clearbox's own agent loop (ask → run the tool calls → feed results back → repeat until a reply without tool calls). | Clearbox's built-in toolset (below) + the MCP tools. |
 | `mock` | A fake agent that prints a plausible transcript. No cost. | Pretend ones. |
 
 On every start the server makes sure these profiles exist (created only when absent, never
@@ -169,8 +171,8 @@ profile overrides the flag. Manage profiles in the UI (**Agents** in the sidebar
 connection** button), over MCP (`create_agent` …) or over REST (`/api/agents`).
 
 ```powershell
-uv run visualclaude --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
-$env:OPENAI_API_KEY = "sk-…"; uv run visualclaude --agent-profile openai   # every node on gpt-4o-mini
+uv run clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
+$env:OPENAI_API_KEY = "sk-…"; uv run clearbox --agent-profile openai   # every node on gpt-4o-mini
 ```
 
 ### Profile fields
@@ -205,7 +207,7 @@ differs from the plan's default.
 
 ### Secrets
 
-Put api keys in environment variables of the VisualClaude process and reference them by name with
+Put api keys in environment variables of the Clearbox process and reference them by name with
 `api_key_env`; the value is read when a node starts and lives only in the HTTP client. A literal
 key can be typed into the Agents panel (or sent as `api_key` to `POST`/`PATCH /api/agents`) for
 convenience: it is stored in the database but **never returned** by REST, the stream, MCP or the
@@ -217,7 +219,7 @@ placeholder key when none is configured, since they rarely check it.
 ### Tools of the `openai` harness
 
 > **Warning:** these tools run arbitrary code in the plan's working directory, with the rights of
-> the VisualClaude process. The file tools are jailed to that directory (`..` and symlinks are
+> the Clearbox process. The file tools are jailed to that directory (`..` and symlinks are
 > resolved before the check), but `bash` is **not** jailed — a shell can always `cd` out. Use preset
 > `readonly` (or `deny: ["bash"]`) for models you would not hand a shell, and a sandbox for
 > anything you do not trust.
@@ -231,7 +233,7 @@ placeholder key when none is configured, since they rarely check it.
 | `glob(pattern)` | Find files, e.g. `**/*.py`, newest first. | ✓ |
 | `grep(pattern, path, glob, max_results=100)` | Regex search over file contents → `path:line: text`. | ✓ |
 | `bash(command, timeout_ms=120000)` | Run a shell command (`cmd.exe` on Windows, `/bin/sh` elsewhere), max 600 000 ms; kills the process tree on timeout. | |
-| `vc_*` | The visualclaude MCP tools (`vc_create_plan`, `vc_add_node`, …) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
+| `vc_*` | The clearbox MCP tools (`vc_create_plan`, `vc_add_node`, …) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
 
 Walks skip `.git`, `node_modules`, `__pycache__` and virtualenvs; results are truncated like the
 Claude harness's.
@@ -266,7 +268,7 @@ tests) in parallel, a strong-model node assesses the architecture from their res
 strong-model node reviews that assessment:
 
 ```powershell
-uv run visualclaude --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
+uv run clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
 uv run python examples/mixed_plan.py --start
 ```
 
@@ -277,7 +279,7 @@ configured `openai` profile with preset `readonly`, `max_turns` 20, `max_paralle
 inventory nodes inherit it), `add_node(..., agent="strong")` pins the assessment, and
 `set_node_agent` moves the review node. `--cheap NAME` / `--strong NAME` use profiles you already
 have; `--repo PATH` reviews another directory. With no `openai` profile configured (e.g. against
-`uv run visualclaude --mock`) or with `--mock` it creates `mock-cheap` / `mock-strong` instead, so
+`uv run clearbox --mock`) or with `--mock` it creates `mock-cheap` / `mock-strong` instead, so
 the whole flow can be watched for free.
 
 ## UI
@@ -298,23 +300,23 @@ the whole flow can be watched for free.
   key, choose its toolset, cap its parallelism, and **Test connection** before trusting it.
 * URLs are deep-linkable: `/#/plan/2/node/3`, `/#/agents`, `/#/agents/4`.
 
-## Developing VisualClaude with VisualClaude
+## Developing Clearbox with Clearbox
 
 Run a *frozen* copy as the service so agents can edit the source without breaking the running
 instance, and keep the database outside the repo:
 
 ```powershell
-uv tool install --force .            # snapshot of the current code -> `visualclaude` on PATH
-visualclaude --db $HOME\.visualclaude\vc.db --workdir $HOME\.visualclaude\workspace
+uv tool install --force .            # snapshot of the current code -> `clearbox` on PATH
+clearbox --db $HOME\.clearbox\vc.db --workdir $HOME\.clearbox\workspace
 ```
 
-The repo contains a `.mcp.json`, so Claude Code started in this folder offers the `visualclaude`
+The repo contains a `.mcp.json`, so Claude Code started in this folder offers the `clearbox`
 server automatically. Create plans with `working_directory` set to the repo path so built-in agents
 work on the code. To pick up the agents' changes, stop the service and run
 `uv tool install --force .` again.
 
 Agent profiles live in that database, so they survive the reinstall — configure an endpoint once
-and every later plan can use it. Two things worth knowing when a plan builds VisualClaude itself:
+and every later plan can use it. Two things worth knowing when a plan builds Clearbox itself:
 
 * Built-in `claude-sdk` agents use the login of the **service** process, not of the Claude Code
   session that planned the work. After `claude /login`, or when a session limit hits agents but not
@@ -327,18 +329,18 @@ and every later plan can use it. Two things worth knowing when a plan builds Vis
 
 | Flag | Env | Default |
 | --- | --- | --- |
-| `--host`, `--port` | `VISUALCLAUDE_HOST`, `VISUALCLAUDE_PORT` | `127.0.0.1`, `8765` |
-| `--db` | `VISUALCLAUDE_DB` | `visualclaude.db` |
-| `--workdir` | `VISUALCLAUDE_WORKDIR` | `workspace` |
-| `--max-concurrency` | `VISUALCLAUDE_MAX_CONCURRENCY` | `3` |
-| `--permission-mode` | `VISUALCLAUDE_PERMISSION_MODE` | `acceptEdits` |
-| `--model` | `VISUALCLAUDE_MODEL` | SDK default |
+| `--host`, `--port` | `CLEARBOX_HOST`, `CLEARBOX_PORT` | `127.0.0.1`, `8765` |
+| `--db` | `CLEARBOX_DB` | `clearbox.db` |
+| `--workdir` | `CLEARBOX_WORKDIR` | `workspace` |
+| `--max-concurrency` | `CLEARBOX_MAX_CONCURRENCY` | `3` |
+| `--permission-mode` | `CLEARBOX_PERMISSION_MODE` | `acceptEdits` |
+| `--model` | `CLEARBOX_MODEL` | SDK default |
 | `--max-turns` | | unlimited |
-| `--mock`, `--mock-speed` | `VISUALCLAUDE_AGENT=mock` | off |
+| `--mock`, `--mock-speed` | `CLEARBOX_AGENT=mock` | off |
 | `--no-agent-mcp` | | agents get the MCP tools |
-| `--agent-profile NAME` | `VISUALCLAUDE_AGENT_PROFILE` | `mock` with `--mock`, else `claude` |
+| `--agent-profile NAME` | `CLEARBOX_AGENT_PROFILE` | `mock` with `--mock`, else `claude` |
 | `--openai-base-url URL` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
-| `--openai-model NAME` | `VISUALCLAUDE_OPENAI_MODEL` | `gpt-4o-mini` for the OpenAI endpoint, else none |
+| `--openai-model NAME` | `CLEARBOX_OPENAI_MODEL` | `gpt-4o-mini` for the OpenAI endpoint, else none |
 | `--openai-api-key-env NAME` | | `OPENAI_API_KEY` |
 
 `--model`, `--permission-mode` and `--max-turns` configure the `claude` profile's empty fields (and
@@ -355,11 +357,11 @@ agents the equivalent control is the profile's `tools` preset.
 ## Layout of the code
 
 ```
-visualclaude/
+clearbox/
   store.py        SQLite schema + DAG operations (ids, cycle check) + agent profiles
   engine.py       scheduler, node lifecycle, subplans, external-agent protocol
   bootstrap.py    built-in profiles, server default, startup banner and validation
-  mcp_bridge.py   MCP client that hands the visualclaude tools to non-Claude harnesses (vc_*)
+  mcp_bridge.py   MCP client that hands the clearbox tools to non-Claude harnesses (vc_*)
   mcp_tools.py    MCP tool definitions
   app.py          FastAPI: REST, SSE live stream, MCP mounted at /mcp
   agents.py       backwards-compatible aliases; the implementations moved to harness/

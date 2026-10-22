@@ -6,7 +6,7 @@ clobbering it, plus one node with no files that runs alongside them freely:
 
 None of the three nodes has a dependency on another, so without `files` all three would be free to
 run at once. `writer-a` and `writer-b` both declare `shared.txt`; `writer-c` declares nothing. Run
-against `uv run visualclaude --mock` and the three show up in the same graph layer, but `writer-b`
+against `uv run clearbox --mock` and the three show up in the same graph layer, but `writer-b`
 (the higher node number) is nudged down and waits for `writer-a` to finish before it starts, while
 `writer-c` runs at the same time as either.
 

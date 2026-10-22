@@ -1,4 +1,4 @@
-// VisualClaude frontend: plan DAG view + live agent transcripts. No build step, no deps.
+// Clearbox frontend: plan DAG view + live agent transcripts. No build step, no deps.
 "use strict";
 
 const NODE_W = 230, NODE_H = 88, H_GAP = 46, V_GAP = 66;
@@ -722,7 +722,7 @@ function diffStat(diff) {
   return { add, del };
 }
 // Agents call the file tools with absolute paths, so strip the plan's working directory:
-// "…\VisualClaude\visualclaude\app.py" reads as "visualclaude/app.py" in the file list.
+// "…\Clearbox\clearbox\app.py" reads as "clearbox/app.py" in the file list.
 function shortPath(p) {
   const wd = state.data?.working_directory;
   let s = String(p).replace(/\\/g, "/");
@@ -1202,7 +1202,7 @@ function renderAgentForm(body, a) {
     fld("ag-maxpar", "Max parallel", inp("ag-maxpar", v.max_parallel, { type: "number", min: 1, step: 1, placeholder: "unlimited" }), "at most this many nodes run on this agent at once (e.g. 1 for a single local GPU)"),
     el("div", { class: "fld", "data-only": "openai" },
       el("label", { for: "ag-preset" }, "Tools"), preset,
-      el("label", { class: "chk" }, mcp, " expose visualclaude MCP tools (plan building, report_progress)")),
+      el("label", { class: "chk" }, mcp, " expose clearbox MCP tools (plan building, report_progress)")),
     fld("ag-sys", "System prompt addition", sys),
     el("details", { class: "fld adv", open: Object.keys(params).length ? true : null },
       el("summary", {}, "Advanced params (JSON)"),

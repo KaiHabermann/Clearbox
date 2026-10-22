@@ -6,7 +6,7 @@ the Claude Agent SDK, such an endpoint is just a model: there is no agent loop
 and no tools on the other side. This module supplies both. It runs the classic
 loop (ask the model -> execute the tool calls it makes -> feed the results back
 -> repeat until it answers without tool calls) with the sandboxed ``Toolbox``
-from ``tools.py`` plus, when enabled, the visualclaude MCP tools through
+from ``tools.py`` plus, when enabled, the clearbox MCP tools through
 ``McpToolBridge``, and translates everything into the event contract from
 ``base.py``. That is the whole point: a session on a local llama shows up in the
 UI exactly like a Claude session, with no harness-specific code anywhere else.
@@ -281,7 +281,7 @@ class OpenAiHarness:
     """Runs an agent loop against an OpenAI-compatible chat-completions endpoint."""
 
     def __init__(self, profile: dict[str, Any] | None = None, mcp_url: str | None = None):
-        """``mcp_url`` is the visualclaude MCP endpoint when the server exposes it to
+        """``mcp_url`` is the clearbox MCP endpoint when the server exposes it to
         agents (``expose_mcp_to_agents``); the profile's ``tools.mcp`` can still
         switch the bridge off (or on, if a url is given)."""
         profile = profile or {}
@@ -386,7 +386,7 @@ class OpenAiHarness:
             env.append("- Tools: " + ", ".join(s.name for s in specs))
             if any(s.name.startswith("vc_") for s in specs):
                 env.append(
-                    "- The visualclaude plan tools mentioned above (create_plan, add_node, add_edge, ...) "
+                    "- The clearbox plan tools mentioned above (create_plan, add_node, add_edge, ...) "
                     "are available with a vc_ prefix: vc_create_plan, vc_add_node, vc_add_edge, ..."
                 )
         else:
@@ -525,7 +525,7 @@ class OpenAiHarness:
             bridge = McpToolBridge(self.mcp_url)  # type: ignore[arg-type]
             vc_specs = await bridge.specs()
             if not vc_specs:
-                yield "error", {"text": f"visualclaude MCP tools unavailable at {self.mcp_url}; continuing without them"}
+                yield "error", {"text": f"clearbox MCP tools unavailable at {self.mcp_url}; continuing without them"}
             specs = specs + vc_specs
         tools = [tool_param(s) for s in specs]
         messages: list[dict[str, Any]] = [

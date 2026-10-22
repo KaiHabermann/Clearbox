@@ -12,7 +12,7 @@ from .harness import HarnessError
 from .store import PlanError, public_profile, validate_working_directory
 
 INSTRUCTIONS = """
-VisualClaude lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
+Clearbox lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
 where every node is one piece of work. Edges point from a prerequisite to the node that
 depends on it (from_node_id must finish before to_node_id starts). Execution walks the graph
 from the roots to the leaves; independent nodes run in parallel.
@@ -46,7 +46,7 @@ Working on nodes as an external agent:
 
 
 def build_mcp(engine: Engine) -> MCPServer:
-    mcp = MCPServer("visualclaude", instructions=INSTRUCTIONS)
+    mcp = MCPServer("clearbox", instructions=INSTRUCTIONS)
     store = engine.store
 
     registry = engine.harnesses
@@ -241,7 +241,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         files (optional): list the files this node will CREATE or MODIFY; reading is always allowed
         and needs no declaration. Paths are relative to the plan's working directory, may name
         files that do not exist yet, and a directory claims everything under it.
-        Example: files=["visualclaude/store.py", "tests/"]. Two nodes that could otherwise run in
+        Example: files=["clearbox/store.py", "tests/"]. Two nodes that could otherwise run in
         parallel and declare the same file run one after the other (lowest node number first)
         instead of editing it at the same time. Nodes without files never wait for each other.
         """
@@ -396,7 +396,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         harness: 'claude-sdk' (Claude Agent SDK; model e.g. "claude-opus-5-5", empty = server default),
           'openai' (any OpenAI-compatible chat-completions endpoint) or 'mock' (fake agent for tests).
         For 'openai': model is required; base_url is the endpoint root ending in /v1 (empty = the real
-          OpenAI API); api_key_env is the NAME of an environment variable of the VisualClaude server
+          OpenAI API); api_key_env is the NAME of an environment variable of the Clearbox server
           holding the key (local endpoints usually need none). Examples:
             create_agent(name="gpt-mini", harness="openai", model="gpt-4o-mini",
                          api_key_env="OPENAI_API_KEY")

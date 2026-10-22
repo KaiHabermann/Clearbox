@@ -28,7 +28,7 @@ STATIC = Path(__file__).parent / "static"
 class Settings:
     host: str = "127.0.0.1"
     port: int = 8765
-    db: str = "visualclaude.db"
+    db: str = "clearbox.db"
     workdir: str = "workspace"
     agent: str = "claude"          # 'claude' | 'mock': the harness used when no agent profile applies
     default_agent: str | None = None  # --agent-profile: name of the server-wide default profile
@@ -181,7 +181,7 @@ def create_app(settings: Settings) -> FastAPI:
                 bus.publish({"type": "shutdown"})
                 await engine.shutdown()
 
-    app = FastAPI(title="VisualClaude", lifespan=lifespan)
+    app = FastAPI(title="Clearbox", lifespan=lifespan)
     app.state.engine = engine
     app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp

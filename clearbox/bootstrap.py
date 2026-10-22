@@ -33,7 +33,7 @@ from .harness.openai_compat import DEFAULT_BASE_URL, is_local_url
 from .harness.registry import HarnessRegistry
 from .store import PlanError, Store, public_profile
 
-log = logging.getLogger("visualclaude")
+log = logging.getLogger("clearbox")
 
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"  # only for the real OpenAI endpoint; other servers name their own models
 

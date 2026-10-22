@@ -1,6 +1,6 @@
 """Harness that runs a real Claude agent session through the Claude Agent SDK.
 
-This is the original VisualClaude backend. Its settings can come from an agent
+This is the original Clearbox backend. Its settings can come from an agent
 profile (when a node or plan selects one) or from the explicit constructor
 arguments, which carry the CLI defaults; profile values win when present.
 """
@@ -85,8 +85,8 @@ class ClaudeSdkHarness:
         mcp_servers: dict[str, Any] = {}
         allowed = list(self.allowed_tools)
         if self.mcp_url:
-            mcp_servers["visualclaude"] = {"type": "http", "url": self.mcp_url}
-            allowed.append("mcp__visualclaude")
+            mcp_servers["clearbox"] = {"type": "http", "url": self.mcp_url}
+            allowed.append("mcp__clearbox")
 
         system_append = job.system_append
         if self.system_append:

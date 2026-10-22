@@ -10,7 +10,7 @@ The probe is one tiny, tool-less round trip that asks the model to reply "OK":
   url, key and params, no retries. Errors carry the same actionable wording a
   failed node would show (wrong /v1 path, 401, unknown model, ...).
 - ``claude-sdk``: a one-turn Claude Agent SDK session in a throwaway directory,
-  without tools or the visualclaude MCP server. This checks that the CLI starts
+  without tools or the clearbox MCP server. This checks that the CLI starts
   and is logged in, and costs a few tokens.
 - ``mock``: always fine, instantly.
 

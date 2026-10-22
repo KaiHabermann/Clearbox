@@ -1,4 +1,4 @@
-"""MCP tool bridge: hand the visualclaude MCP tools to harnesses without an MCP client.
+"""MCP tool bridge: hand the clearbox MCP tools to harnesses without an MCP client.
 
 A built-in Claude agent reaches the service's own MCP endpoint through the
 Claude Agent SDK; that is how a node "expands" itself into a subplan (see
@@ -36,7 +36,7 @@ from mcp.client.client import Client
 from .harness.base import _truncate
 from .harness.tools import ToolError, ToolSpec
 
-log = logging.getLogger("visualclaude")
+log = logging.getLogger("clearbox")
 
 PREFIX = "vc_"
 
@@ -86,7 +86,7 @@ def _flatten(result: Any) -> str:
 
 
 class McpToolBridge:
-    """The allowlisted visualclaude MCP tools of one server, as ``ToolSpec``s.
+    """The allowlisted clearbox MCP tools of one server, as ``ToolSpec``s.
 
     ``vc_report_progress`` duplicates what the harness already emits: every
     text/tool_use/tool_result event of the agent is recorded on the node anyway,
@@ -107,7 +107,7 @@ class McpToolBridge:
         # anyio wraps transport errors in (nested) ExceptionGroups; show the real cause.
         while getattr(e, "exceptions", None):  # BaseExceptionGroup is 3.11+
             e = e.exceptions[0]
-        msg = f"visualclaude MCP endpoint {self.url} unreachable ({what}): {type(e).__name__}: {e}"
+        msg = f"clearbox MCP endpoint {self.url} unreachable ({what}): {type(e).__name__}: {e}"
         if not self._warned:
             self._warned = True
             log.warning("%s", msg)

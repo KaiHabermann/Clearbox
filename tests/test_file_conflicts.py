@@ -16,7 +16,7 @@ Every plan and profile it creates is deleted again.
 The server's --max-concurrency must be exactly 3 (the default) -- part 2 asserts
 that three file-disjoint nodes overlap.
 
-Run:  uv run visualclaude --mock      (one shell)
+Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_file_conflicts.py [http://127.0.0.1:8765]
 """
 import asyncio, json, os, sys, tempfile, time, uuid
@@ -25,7 +25,7 @@ import urllib.request
 from mcp.client.client import Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from visualclaude.store import PlanError, Store, keys_conflict, normalize_file
+from clearbox.store import PlanError, Store, keys_conflict, normalize_file
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
 TAG = uuid.uuid4().hex[:6]

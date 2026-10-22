@@ -4,7 +4,7 @@ Also covers the file-scoping surface: `files`, `conflicts` and `blocked_by` in
 get_plan and the REST node view, update_node / set_node_files / PUT .../files.
 Scheduling with files is proven in test_file_conflicts.py.
 
-Run:  uv run visualclaude --mock --mock-speed 20      (one shell)
+Run:  uv run clearbox --mock --mock-speed 20      (one shell)
       uv run python tests/test_flow.py [http://127.0.0.1:8765]
 """
 import asyncio, json, sys, time
