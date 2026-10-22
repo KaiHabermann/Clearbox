@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -516,19 +517,30 @@ def create_app(settings: Settings) -> FastAPI:
     async def stream(request: Request) -> StreamingResponse:
         q = bus.subscribe()
 
+        def stopping() -> bool:
+            """True once Ctrl+C arrived. Checked here because uvicorn waits for open
+            connections before the lifespan shutdown runs, and this response never ends
+            on its own -- an open browser tab would otherwise block the whole exit."""
+            server = getattr(app.state, "server", None)
+            return bool(server is not None and server.should_exit)
+
         async def gen():
+            last_ping = time.monotonic()
             try:
                 yield "event: hello\ndata: {}\n\n"
                 while True:
-                    if await request.is_disconnected():
+                    if stopping() or await request.is_disconnected():
                         break
                     try:
-                        msg = await asyncio.wait_for(q.get(), timeout=15)
+                        # short wait so a stop is noticed quickly; the ping stays on 15s
+                        msg = await asyncio.wait_for(q.get(), timeout=1)
                         if msg.get("type") == "shutdown":
-                            break  # the server is stopping; end the response so it can
+                            break
                         yield f"data: {json.dumps(msg, default=str)}\n\n"
                     except asyncio.TimeoutError:
-                        yield ": ping\n\n"
+                        if time.monotonic() - last_ping >= 15:
+                            yield ": ping\n\n"
+                            last_ping = time.monotonic()
             finally:
                 bus.unsubscribe(q)
 
