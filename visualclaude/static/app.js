@@ -49,6 +49,27 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
 function fmtTime(ts) { return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
 function fmtDur(s) { if (s == null) return ""; s = Math.max(0, Math.round(s)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`; }
 function fmtTokens(n) { return n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`; }
+
+// "↓12.3k ↑4.5k" in the node box: input and output tokens as separate live counters.
+// Tagged with the node id so a {"type":"tokens"} message can retarget them without a redraw.
+function tokenCounters(tin, tout, nodeId) {
+  const g = el("svg:g", { class: "tok", "data-tok": nodeId });
+  const t = el("svg:text", { x: NODE_W - 12, y: 50, "text-anchor": "end" },
+    el("svg:tspan", { class: "tok-in" }, `↓${fmtTokens(tin)}`),
+    el("svg:tspan", { class: "tok-out", dx: 7 }, `↑${fmtTokens(tout)}`));
+  t.append(el("svg:title", {}, `${tin.toLocaleString()} tokens in · ${tout.toLocaleString()} out`));
+  g.append(t);
+  return g;
+}
+
+function updateTokenCounters(nodeId, tin, tout) {
+  const g = document.querySelector(`#nodes g.tok[data-tok="${nodeId}"]`);
+  if (!g) return false;
+  g.querySelector(".tok-in").textContent = `↓${fmtTokens(tin)}`;
+  g.querySelector(".tok-out").textContent = `↑${fmtTokens(tout)}`;
+  g.querySelector("title").textContent = `${tin.toLocaleString()} tokens in · ${tout.toLocaleString()} out`;
+  return true;
+}
 function mdInline(s) {
   return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
 }
@@ -572,10 +593,8 @@ function renderGraph() {
     g.append(el("svg:text", { class: "ref", x: NODE_W - 12, y: 20, "text-anchor": "end" }, `${d.plan.id}.${n.node_id}`));
 
     if (!n.subplan_id && (n.tokens_in != null || n.tokens_out != null)) {
-      const tin = n.tokens_in || 0, tout = n.tokens_out || 0;
-      const tok = el("svg:text", { class: "tok", x: NODE_W - 12, y: 50, "text-anchor": "end" }, fmtTokens(tin + tout));
-      tok.append(el("svg:title", {}, `${tin.toLocaleString()} in · ${tout.toLocaleString()} out`));
-      g.append(tok);
+      // two counters, updated live from {"type":"tokens"} while the node runs
+      g.append(tokenCounters(n.tokens_in || 0, n.tokens_out || 0, n.node_id));
     }
 
     // agent chip: only where this node's agent differs from the plan's default (uniform plans stay quiet);
@@ -1235,6 +1254,13 @@ function connect() {
       else if (msg.deleted && state.planId === msg.plan_id) { state.planId = null; renderEmpty("Plan deleted."); }
     } else if (msg.type === "agents") {
       loadAgentsSoon();
+    } else if (msg.type === "tokens") {
+      const n = state.data?.nodes.find((x) => x.node_id === msg.node_id);
+      if (n && state.data.plan.id === msg.plan_id) {
+        n.tokens_in = msg.tokens_in; n.tokens_out = msg.tokens_out;
+        // patch the counters in place; only redraw if the node had none yet
+        if (!updateTokenCounters(msg.node_id, msg.tokens_in, msg.tokens_out)) renderGraph();
+      }
     } else if (msg.type === "event") {
       const ev = msg.event;
       if (state.sel && ev.plan_id === state.sel.plan_id && ev.node_id === state.sel.node_id) {

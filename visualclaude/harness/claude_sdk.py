@@ -13,6 +13,19 @@ from typing import Any, AsyncIterator
 from .base import AgentJob, _tool_result_text, _truncate
 
 
+def _usage_pair(usage: Any) -> tuple[int | None, int | None]:
+    """(input, output) tokens from an SDK usage dict; cache reads/writes count as input."""
+    if not usage:
+        return None, None
+    tokens_in = (
+        int(usage.get("input_tokens") or 0)
+        + int(usage.get("cache_creation_input_tokens") or 0)
+        + int(usage.get("cache_read_input_tokens") or 0)
+    )
+    out = usage.get("output_tokens")
+    return tokens_in, (int(out) if out is not None else None)
+
+
 def _as_json(value: Any, default: Any) -> Any:
     """Profile columns like params/tools may arrive as JSON text or already decoded."""
     if value is None or value == "":
@@ -100,6 +113,11 @@ class ClaudeSdkHarness:
                     }
             elif isinstance(msg, AssistantMessage):
                 sub = msg.parent_tool_use_id
+                tin, tout = _usage_pair(msg.usage)
+                if tin or tout:
+                    # per-turn delta, so the UI can count up while the node runs; the
+                    # ResultMessage below still carries the authoritative totals
+                    yield "usage", {"tokens_in": tin or 0, "tokens_out": tout or 0}
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         if block.text.strip():
@@ -125,13 +143,7 @@ class ClaudeSdkHarness:
                                 "parent_tool_use_id": msg.parent_tool_use_id,
                             }
             elif isinstance(msg, ResultMessage):
-                usage = msg.usage or {}
-                tokens_in = (
-                    int(usage.get("input_tokens") or 0)
-                    + int(usage.get("cache_creation_input_tokens") or 0)
-                    + int(usage.get("cache_read_input_tokens") or 0)
-                ) if usage else None
-                tokens_out = int(usage["output_tokens"]) if usage.get("output_tokens") is not None else None
+                tokens_in, tokens_out = _usage_pair(msg.usage)
                 yield "result", {
                     "text": msg.result or "",
                     "is_error": bool(msg.is_error),

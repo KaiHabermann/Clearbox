@@ -559,6 +559,12 @@ class OpenAiHarness:
                         await self._complete(client, base_kwargs, messages, acc, include_usage)
                     else:
                         raise
+                if acc.usage:
+                    # per-turn delta so the UI can count up while the node runs
+                    yield "usage", {
+                        "tokens_in": int(getattr(acc.usage, "prompt_tokens", 0) or 0),
+                        "tokens_out": int(getattr(acc.usage, "completion_tokens", 0) or 0),
+                    }
                 state.add_usage(acc.usage)
 
                 text = acc.text

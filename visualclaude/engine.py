@@ -170,8 +170,24 @@ class Engine:
     def _emit(self, plan_id: int, node_id: int, kind: str, data: dict[str, Any]) -> None:
         if kind == "tool_use":
             self._snapshot_file_tool(plan_id, node_id, data)
+        if kind == "usage":
+            self._add_usage(plan_id, node_id, data)
+            return  # a running total, not something to show in the transcript
         ev = self.store.add_event(plan_id, node_id, kind, data)
         self.bus.publish({"type": "event", "event": ev})
+
+    def _add_usage(self, plan_id: int, node_id: int, data: dict[str, Any]) -> None:
+        """Add one turn's tokens to the node's running total and push it to the browser.
+
+        Sent as its own small message rather than a plan refresh: this arrives once
+        per model turn, and the card only needs two numbers.
+        """
+        n = self.store.get_node(plan_id, node_id)
+        tokens_in = (n["tokens_in"] or 0) + int(data.get("tokens_in") or 0)
+        tokens_out = (n["tokens_out"] or 0) + int(data.get("tokens_out") or 0)
+        self.store.update_node(plan_id, node_id, tokens_in=tokens_in, tokens_out=tokens_out)
+        self.bus.publish({"type": "tokens", "plan_id": plan_id, "node_id": node_id,
+                          "tokens_in": tokens_in, "tokens_out": tokens_out})
 
     def notify_plan(self, plan_id: int) -> None:
         try:
@@ -612,7 +628,9 @@ class Engine:
 
     # ------------------------------------------------------------ builtin runs
     def _spawn(self, plan_id: int, node_id: int, profile: dict[str, Any] | None, harness: Harness) -> None:
-        self.store.update_node(plan_id, node_id, agent_done=0, result=None, error=None)
+        # tokens_in/out count up from the "usage" events of this run, so a retry starts at zero
+        self.store.update_node(plan_id, node_id, agent_done=0, result=None, error=None,
+                               tokens_in=None, tokens_out=None)
         self.store.clear_node_diffs(plan_id, node_id)
         self._set_status(plan_id, node_id, "running", agent_kind="builtin",
                          agent_name=self.harnesses.agent_name(profile))
@@ -695,12 +713,38 @@ class Engine:
         self.kick()
 
     # ----------------------------------------------------------- user controls
+    def _dir_clash(self, plan_id: int) -> dict[str, Any] | None:
+        """A started plan with unfinished work whose folder overlaps this one's.
+
+        File-conflict locking only orders nodes inside one plan tree, so two plans
+        in the same folder (or nested folders) would edit the same files with
+        nothing coordinating them. Refusing to start is better than the clobbering.
+        """
+        mine = os.path.normcase(os.path.normpath(self.plan_workdir(plan_id)))
+        for other in self.store.started_root_plans():
+            if other["id"] == plan_id:
+                continue
+            counts = self.rollup(other["id"])
+            if counts["pending"] + counts["ready"] + counts["running"] == 0:
+                continue  # finished: it is not going to touch anything any more
+            theirs = os.path.normcase(os.path.normpath(self.plan_workdir(other["id"])))
+            if mine == theirs or mine.startswith(theirs + os.sep) or theirs.startswith(mine + os.sep):
+                return other
+        return None
+
     def start_plan(self, plan_id: int, executor: str = "builtin") -> None:
         if executor not in ("builtin", "external"):
             raise PlanError("executor must be 'builtin' or 'external'")
         plan = self.store.get_plan(plan_id)
         if plan["parent_plan_id"] is not None:
             raise PlanError(f"plan {plan_id} is a subplan; start its root plan {self.store.root_of(plan_id)['id']}")
+        clash = self._dir_clash(plan_id)
+        if clash is not None:
+            raise PlanError(
+                f"plan {clash['id']} ({clash['title']}) is still running in "
+                f"{self.plan_workdir(clash['id'])}. Two plans must not work in the same folder at "
+                "once: stop it, or give one of them a different working directory."
+            )
         self.store.set_plan_started(plan_id, executor, True)
         self.notify_plan(plan_id)
         self.kick()
