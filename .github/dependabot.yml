@@ -1,0 +1,19 @@
+# The workflows pin exact action versions so a release is reproducible; this is what keeps
+# those pins from going stale. Grouped into one PR a month so it stays quiet.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]

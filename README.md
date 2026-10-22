@@ -19,9 +19,18 @@ worked on right now, and — on click — the agent's session in that node as it
                      browser UI  (DAG view, running markers, live transcripts)
 ```
 
+## Install
+
+Needs Python ≥ 3.10.
+
+```powershell
+uv tool install clearbox        # or: pipx install clearbox, or: pip install clearbox
+clearbox --mock                 # fake agents: try the UI without spending tokens
+```
+
 ## Quick start
 
-Needs Python ≥ 3.10. With [uv](https://docs.astral.sh/uv/):
+From a clone, with [uv](https://docs.astral.sh/uv/):
 
 ```powershell
 cd Clearbox
@@ -512,3 +521,29 @@ tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rule
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
 tests/test_openai_harness.py  the agent loop against tests/fake_openai.py (no network, no DB)
 ```
+
+## Releasing
+
+The git tag is the trigger and the single source of truth. Bump the version, tag it, push:
+
+```powershell
+uv version --bump patch         # or minor / major; edits pyproject.toml
+git commit -am "release v0.1.1"
+git tag v0.1.1
+git push origin main --tags
+```
+
+`.github/workflows/release.yml` then builds the sdist and wheel, refuses to continue if the tag
+disagrees with `pyproject.toml`, checks the wheel really contains `clearbox/static/`, publishes to
+PyPI, and only then creates the GitHub release with the artifacts attached. PyPI goes first
+because an upload there is permanent, while a GitHub release can be deleted and recreated.
+
+Publishing uses **PyPI Trusted Publishing**, so there is no API token in the repository. Configure
+it once on PyPI under *Publishing* with: owner `kaihabermann`, repository `clearbox`, workflow
+`release.yml`, environment `pypi`. Before the first release the project does not exist on PyPI
+yet — add it as a *pending publisher* on your account instead, with the same four values.
+
+`.github/workflows/ci.yml` runs the same build plus the mock-agent test suite on every push and
+pull request, and installs the built wheel into a clean environment to catch a packaging mistake
+that an editable install would hide. Action versions are pinned exactly and kept current by
+Dependabot.

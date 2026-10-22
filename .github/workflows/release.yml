@@ -1,0 +1,97 @@
+# Release: push a tag, get a PyPI release and a GitHub release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag is the trigger and the single source of truth. PyPI is published FIRST and the GitHub
+# release is created only if that succeeded, because a PyPI upload cannot be undone or replaced
+# while a GitHub release can be deleted and recreated freely. Doing it the other way round would
+# leave a published release announcing a version nobody can install.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC), so there is no API token in this repository.
+# One-time setup on PyPI -> your project -> Publishing -> Add a new publisher:
+#   Owner: kaihabermann   Repository: clearbox   Workflow: release.yml   Environment: pypi
+# For the very first release the project does not exist on PyPI yet: add it as a *pending*
+# publisher under your account instead (Your projects -> Publishing), with the same four values.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}   # lets you re-run a build without tagging; publishing still needs a tag
+
+permissions: {}           # nothing by default; each job asks for exactly what it needs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: true
+
+      # A tag that disagrees with pyproject.toml is the classic way to publish 0.1.0 twice and
+      # burn the version number, so fail before anything is built.
+      - name: Tag must match the project version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          project="$(uv version --short)"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "pyproject: $project / tag: $tag"
+          [ "$project" = "$tag" ] || { echo "::error::tag $GITHUB_REF_NAME does not match version $project in pyproject.toml"; exit 1; }
+
+      - run: uv build
+      - name: Check the artifacts render on PyPI
+        run: uvx twine check --strict dist/*
+
+      # The wheel is useless without the browser UI, and nothing else would notice it missing.
+      - name: Wheel must contain the static UI
+        run: |
+          python -m zipfile -l dist/*.whl | tee /tmp/wheel.txt
+          for f in static/index.html static/app.js static/style.css; do
+            grep -q "clearbox/$f" /tmp/wheel.txt || { echo "::error::$f missing from the wheel"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  pypi:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/clearbox
+    permissions:
+      id-token: write        # mints the OIDC token Trusted Publishing exchanges for an upload token
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
+
+  github-release:
+    needs: pypi              # only announce what is actually installable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0     # --generate-notes needs the history to diff against the previous tag
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

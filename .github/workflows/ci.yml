@@ -1,0 +1,80 @@
+# Checks on every push and pull request. Deliberately small: the package must build, install
+# clean and start, and the tests that need no API key must pass. Everything here also runs as
+# part of a release, so a green CI means a tag will not fail halfway through publishing.
+name: ci
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:                       # a new push supersedes an in-flight run of the same branch
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]   # the oldest supported and the newest, not every version between
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+
+      - run: uv sync
+
+      # Needs no server and no network: the OpenAI-compatible harness against a scripted fake.
+      - name: Harness tests
+        run: uv run python tests/test_openai_harness.py
+
+      # The rest drive a real server. Mock agents only, so no API key and no token spend.
+      - name: Start a mock server
+        run: |
+          uv run clearbox --mock --port 8765 --db "$RUNNER_TEMP/ci.db" --workdir "$RUNNER_TEMP/ws" &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8765/api/plans >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::server did not come up"; exit 1
+
+      - name: End-to-end tests
+        run: |
+          for t in test_flow test_agents_api test_file_conflicts test_mixed_run test_rework; do
+            echo "::group::$t"
+            uv run python "tests/$t.py" http://127.0.0.1:8765
+            echo "::endgroup::"
+          done
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: true
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+
+      # Install the built wheel into a clean environment -- this is what a user gets from PyPI,
+      # and it catches a missing data file or entry point that an editable install hides.
+      - name: Install the wheel and run it
+        run: |
+          uv venv /tmp/fresh
+          VIRTUAL_ENV=/tmp/fresh uv pip install dist/*.whl
+          /tmp/fresh/bin/clearbox --help
+          /tmp/fresh/bin/python -c "
+          from pathlib import Path
+          import clearbox.app as a
+          for f in ('index.html', 'app.js', 'style.css'):
+              assert (a.STATIC / f).is_file(), f'{f} missing from the installed package'
+          print('static UI present in the installed wheel')
+          "
