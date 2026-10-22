@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VisualClaude</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="brand"><span class="logo"></span>VisualClaude</div>
+    <div class="section-label">Plans</div>
+    <ul id="plan-list"></ul>
+    <div class="sidebar-foot">
+      <span id="conn" class="conn off" title="live connection"></span>
+      <span id="conn-text">connecting…</span>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <nav id="crumbs"></nav>
+      <span id="plan-status" class="pill"></span>
+      <div class="spacer"></div>
+      <div id="controls"></div>
+    </header>
+    <div id="active-bar"></div>
+    <div id="canvas-wrap">
+      <svg id="canvas">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-head"></path>
+          </marker>
+          <marker id="arrow-done" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-head done"></path>
+          </marker>
+          <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-head active"></path>
+          </marker>
+        </defs>
+        <g id="viewport"><g id="edges"></g><g id="nodes"></g></g>
+      </svg>
+      <div id="empty" class="empty hidden"></div>
+      <div id="legend">
+        <span><i class="dot pending"></i>pending</span>
+        <span><i class="dot ready"></i>ready</span>
+        <span><i class="dot running"></i>running</span>
+        <span><i class="dot done"></i>done</span>
+        <span><i class="dot failed"></i>failed</span>
+        <span><i class="stack-icon"></i>subplan</span>
+      </div>
+      <div id="zoom">
+        <button data-z="in" title="zoom in">+</button>
+        <button data-z="out" title="zoom out">−</button>
+        <button data-z="fit" title="fit to screen">⤢</button>
+      </div>
+    </div>
+  </main>
+
+  <aside id="drawer" class="closed">
+    <div id="drawer-head"></div>
+    <div id="drawer-body">
+      <div id="node-info"></div>
+      <div class="transcript-head">
+        <span>Agent session</span>
+        <label class="follow"><input type="checkbox" id="follow" checked> follow</label>
+      </div>
+      <div id="transcript"></div>
+    </div>
+  </aside>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
