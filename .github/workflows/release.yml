@@ -47,7 +47,7 @@ jobs:
       # The wheel is useless without the browser UI, and nothing else would notice it missing.
       - name: Wheel must contain the static UI
         run: |
-          python -m zipfile -l dist/*.whl | tee /tmp/wheel.txt
+          python3 -m zipfile -l dist/*.whl | tee /tmp/wheel.txt
           for f in static/index.html static/app.js static/style.css; do
             grep -q "clearbox/$f" /tmp/wheel.txt || { echo "::error::$f missing from the wheel"; exit 1; }
           done
