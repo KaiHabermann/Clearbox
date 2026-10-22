@@ -20,6 +20,9 @@ const state = {
   agents: [],          // /api/agents (public profiles: no secrets)
   agentSel: null,      // agent panel: null (closed) | "list" | "new" | profile id
   agentDirty: false,   // the open agent form has unsaved edits
+  workdirEdit: false,  // the topbar working-directory pill is open as an editable input
+  fullOpen: false,     // the full-screen node review is open
+  nodeInfoResp: null,  // last /nodes/:id response, used to rebuild #node-info when full view closes
 };
 
 // ------------------------------------------------------------------ utils
@@ -72,6 +75,10 @@ function md(text) {
   return parts.map((p, i) => (i % 2) ? `<pre>${esc(p.replace(/^\w*\n/, ""))}</pre>` : mdBlock(p)).join("");
 }
 function truncate(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+function lastSeg(path) {
+  const parts = String(path ?? "").split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(path ?? "");
+}
 const put = (p, body) => api(p, { method: "PUT", body: JSON.stringify(body || {}) });
 
 // ---------------------------------------------------------------- agents
@@ -121,8 +128,8 @@ function agentSelect(current, inheritLabel, onchange, attrs = {}) {
 
 // ---------------------------------------------------------------- routing
 function parseHash() {
-  const m = location.hash.match(/^#\/plan\/(\d+)(?:\/node\/(\d+))?/);
-  return m ? { plan: +m[1], node: m[2] ? +m[2] : null } : null;
+  const m = location.hash.match(/^#\/plan\/(\d+)(?:\/node\/(\d+)(\/full)?)?/);
+  return m ? { plan: +m[1], node: m[2] ? +m[2] : null, full: !!m[3] } : null;
 }
 function parseAgentHash() {
   const m = location.hash.match(/^#\/agents(?:\/(\d+|new))?\/?$/);
@@ -133,7 +140,7 @@ function setHash() {
   if (state.agentSel != null) h = state.agentSel === "list" ? "#/agents" : `#/agents/${state.agentSel}`;
   else if (state.planId != null) {
     h = `#/plan/${state.planId}`;
-    if (state.sel && state.sel.plan_id === state.planId) h += `/node/${state.sel.node_id}`;
+    if (state.sel && state.sel.plan_id === state.planId) h += `/node/${state.sel.node_id}${state.fullOpen ? "/full" : ""}`;
   } else if (parseAgentHash()) h = location.pathname + location.search;  // agent panel closed, no plan shown
   else return;
   if (location.hash !== h) history.replaceState(null, "", h);
@@ -143,7 +150,14 @@ window.addEventListener("hashchange", () => {
   if (ag) { if (ag.agent !== state.agentSel) openAgentPanel(ag.agent); return; }
   if (state.agentSel != null) closeAgentPanel(false);
   const r = parseHash();
-  if (r && r.plan !== state.planId) openPlan(r.plan, r.node);
+  if (!r) return;
+  if (r.plan !== state.planId) {
+    openPlan(r.plan, r.node).then(() => { if (r.full && r.node != null) openFullView(false); });
+    return;
+  }
+  if (r.node != null && (!state.sel || state.sel.node_id !== r.node)) selectNode(r.plan, r.node);
+  if (r.full && r.node != null && !state.fullOpen) openFullView(false);
+  if (!r.full && state.fullOpen) closeFullView(false);
 });
 
 // ------------------------------------------------------------- plan list
@@ -167,13 +181,14 @@ function renderPlanList() {
       el("i", { class: `dot ${st}` }),
       el("span", { class: "pl-title", title: p.title }, p.title),
       el("span", { class: "pl-id" }, `#${p.id}`),
-      bar));
+      bar,
+      el("span", { class: "pl-dir", title: p.working_directory }, lastSeg(p.working_directory))));
   }
 }
 
 // ------------------------------------------------------------- plan view
 async function openPlan(planId, nodeId = null) {
-  if (planId !== state.planId) { state.sel = null; closeDrawer(false); }
+  if (planId !== state.planId) { state.sel = null; closeDrawer(false); state.workdirEdit = false; }
   state.planId = planId;
   await refreshPlan();
   if (nodeId != null) selectNode(planId, nodeId);
@@ -199,7 +214,49 @@ const loadPlansSoon = debounce(loadPlans, 400);
 function renderEmpty(html) {
   $("#nodes").innerHTML = ""; $("#edges").innerHTML = "";
   const e = $("#empty"); e.innerHTML = html; e.classList.remove("hidden");
-  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = "";
+  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-workdir").innerHTML = "";
+}
+
+// Working-directory pill: shows the resolved directory (hover for the full path), clickable to
+// change it on a not-yet-started top-level plan. Skipped while state.workdirEdit is true so an SSE-
+// triggered refresh does not clobber an input the user is actively typing into.
+function renderWorkdir(d) {
+  if (state.workdirEdit) return;
+  const box = $("#plan-workdir");
+  box.innerHTML = "";
+  const dir = d.working_directory, topLevel = !d.ancestors.length, editable = topLevel && !d.root.started;
+  box.className = `workdir-ctl${editable ? "" : " locked"}`;
+  box.title = editable ? `Working directory — click to change:\n${dir}`
+    : `Working directory:\n${dir}` + (topLevel ? "\n(locked while the plan is running)" : "\n(set on the top-level plan)");
+  box.append(el("span", { class: "wd-ic" }, "📁"), el("span", { class: "wd-txt" }, lastSeg(dir)));
+  box.onclick = editable ? () => startWorkdirEdit(d.plan.id, dir) : null;
+}
+function startWorkdirEdit(planId, current) {
+  state.workdirEdit = true;
+  const box = $("#plan-workdir");
+  box.onclick = null;
+  box.className = "workdir-ctl editing";
+  box.innerHTML = "";
+  const input = el("input", { class: "workdir-input", value: current });
+  const err = el("span", { class: "workdir-err" });
+  let done = false;
+  const finish = async () => {
+    if (done) return;
+    const val = input.value.trim();
+    if (val === current) { done = true; state.workdirEdit = false; renderHeader(); return; }
+    try {
+      await put(`/api/plans/${planId}/workdir`, { dir: val || null });
+      done = true; state.workdirEdit = false;
+      await refreshPlan();
+    } catch (e) { err.textContent = e.message; }
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish();
+    if (e.key === "Escape") { done = true; state.workdirEdit = false; renderHeader(); }
+  });
+  input.addEventListener("blur", () => setTimeout(finish, 100));
+  box.append(input, err);
+  input.focus(); input.select();
 }
 
 function renderHeader() {
@@ -218,6 +275,8 @@ function renderHeader() {
   pill.className = `pill ${st}`;
   pill.textContent = d.root.started ? `${st} · ${d.root.executor}` : st;
   pill.title = `${d.progress.done}/${d.progress.total} tasks done`;
+
+  renderWorkdir(d);
 
   // plan-wide default agent: applies to this plan's nodes and (unless they set their own) its subplans
   const pa = $("#plan-agent");
@@ -607,10 +666,64 @@ function ensureVisible(nodeId) {
   }
 }
 function closeDrawer(update = true) {
+  if (state.fullOpen) closeFullView(false);
   $("#drawer").classList.add("closed");
-  state.sel = null; state.nodeData = null;
+  state.sel = null; state.nodeData = null; state.nodeInfoResp = null;
   if (update && state.data) { renderGraph(); setHash(); }
 }
+
+// ------------------------------------------------------------ full view
+// Full-screen node review, opened from the drawer. It does not re-implement the drawer's renderers:
+// it physically relocates the live #drawer-head / #node-info / #transcript-head / #transcript
+// elements into the full-view layout (and back on close), so renderNodeInfo/appendEvent/etc keep
+// working unmodified via their existing #id selectors regardless of which container currently holds
+// them. The one exception is the Changes/diffs block (#changes-row, inside #node-info): it gets its
+// own wide column while full view is open, via relocateForFull(), called at the end of every
+// renderNodeInfo() so it follows node switches and live updates.
+const drawerSlots = {
+  head: $("#drawer-head"), info: $("#node-info"), thead: $("#transcript-head"), transcript: $("#transcript"),
+};
+const drawerHome = new Map(Object.values(drawerSlots).map((el) => [el, { parent: el.parentNode, next: el.nextSibling }]));
+function relocateForFull() {
+  const cr = document.getElementById("changes-row"), col = $("#full-changes-col");
+  if (!col) return;
+  if (state.fullOpen) { if (cr && cr.parentNode !== col) { col.innerHTML = ""; col.append(cr); } }
+  else if (cr && cr.parentNode === col) $("#node-info").append(cr);  // info was just rebuilt without it
+}
+function openFullView(push = true) {
+  if (!state.sel || state.fullOpen) return;
+  state.fullOpen = true;
+  $("#full-head-slot").append(drawerSlots.head);
+  $("#full-info-col").append(drawerSlots.info);
+  $("#full-transcript-col").append(drawerSlots.thead, drawerSlots.transcript);
+  relocateForFull();
+  $("#full-view").classList.remove("closed");
+  if (push) setHash();
+}
+function closeFullView(push = true) {
+  if (!state.fullOpen) return;
+  state.fullOpen = false;
+  $("#full-view").classList.add("closed");
+  for (const [el, home] of drawerHome) home.parent.insertBefore(el, home.next);
+  if (state.nodeInfoResp) renderNodeInfo(state.nodeInfoResp);  // rebuilds #node-info with Changes back inline
+  if (push) setHash();
+}
+function navFull(dir) {
+  if (!state.sel || !state.data) return;
+  const ids = state.data.nodes.map((n) => n.node_id).sort((a, b) => a - b);
+  const i = ids.indexOf(state.sel.node_id);
+  if (i < 0) return;
+  selectNode(state.planId, ids[(i + dir + ids.length) % ids.length]);
+}
+$("#full-exit").addEventListener("click", () => closeFullView());
+$("#full-prev").addEventListener("click", () => navFull(-1));
+$("#full-next").addEventListener("click", () => navFull(1));
+document.addEventListener("keydown", (e) => {
+  if (!state.fullOpen || e.defaultPrevented || /^(input|textarea|select)$/i.test(e.target.tagName)) return;
+  if (e.key === "Escape") { closeFullView(); return; }
+  if (e.key === "ArrowLeft" || e.key === "k") { e.preventDefault(); navFull(-1); }
+  else if (e.key === "ArrowRight" || e.key === "j") { e.preventDefault(); navFull(1); }
+});
 
 async function refreshNodeInfo(withEvents = false) {
   const s = state.sel; if (!s) return;
@@ -619,6 +732,7 @@ async function refreshNodeInfo(withEvents = false) {
   catch { closeDrawer(); return; }
   if (!state.sel || state.sel.plan_id !== s.plan_id || state.sel.node_id !== s.node_id) return;
   state.nodeData = r.node;
+  state.nodeInfoResp = r;
   renderNodeInfo(r);
   if (withEvents) r.events.forEach(appendEvent);
   updateTyping();
@@ -637,6 +751,7 @@ function renderNodeInfo(r) {
         el("span", { style: "font-family:var(--mono)" }, `plan ${pid} · node ${n.node_id}`),
         agent && el("span", {}, agent),
         n.session_id && el("span", { title: "agent session id", style: "font-family:var(--mono)" }, truncate(n.session_id, 14)))),
+    el("button", { class: "expand", title: "full screen (⤢)", "aria-label": "expand to full screen", onclick: () => openFullView() }, "⤢"),
     el("button", { class: "close", onclick: () => closeDrawer() }, "✕"));
 
   const info = $("#node-info");
@@ -673,6 +788,7 @@ function renderNodeInfo(r) {
     onclick: () => completeNode(pid, n),
   }, "✓ Mark done"));
   if (actions.children.length) info.append(actions);
+  relocateForFull();
 }
 
 function nodeLink(ref) {
@@ -741,7 +857,7 @@ function diffHtml(diff) {
 }
 function renderChangesRow(pid, n) {
   const v = el("div", { class: "v diffs-row" }, el("div", { class: "files-empty" }, "loading…"));
-  const wrap = el("div", {}, el("div", { class: "k" }, "Changes"), v);
+  const wrap = el("div", { id: "changes-row" }, el("div", { class: "k" }, "Changes"), v);
   api(`/api/plans/${pid}/nodes/${n.node_id}/diffs`).then((r) => {
     v.innerHTML = "";
     if (!r.diffs.length) { v.append(el("div", { class: "files-empty" }, "no file changes captured")); return; }

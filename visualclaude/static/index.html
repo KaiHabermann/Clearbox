@@ -27,6 +27,7 @@
     <header id="topbar">
       <nav id="crumbs"></nav>
       <span id="plan-status" class="pill"></span>
+      <span id="plan-workdir" class="workdir-ctl"></span>
       <span id="plan-agent" class="agent-ctl"></span>
       <div class="spacer"></div>
       <div id="controls"></div>
@@ -75,13 +76,28 @@
     <div id="drawer-head"></div>
     <div id="drawer-body">
       <div id="node-info"></div>
-      <div class="transcript-head">
+      <div class="transcript-head" id="transcript-head">
         <span>Agent session</span>
         <label class="follow"><input type="checkbox" id="follow" checked> follow</label>
       </div>
       <div id="transcript"></div>
     </div>
   </aside>
+
+  <div id="full-view" class="closed">
+    <div id="full-topbar">
+      <button id="full-prev" class="nav-btn" title="previous node (k / ←)">‹</button>
+      <div id="full-head-slot"></div>
+      <button id="full-next" class="nav-btn" title="next node (j / →)">›</button>
+      <div class="spacer"></div>
+      <button id="full-exit" class="close" title="exit full screen (Esc)">⤡ Exit full screen</button>
+    </div>
+    <div id="full-columns">
+      <div id="full-info-col"></div>
+      <div id="full-changes-col"></div>
+      <div id="full-transcript-col"></div>
+    </div>
+  </div>
 
   <aside id="agent-drawer" class="closed" aria-labelledby="agent-title">
     <div id="agent-head"></div>

@@ -122,7 +122,12 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("plans", "default_agent_profile_id", "INTEGER"),  # NULL = inherit from the parent plan
     ("nodes", "tokens_in", "INTEGER"),                 # NULL = unknown (mock runs, older nodes)
     ("nodes", "tokens_out", "INTEGER"),
+    ("plans", "max_parallel", "INTEGER"),              # NULL = no plan-specific limit (root plans only)
 ]
+
+# Every plan column a caller may change through update_plan; id, parentage and timestamps
+# are store-managed.
+PLAN_FIELDS = ("max_parallel", "cwd")
 
 HARNESSES = ("claude-sdk", "openai", "mock")
 
@@ -201,6 +206,21 @@ def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(r) if r is not None else None
 
 
+def _check_max_parallel(value: Any) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise PlanError("max_parallel must be a positive integer or null")
+
+
+def validate_working_directory(path: str) -> None:
+    """Raise PlanError unless path is an existing absolute directory.
+
+    Shared by create_plan and the later working-directory change, so both apply the
+    same rule a plan's agents can rely on.
+    """
+    if not os.path.isabs(path) or not os.path.isdir(path):
+        raise PlanError(f"working_directory must be an existing absolute path: {path}")
+
+
 def public_profile(row: dict[str, Any]) -> dict[str, Any]:
     """A profile safe to send anywhere: the literal key is replaced by `has_api_key`.
 
@@ -235,9 +255,8 @@ def _profile_values(fields: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(val, dict):
                 raise PlanError(f"profile {key} must be a JSON object")
             out[key] = json.dumps(val)
-    mp = out.get("max_parallel")
-    if mp is not None and (isinstance(mp, bool) or not isinstance(mp, int) or mp < 1):
-        raise PlanError("max_parallel must be a positive integer or null")
+    if "max_parallel" in out:
+        _check_max_parallel(out["max_parallel"])
     if "description" in out and out["description"] is None:
         out["description"] = ""
     if out.get("api_key") == "":
@@ -285,6 +304,7 @@ class Store:
         parent_plan_id: int | None = None,
         parent_node_id: int | None = None,
         cwd: str | None = None,
+        max_parallel: int | None = None,
     ) -> int:
         with self._lock:
             if (parent_plan_id is None) != (parent_node_id is None):
@@ -298,10 +318,11 @@ class Store:
                     )
                 if self.subplan_of(parent_plan_id, parent_node_id) is not None:
                     raise PlanError(f"node ({parent_plan_id}, {parent_node_id}) already has a subplan")
+            _check_max_parallel(max_parallel)
             cur = self._exec(
-                "INSERT INTO plans(title, description, parent_plan_id, parent_node_id, cwd, created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (title, description, parent_plan_id, parent_node_id, cwd, time.time()),
+                "INSERT INTO plans(title, description, parent_plan_id, parent_node_id, cwd, max_parallel, "
+                "created_at) VALUES (?,?,?,?,?,?,?)",
+                (title, description, parent_plan_id, parent_node_id, cwd, max_parallel, time.time()),
             )
             return int(cur.lastrowid)
 
@@ -310,6 +331,20 @@ class Store:
         if p is None:
             raise PlanError(f"unknown plan {plan_id}")
         return p
+
+    def update_plan(self, plan_id: int, **fields: Any) -> None:
+        """Change plan settings (``max_parallel``, ``cwd``); only the given fields change."""
+        unknown = set(fields) - set(PLAN_FIELDS)
+        if unknown:
+            raise PlanError(f"unknown plan field(s): {', '.join(sorted(unknown))}")
+        if "max_parallel" in fields:
+            _check_max_parallel(fields["max_parallel"])
+        if not fields:
+            return
+        with self._lock:
+            self.get_plan(plan_id)
+            sets = ", ".join(f"{k}=?" for k in fields)
+            self._exec(f"UPDATE plans SET {sets} WHERE id=?", (*fields.values(), plan_id))
 
     def list_root_plans(self) -> list[dict[str, Any]]:
         return self._q("SELECT * FROM plans WHERE parent_plan_id IS NULL ORDER BY id DESC")

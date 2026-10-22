@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -10,7 +9,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from .engine import ConflictCache, Engine
 from .harness import HarnessError
-from .store import PlanError, public_profile
+from .store import PlanError, public_profile, validate_working_directory
 
 INSTRUCTIONS = """
 VisualClaude lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
@@ -140,6 +139,7 @@ def build_mcp(engine: Engine) -> MCPServer:
             "description": p["description"],
             "working_directory": engine.plan_workdir(plan_id),
             "parent": [p["parent_plan_id"], p["parent_node_id"]] if p["parent_plan_id"] else None,
+            "max_parallel": p["max_parallel"],
             "default_agent": _profile_name(p["default_agent_profile_id"]),
             "started": bool(store.root_of(plan_id)["started"]),
             "status": engine.plan_status(plan_id),
@@ -155,6 +155,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         parent_plan_id: int | None = None,
         parent_node_id: int | None = None,
         working_directory: str | None = None,
+        max_parallel: int | None = None,
     ) -> int:
         """Create a new plan and return its integer id.
 
@@ -164,14 +165,24 @@ def build_mcp(engine: Engine) -> MCPServer:
         working_directory (top-level plans only): absolute path of an existing directory the
         plan's agents work in, e.g. a code repository. Defaults to <workdir>/plan-<id>.
         Subplans always use the working directory of their top-level plan.
+
+        max_parallel (top-level plans only): cap how many nodes of this plan's whole tree
+        (including its subplans) run at once, regardless of the server's global concurrency
+        cap; null = no plan-specific limit. Useful to keep one plan from taking every free
+        slot, or to throttle a plan whose agents share a rate-limited resource.
         """
+        if parent_plan_id is not None and max_parallel is not None:
+            raise ToolError("max_parallel can only be set on top-level plans")
         if working_directory is not None:
             if parent_plan_id is not None:
                 raise ToolError("working_directory can only be set on top-level plans")
-            if not os.path.isabs(working_directory) or not os.path.isdir(working_directory):
-                raise ToolError(f"working_directory must be an existing absolute path: {working_directory}")
+            try:
+                validate_working_directory(working_directory)
+            except PlanError as e:
+                raise ToolError(str(e)) from e
         try:
-            pid = store.create_plan(title, description, parent_plan_id, parent_node_id, cwd=working_directory)
+            pid = store.create_plan(title, description, parent_plan_id, parent_node_id, cwd=working_directory,
+                                    max_parallel=max_parallel)
         except PlanError as e:
             raise ToolError(str(e)) from e
         if parent_plan_id is not None:
@@ -179,6 +190,40 @@ def build_mcp(engine: Engine) -> MCPServer:
             engine.kick()
         engine.notify_plan(pid)
         return pid
+
+    @mcp.tool()
+    def update_plan(plan_id: int, max_parallel: int | None = None) -> str:
+        """Change a top-level plan's own settings; only the fields you pass change.
+
+        max_parallel: cap how many nodes of this plan's whole tree run at once (0 or null
+        removes the limit). Only meaningful on top-level plans; subplans share their root
+        plan's cap. See create_plan.
+        """
+        fields: dict[str, Any] = {}
+        if max_parallel is not None:
+            fields["max_parallel"] = max_parallel or None
+        if fields:
+            try:
+                store.update_plan(plan_id, **fields)
+            except PlanError as e:
+                raise ToolError(str(e)) from e
+            engine.kick()  # a raised (or cleared) limit may let waiting nodes start
+        engine.notify_plan(plan_id)
+        return "updated"
+
+    @mcp.tool()
+    def set_plan_workdir(plan_id: int, working_directory: str | None) -> str:
+        """Change a top-level plan's working directory; only before it has been started.
+
+        working_directory must be an existing absolute path, as in create_plan; null or ""
+        resets it to the default <workdir>/plan-<id>.
+        """
+        try:
+            engine.set_plan_workdir(plan_id, working_directory or None)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.notify_plan(plan_id)
+        return f"plan {plan_id} working directory set to {engine.plan_workdir(plan_id)}"
 
     @mcp.tool()
     def add_node(

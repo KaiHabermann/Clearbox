@@ -11,11 +11,13 @@ for it while running ("expanding" itself) is done once the agent has finished
 *and* that subplan is complete.
 
 With executor="builtin" the service spawns an agent session for every ready
-node (up to ``max_concurrency`` at a time). Which agent runs a node is decided
+node (up to ``max_concurrency`` at a time, round-robin across started root
+plans so one plan cannot take every slot). Which agent runs a node is decided
 per node by the ``HarnessRegistry`` (node profile -> plan defaults -> server
 default -> the CLI-configured harness); a profile's ``max_parallel`` further
-caps how many of its nodes run at once. With executor="external", ready nodes
-wait until an outside agent claims them through the MCP tools.
+caps how many of its nodes run at once, and a root plan's own ``max_parallel``
+caps how many nodes of its whole tree run at once. With executor="external",
+ready nodes wait until an outside agent claims them through the MCP tools.
 
 File scoping: a node may declare the files it creates or modifies. Two nodes
 of one plan tree whose files conflict never run at the same time; this is a
@@ -40,7 +42,7 @@ from typing import Any
 
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
-from .store import PlanError, Store
+from .store import PlanError, Store, validate_working_directory
 
 log = logging.getLogger("visualclaude")
 
@@ -126,6 +128,11 @@ class Engine:
         # profile id each running builtin task resolved to (None = implicit harness);
         # in memory like _tasks, since builtin runs do not survive a restart either
         self._task_profiles: dict[tuple[int, int], int | None] = {}
+        # root plan id each running builtin task belongs to, for the per-plan max_parallel cap
+        self._task_roots: dict[tuple[int, int], int] = {}
+        # round-robin cursor into started_root_plans(): which root gets first pick of a free
+        # slot next tick, so the oldest plan does not always take every slot (see _spawn_round_robin)
+        self._rr_index = 0
         # (plan_id, node_id) -> {file_path: text-before-first-write-or-None}, captured from
         # tool_use events while the node runs; diffed against the current text when it finishes.
         # In memory only, like _tasks: a restart loses in-flight diffs the same way it re-queues
@@ -196,6 +203,20 @@ class Engine:
         os.makedirs(d, exist_ok=True)
         return d
 
+    def set_plan_workdir(self, plan_id: int, directory: str | None) -> None:
+        """Change a top-level plan's working directory; only while it has not been started.
+
+        None/empty resets it to the default ``<workdir>/plan-<id>``.
+        """
+        root = self.store.root_of(plan_id)
+        if root["id"] != plan_id:
+            raise PlanError("working_directory can only be set on top-level plans")
+        if root["started"]:
+            raise PlanError("cannot change the working directory of a started plan")
+        if directory:
+            validate_working_directory(directory)
+        self.store.update_plan(plan_id, cwd=directory or None)
+
     def rollup(self, plan_id: int) -> dict[str, int]:
         """Status counts over all task (leaf) nodes of a plan, recursively."""
         counts = {"total": 0, "pending": 0, "ready": 0, "running": 0, "done": 0, "failed": 0}
@@ -231,10 +252,17 @@ class Engine:
             changed = False
             for root in self.store.started_root_plans():
                 changed |= self._advance(root["id"], root["executor"])
+            changed |= self._spawn_round_robin()
             if not changed:
                 break
 
     def _advance(self, plan_id: int, executor: str) -> bool:
+        """Advance pending/subplan-container status for one plan tree (recursing into subplans).
+
+        Does not spawn builtin runs: that is a separate, cross-plan step (``_spawn_round_robin``)
+        so that every started root plan gets a fair turn at free slots instead of whichever one
+        ``started_root_plans`` happens to list first.
+        """
         changed = False
         nodes = {n["node_id"]: n for n in self.store.nodes(plan_id)}
         preds: dict[int, list[int]] = {nid: [] for nid in nodes}
@@ -264,27 +292,59 @@ class Engine:
                 elif status == "failed":
                     self._set_status(plan_id, nid, "failed", error=f"a node in subplan {sub} failed")
                     changed = True
+        return changed
 
-        if executor == "builtin":
-            for nid in sorted(nodes):
-                if len(self._tasks) >= self.config.max_concurrency:
-                    break
-                n = self.store.get_node(plan_id, nid)
-                if n["status"] != "ready" or (plan_id, nid) in self._tasks:
+    def _spawn_round_robin(self) -> bool:
+        """Give every started builtin root plan a turn at the free slots, not oldest-first.
+
+        One attempt per root per pass, cycling root plans starting where the previous tick
+        left off (``_rr_index``), until the global cap is full or a whole pass spawns nothing.
+        """
+        roots = [r for r in self.store.started_root_plans() if r["executor"] == "builtin"]
+        if not roots:
+            return False
+        n = len(roots)
+        start = self._rr_index % n
+        order = roots[start:] + roots[:start]
+        changed = False
+        stalled = 0
+        i = 0
+        while len(self._tasks) < self.config.max_concurrency and stalled < len(order):
+            root = order[i % n]
+            i += 1
+            if self._spawn_one(root["id"]):
+                changed = True
+                stalled = 0
+            else:
+                stalled += 1
+        self._rr_index = (start + i) % n
+        return changed
+
+    def _spawn_one(self, root_id: int) -> bool:
+        """Start (or fail) the lowest-numbered spawnable ready node of one plan tree.
+
+        Returns True if it made progress (a node started or was failed as misconfigured), so
+        the caller's round-robin loop knows this root is not stalled.
+        """
+        if self._plan_full(root_id):
+            return False  # stays ready; a finishing task of this plan kicks the scheduler again
+        for pid in sorted(self.store.descendant_plans(root_id)):
+            for nid in sorted(n["node_id"] for n in self.store.nodes(pid)):
+                n = self.store.get_node(pid, nid)
+                if n["status"] != "ready" or (pid, nid) in self._tasks:
                     continue
                 try:
-                    profile, harness = self.harnesses.resolve(plan_id, nid)
+                    profile, harness = self.harnesses.resolve(pid, nid)
                 except HarnessError as e:
-                    self._fail_misconfigured(plan_id, nid, str(e))
-                    changed = True
-                    continue
+                    self._fail_misconfigured(pid, nid, str(e))
+                    return True
                 if self._profile_full(profile):
                     continue  # stays ready; a finishing task kicks the scheduler again
-                if self._files_held_back(plan_id, nid):
+                if self._files_held_back(pid, nid):
                     continue  # stays ready; the releasing node kicks the scheduler
-                self._spawn(plan_id, nid, profile, harness)
-                changed = True
-        return changed
+                self._spawn(pid, nid, profile, harness)
+                return True
+        return False
 
     def _profile_full(self, profile: dict[str, Any] | None) -> bool:
         """Whether the profile already runs ``max_parallel`` nodes (across all plans)."""
@@ -292,6 +352,15 @@ class Engine:
             return False
         running = sum(1 for pid in self._task_profiles.values() if pid == profile["id"])
         return running >= profile["max_parallel"]
+
+    def _plan_full(self, root_id: int) -> bool:
+        """Whether a top-level plan's own ``max_parallel`` already runs that many nodes,
+        counting every node of its whole tree (its own nodes and every subplan's)."""
+        mp = self.store.get_plan(root_id)["max_parallel"]
+        if not mp:
+            return False
+        running = sum(1 for rid in self._task_roots.values() if rid == root_id)
+        return running >= mp
 
     def _files_busy(self, plan_id: int, node_id: int) -> tuple[int, int] | None:
         """The running node of the same plan tree holding a file that conflicts with this node's.
@@ -552,6 +621,7 @@ class Engine:
         task = asyncio.create_task(self._run_builtin(plan_id, node_id, profile, harness))
         self._tasks[(plan_id, node_id)] = task
         self._task_profiles[(plan_id, node_id)] = profile["id"] if profile else None
+        self._task_roots[(plan_id, node_id)] = self.store.root_of(plan_id)["id"]
 
     async def _run_builtin(self, plan_id: int, node_id: int, profile: dict[str, Any] | None,
                            harness: Harness) -> None:
@@ -605,6 +675,7 @@ class Engine:
         finally:
             self._tasks.pop(key, None)
             self._task_profiles.pop(key, None)
+            self._task_roots.pop(key, None)
             self.kick()
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
@@ -659,6 +730,7 @@ class Engine:
             pass
         self._tasks.pop((plan_id, node_id), None)
         self._task_profiles.pop((plan_id, node_id), None)
+        self._task_roots.pop((plan_id, node_id), None)
 
     async def stop_node(self, plan_id: int, node_id: int) -> None:
         task = self._tasks.get((plan_id, node_id))

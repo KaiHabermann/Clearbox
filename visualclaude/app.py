@@ -53,6 +53,21 @@ class StartBody(BaseModel):
     executor: str = "builtin"
 
 
+class PlanPatch(BaseModel):
+    """Partial update of a (top-level) plan's own settings; fields left out are unchanged.
+
+    max_parallel: cap how many nodes of this plan's whole tree run at once; null removes it.
+    """
+
+    max_parallel: int | None = None
+
+
+class WorkdirBody(BaseModel):
+    """Change a top-level plan's working directory; null/"" resets it to the default."""
+
+    dir: str | None = None
+
+
 class CompleteBody(BaseModel):
     """Mark a node done by hand; null result = reuse the agent's own closing summary."""
 
@@ -301,6 +316,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "status": engine.plan_status(p["id"]),
                 "progress": engine.rollup(p["id"]),
                 "created_at": p["created_at"],
+                "working_directory": engine.plan_workdir(p["id"]),
             }
             for p in store.list_root_plans()
         ]
@@ -321,6 +337,7 @@ def create_app(settings: Settings) -> FastAPI:
         return {
             "plan": p,
             "default_agent": default_agent,
+            "working_directory": engine.plan_workdir(plan_id),
             "root": {"id": root["id"], "started": bool(root["started"]), "executor": root["executor"]},
             "status": engine.plan_status(plan_id),
             "progress": engine.rollup(plan_id),
@@ -349,6 +366,31 @@ def create_app(settings: Settings) -> FastAPI:
         except PlanError as e:
             raise HTTPException(404, str(e)) from e
         return {"diffs": store.node_diffs(plan_id, node_id)}
+
+    @app.patch("/api/plans/{plan_id}")
+    def update_plan(plan_id: int, body: PlanPatch) -> dict[str, Any]:
+        """Change a plan's own settings (currently just max_parallel); only given fields change."""
+        fields = body.model_dump(exclude_unset=True)
+        try:
+            store.update_plan(plan_id, **fields)
+            p = store.get_plan(plan_id)
+            root_id = store.root_of(plan_id)["id"]
+        except PlanError as e:
+            raise _err(e) from e
+        bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
+        engine.kick()  # a raised (or cleared) limit may let waiting nodes start
+        return {"plan": p}
+
+    @app.put("/api/plans/{plan_id}/workdir")
+    def set_plan_workdir(plan_id: int, body: WorkdirBody) -> dict[str, Any]:
+        """Change a top-level plan's working directory; only while it has not been started."""
+        try:
+            engine.set_plan_workdir(plan_id, body.dir or None)
+            p = store.get_plan(plan_id)
+        except PlanError as e:
+            raise _err(e) from e
+        bus.publish({"type": "plan", "plan_id": plan_id, "root_id": plan_id})
+        return {"plan": p, "working_directory": engine.plan_workdir(plan_id)}
 
     # ---------------------------------------------------------- controls
     @app.post("/api/plans/{plan_id}/start")
