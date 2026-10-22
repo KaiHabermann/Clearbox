@@ -69,7 +69,10 @@ def main() -> None:
     print(f"VisualClaude UI:  http://{settings.host}:{settings.port}/")
     print(f"MCP endpoint:     {settings.mcp_url}   (agents: {settings.agent})")
     print(f"Agents:           {app.state.agents_line}")
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning")
+    # timeout_graceful_shutdown: Ctrl+C must always get the port back. Long-lived connections
+    # (the SSE stream, MCP sessions) are asked to close first; this drops whatever is left.
+    uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning",
+                timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

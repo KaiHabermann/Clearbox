@@ -45,13 +45,31 @@ const post = (p, body) => api(p, { method: "POST", body: JSON.stringify(body || 
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 function fmtTime(ts) { return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
 function fmtDur(s) { if (s == null) return ""; s = Math.max(0, Math.round(s)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`; }
+function fmtTokens(n) { return n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k`; }
+function mdInline(s) {
+  return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+}
+function mdBlock(text) {
+  // headings, bullet/numbered lists; everything else keeps its raw newlines (containers use pre-wrap)
+  const lines = String(text).split("\n");
+  let html = "", list = null;
+  const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
+  for (const line of lines) {
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    const ul = line.match(/^\s*[-*]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (h) { closeList(); html += `<h${h[1].length}>${mdInline(h[2])}</h${h[1].length}>\n`; }
+    else if (ul) { if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; } html += `<li>${mdInline(ul[1])}</li>`; }
+    else if (ol) { if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; } html += `<li>${mdInline(ol[1])}</li>`; }
+    else { closeList(); html += mdInline(line) + "\n"; }
+  }
+  closeList();
+  return html;
+}
 function md(text) {
-  // tiny, safe markdown: code fences, inline code, bold
+  // tiny, safe markdown: code fences, headings, lists, inline code, bold
   const parts = String(text ?? "").split(/```/);
-  return parts.map((p, i) => {
-    if (i % 2) return `<pre>${esc(p.replace(/^\w*\n/, ""))}</pre>`;
-    return esc(p).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-  }).join("");
+  return parts.map((p, i) => (i % 2) ? `<pre>${esc(p.replace(/^\w*\n/, ""))}</pre>` : mdBlock(p)).join("");
 }
 function truncate(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
 const put = (p, body) => api(p, { method: "PUT", body: JSON.stringify(body || {}) });
@@ -228,6 +246,15 @@ function renderHeader() {
     c.append(menu);
   } else if (d.status !== "done") {
     c.append(el("button", { title: "cancel running built-in agents and pause", onclick: () => act(post(`/api/plans/${rid}/stop`)) }, "❚❚ Stop"));
+  }
+  if (d.progress.failed > 0) {
+    const resume = !d.root.started;
+    c.append(el("button", {
+      title: resume
+        ? "Retry every failed node and resume the plan (it is currently stopped)"
+        : "Retry every failed node, leaving done nodes and their results alone",
+      onclick: () => act(post(`/api/plans/${rid}/retry-failed`).then(() => resume && post(`/api/plans/${rid}/start`, { executor: d.root.executor || "builtin" }))),
+    }, `↻ Retry failed (${d.progress.failed})`));
   }
   c.append(el("button", { title: "clear all results and transcripts", onclick: () => confirm("Reset all nodes of this plan (results and transcripts are cleared)?") && act(post(`/api/plans/${rid}/reset`)) }, "Reset"));
   if (!d.ancestors.length)
@@ -485,6 +512,13 @@ function renderGraph() {
     }, truncate(sub, 34)));
     g.append(el("svg:text", { class: "ref", x: NODE_W - 12, y: 20, "text-anchor": "end" }, `${d.plan.id}.${n.node_id}`));
 
+    if (!n.subplan_id && (n.tokens_in != null || n.tokens_out != null)) {
+      const tin = n.tokens_in || 0, tout = n.tokens_out || 0;
+      const tok = el("svg:text", { class: "tok", x: NODE_W - 12, y: 50, "text-anchor": "end" }, fmtTokens(tin + tout));
+      tok.append(el("svg:title", {}, `${tin.toLocaleString()} in · ${tout.toLocaleString()} out`));
+      g.append(tok);
+    }
+
     // agent chip: only where this node's agent differs from the plan's default (uniform plans stay quiet);
     // always on an explicit override, which gets a filled dot and a solid border
     const a = n.agent, override = a && a.source === "node";
@@ -607,7 +641,7 @@ function renderNodeInfo(r) {
 
   const info = $("#node-info");
   info.innerHTML = "";
-  info.append(el("div", {}, el("div", { class: "k" }, "Task"), el("div", { class: "v" }, n.description || "—")));
+  info.append(el("div", {}, el("div", { class: "k" }, "Task"), el("div", { class: "v", html: n.description ? md(n.description) : "—" })));
   const a = n.agent || state.data?.nodes.find((m) => m.node_id === n.node_id)?.agent;
   if (a && !n.subplan_id) {
     const running = n.status === "running", inh = planDefaultAgent(state.data);
@@ -629,6 +663,7 @@ function renderNodeInfo(r) {
   }
   if (n.error) info.append(el("div", {}, el("div", { class: "k" }, "Error"), el("div", { class: "v err" }, n.error)));
   if (n.result) info.append(el("div", {}, el("div", { class: "k" }, "Result"), el("div", { class: "result-box" }, n.result)));
+  if (!n.subplan_id) info.append(renderChangesRow(pid, n));
   const actions = el("div", { class: "actions" });
   if (n.subplan_id) actions.append(el("button", { class: "primary", onclick: () => openPlan(n.subplan_id) }, `Open subplan #${n.subplan_id} →`));
   if (n.status === "failed") actions.append(el("button", { onclick: () => act(post(`/api/plans/${pid}/nodes/${n.node_id}/retry`)) }, "↻ Retry"));
@@ -690,6 +725,32 @@ function renderFilesRow(pid, n) {
     catch (e) { err.textContent = e.message; save.disabled = false; ta.disabled = false; }
   });
   wrap.append(v, el("div", { class: "files-edit-row" }, ta, save), err);
+  return wrap;
+}
+
+// Changes row: the file diffs captured from this node's Write/Edit/MultiEdit/NotebookEdit tool
+// calls (engine._snapshot_file_tool / _record_diffs). Fetched lazily since most nodes never need
+// it open; a node that is still running simply has none recorded yet.
+function diffHtml(diff) {
+  return diff.split("\n").map((line) => {
+    const cls = line.startsWith("@@") ? "hunk"
+      : (line.startsWith("+") && !line.startsWith("+++")) ? "add"
+      : (line.startsWith("-") && !line.startsWith("---")) ? "del" : "";
+    return `<span class="dl${cls ? " " + cls : ""}">${esc(line)}</span>`;
+  }).join("\n");
+}
+function renderChangesRow(pid, n) {
+  const v = el("div", { class: "v diffs-row" }, el("div", { class: "files-empty" }, "loading…"));
+  const wrap = el("div", {}, el("div", { class: "k" }, "Changes"), v);
+  api(`/api/plans/${pid}/nodes/${n.node_id}/diffs`).then((r) => {
+    v.innerHTML = "";
+    if (!r.diffs.length) { v.append(el("div", { class: "files-empty" }, "no file changes captured")); return; }
+    for (const d of r.diffs) {
+      v.append(el("details", { class: "diff-file" },
+        el("summary", {}, d.path),
+        el("pre", { class: "diff-pre", html: diffHtml(d.diff) })));
+    }
+  }).catch(() => { v.innerHTML = ""; v.append(el("div", { class: "files-empty" }, "could not load diffs")); });
   return wrap;
 }
 

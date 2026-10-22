@@ -125,6 +125,13 @@ class ClaudeSdkHarness:
                                 "parent_tool_use_id": msg.parent_tool_use_id,
                             }
             elif isinstance(msg, ResultMessage):
+                usage = msg.usage or {}
+                tokens_in = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                ) if usage else None
+                tokens_out = int(usage["output_tokens"]) if usage.get("output_tokens") is not None else None
                 yield "result", {
                     "text": msg.result or "",
                     "is_error": bool(msg.is_error),
@@ -134,6 +141,8 @@ class ClaudeSdkHarness:
                     "cost_usd": msg.total_cost_usd,
                     "session_id": msg.session_id,
                     "errors": msg.errors,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
                 }
                 return  # terminal event: stop pulling, the SDK's stream may stay open afterwards
         yield "result", {"text": "", "is_error": True, "errors": ["agent ended without a result"]}

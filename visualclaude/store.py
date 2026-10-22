@@ -104,6 +104,14 @@ CREATE TABLE IF NOT EXISTS node_files (
     PRIMARY KEY (plan_id, node_id, key)
 );
 CREATE INDEX IF NOT EXISTS node_files_key ON node_files(key);
+
+CREATE TABLE IF NOT EXISTS node_diffs (
+    plan_id  INTEGER NOT NULL,
+    node_id  INTEGER NOT NULL,
+    path     TEXT NOT NULL,   -- as seen in the tool_use input, for display
+    diff     TEXT NOT NULL,   -- unified diff text; absent files are never stored, not even as empty
+    PRIMARY KEY (plan_id, node_id, path)
+);
 """
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS never alters
@@ -112,6 +120,8 @@ CREATE INDEX IF NOT EXISTS node_files_key ON node_files(key);
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("nodes", "agent_profile_id", "INTEGER"),          # NULL = inherit from the plan chain
     ("plans", "default_agent_profile_id", "INTEGER"),  # NULL = inherit from the parent plan
+    ("nodes", "tokens_in", "INTEGER"),                 # NULL = unknown (mock runs, older nodes)
+    ("nodes", "tokens_out", "INTEGER"),
 ]
 
 HARNESSES = ("claude-sdk", "openai", "mock")
@@ -360,6 +370,7 @@ class Store:
                 self._exec("DELETE FROM events WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM edges WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM node_files WHERE plan_id=?", (pid,))
+                self._exec("DELETE FROM node_diffs WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM nodes WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM plans WHERE id=?", (pid,))
 
@@ -416,6 +427,7 @@ class Store:
             self._exec("DELETE FROM edges WHERE plan_id=? AND (src=? OR dst=?)", (plan_id, node_id, node_id))
             self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM node_files WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, node_id))
 
     # --------------------------------------------------------------- node files
@@ -551,6 +563,25 @@ class Store:
 
     def clear_events(self, plan_id: int, node_id: int) -> None:
         self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+
+    # -------------------------------------------------------------- node diffs
+    def set_node_diffs(self, plan_id: int, node_id: int, diffs: list[tuple[str, str]]) -> None:
+        """Replace a node's stored diffs (one unified diff per changed file)."""
+        with self._lock:
+            self.clear_node_diffs(plan_id, node_id)
+            for path, diff in diffs:
+                self._exec(
+                    "INSERT INTO node_diffs(plan_id, node_id, path, diff) VALUES (?,?,?,?)",
+                    (plan_id, node_id, path, diff),
+                )
+
+    def node_diffs(self, plan_id: int, node_id: int) -> list[dict[str, Any]]:
+        return self._q(
+            "SELECT path, diff FROM node_diffs WHERE plan_id=? AND node_id=? ORDER BY path", (plan_id, node_id)
+        )
+
+    def clear_node_diffs(self, plan_id: int, node_id: int) -> None:
+        self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
 
     # ----------------------------------------------------------- agent profiles
     @staticmethod

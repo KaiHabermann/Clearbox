@@ -511,8 +511,8 @@ class OpenAiHarness:
             "session_id": state.session_id,
             "errors": state.errors,
             "model": self.model,
-            "prompt_tokens": state.prompt_tokens if state.saw_usage else None,
-            "completion_tokens": state.completion_tokens if state.saw_usage else None,
+            "tokens_in": state.prompt_tokens if state.saw_usage else None,
+            "tokens_out": state.completion_tokens if state.saw_usage else None,
         }
 
     async def _loop(self, job: AgentJob, state: _RunState) -> AsyncIterator[tuple[str, dict[str, Any]]]:

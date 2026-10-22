@@ -160,6 +160,9 @@ def create_app(settings: Settings) -> FastAPI:
             try:
                 yield
             finally:
+                # Wake every open /api/stream generator so it returns. Without this an open
+                # browser tab holds its SSE response forever and Ctrl+C never completes.
+                bus.publish({"type": "shutdown"})
                 await engine.shutdown()
 
     app = FastAPI(title="VisualClaude", lifespan=lifespan)
@@ -338,6 +341,14 @@ def create_app(settings: Settings) -> FastAPI:
             "events": store.events(plan_id, node_id, after),
         }
 
+    @app.get("/api/plans/{plan_id}/nodes/{node_id}/diffs")
+    def get_node_diffs(plan_id: int, node_id: int) -> dict[str, Any]:
+        try:
+            store.get_node(plan_id, node_id)
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
+        return {"diffs": store.node_diffs(plan_id, node_id)}
+
     # ---------------------------------------------------------- controls
     @app.post("/api/plans/{plan_id}/start")
     def start(plan_id: int, body: StartBody) -> dict[str, str]:
@@ -356,6 +367,14 @@ def create_app(settings: Settings) -> FastAPI:
     async def reset(plan_id: int) -> dict[str, str]:
         await engine.reset_plan(plan_id)
         return {"ok": "reset"}
+
+    @app.post("/api/plans/{plan_id}/retry-failed")
+    def retry_failed(plan_id: int) -> dict[str, Any]:
+        try:
+            count = engine.retry_failed(plan_id)
+        except PlanError as e:
+            raise _err(e) from e
+        return {"ok": "retrying", "count": count}
 
     @app.delete("/api/plans/{plan_id}")
     async def delete(plan_id: int) -> dict[str, str]:
@@ -505,6 +524,8 @@ def create_app(settings: Settings) -> FastAPI:
                         break
                     try:
                         msg = await asyncio.wait_for(q.get(), timeout=15)
+                        if msg.get("type") == "shutdown":
+                            break  # the server is stopping; end the response so it can
                         yield f"data: {json.dumps(msg, default=str)}\n\n"
                     except asyncio.TimeoutError:
                         yield ": ping\n\n"

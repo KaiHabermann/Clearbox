@@ -30,6 +30,7 @@ declared files are never held back.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import os
 import time
@@ -55,6 +56,20 @@ SYSTEM_APPEND = """
 You are one worker inside VisualClaude, a service that executes a plan (a DAG of work items)
 node by node. You are responsible for exactly ONE node. Stay within its scope: other nodes are
 handled by other agents, before or after you. Results of prerequisite nodes are given to you.
+
+Trust your instructions. The design was settled when the plan was written, so implement what the
+node asks instead of reconsidering it. Do not re-open decisions the node already made, and do not
+widen the scope. If part of the node is genuinely wrong or impossible, do the sensible thing and
+say so plainly in your summary.
+
+Keep it simple. Write the smallest change that does the job and matches the surrounding code.
+No speculative abstraction, no extra configuration, no defensive scaffolding for problems nobody
+has reported.
+
+Test lightly. Enough to show your change works -- a couple of cases, or one short script. Do not
+build test suites, fixtures or browser automation unless the node explicitly asks for them: on a
+task this size they cost far more time and tokens than they are worth.
+
 When you are done, end with a concise summary of what you did and what you produced (files,
 decisions, findings). That final message is handed to the nodes that depend on yours.
 """.strip()
@@ -111,6 +126,11 @@ class Engine:
         # profile id each running builtin task resolved to (None = implicit harness);
         # in memory like _tasks, since builtin runs do not survive a restart either
         self._task_profiles: dict[tuple[int, int], int | None] = {}
+        # (plan_id, node_id) -> {file_path: text-before-first-write-or-None}, captured from
+        # tool_use events while the node runs; diffed against the current text when it finishes.
+        # In memory only, like _tasks: a restart loses in-flight diffs the same way it re-queues
+        # the node.
+        self._snapshots: dict[tuple[int, int], dict[str, str | None]] = {}
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -141,6 +161,8 @@ class Engine:
 
     # ------------------------------------------------------------------ helpers
     def _emit(self, plan_id: int, node_id: int, kind: str, data: dict[str, Any]) -> None:
+        if kind == "tool_use":
+            self._snapshot_file_tool(plan_id, node_id, data)
         ev = self.store.add_event(plan_id, node_id, kind, data)
         self.bus.publish({"type": "event", "event": ev})
 
@@ -417,6 +439,51 @@ class Engine:
                 return y[1] in r.get(x[1], ()) or x[1] in r.get(y[1], ())
         return True
 
+    # -------------------------------------------------------------- node diffs
+    # Captures only file tools (Write, Edit, MultiEdit, NotebookEdit): a file written by `bash`
+    # or another shell-out is invisible here, since catching it would mean snapshotting the
+    # whole tree before every node. That is a known gap, not a bug.
+    FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+    def _snapshot_file_tool(self, plan_id: int, node_id: int, data: dict[str, Any]) -> None:
+        if data.get("name") not in self.FILE_TOOLS:
+            return
+        inp = data.get("input")
+        path = inp.get("file_path") if isinstance(inp, dict) else None
+        if not path:
+            return
+        snaps = self._snapshots.setdefault((plan_id, node_id), {})
+        if path not in snaps:
+            snaps[path] = self._read_text(plan_id, path)
+
+    def _read_text(self, plan_id: int, path: str) -> str | None:
+        """The current text of a file the node may have written, or None if it can't be read as text."""
+        full = path if os.path.isabs(path) else os.path.join(self.plan_workdir(plan_id), path)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _record_diffs(self, plan_id: int, node_id: int) -> None:
+        """Diff every snapshotted file against its current text and store the changed ones."""
+        snaps = self._snapshots.pop((plan_id, node_id), None)
+        if not snaps:
+            return
+        diffs = []
+        for path, before in snaps.items():
+            after = self._read_text(plan_id, path)
+            if after is None or after == before:
+                continue
+            diff = "".join(difflib.unified_diff(
+                (before or "").splitlines(keepends=True), after.splitlines(keepends=True),
+                fromfile=path, tofile=path,
+            ))
+            if diff:
+                diffs.append((path, diff))
+        if diffs:
+            self.store.set_node_diffs(plan_id, node_id, diffs)
+
     def _fail_misconfigured(self, plan_id: int, node_id: int, message: str) -> None:
         """A profile that cannot even build its harness fails the node, no retry loop."""
         self.store.update_node(plan_id, node_id, result=None)
@@ -477,6 +544,7 @@ class Engine:
     # ------------------------------------------------------------ builtin runs
     def _spawn(self, plan_id: int, node_id: int, profile: dict[str, Any] | None, harness: Harness) -> None:
         self.store.update_node(plan_id, node_id, agent_done=0, result=None, error=None)
+        self.store.clear_node_diffs(plan_id, node_id)
         self._set_status(plan_id, node_id, "running", agent_kind="builtin",
                          agent_name=self.harnesses.agent_name(profile))
         self._emit(plan_id, node_id, "system", {"text": self.harnesses.label(profile),
@@ -515,6 +583,9 @@ class Engine:
                     self._emit(plan_id, node_id, kind, data)
                     if result is not None:
                         break
+            if result is not None:
+                self.store.update_node(plan_id, node_id, tokens_in=result.get("tokens_in"),
+                                       tokens_out=result.get("tokens_out"))
             if result is None or result.get("is_error"):
                 errs = (result or {}).get("errors") or [(result or {}).get("text") or "agent failed"]
                 self._finish(plan_id, node_id, ok=False, text="; ".join(map(str, errs)))
@@ -537,6 +608,7 @@ class Engine:
             self.kick()
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
+        self._record_diffs(plan_id, node_id)
         if not ok:
             self.store.update_node(plan_id, node_id, agent_done=1)
             self._set_status(plan_id, node_id, "failed", error=text)
@@ -592,6 +664,7 @@ class Engine:
         task = self._tasks.get((plan_id, node_id))
         if task is not None:
             await self._cancel(plan_id, node_id, task)
+        self._snapshots.pop((plan_id, node_id), None)
         n = self.store.get_node(plan_id, node_id)
         if n["status"] in ("running", "ready"):
             self._emit(plan_id, node_id, "system", {"text": "stopped by user"})
@@ -628,6 +701,7 @@ class Engine:
         task = self._tasks.get((plan_id, node_id))
         if task is not None:
             await self._cancel(plan_id, node_id, task)
+        self._record_diffs(plan_id, node_id)
         text = (result or "").strip() or self._last_result_text(plan_id, node_id)
         note = "marked done by user" + ("" if text else " (no result recorded)")
         self._emit(plan_id, node_id, "system", {"text": note})
@@ -655,12 +729,24 @@ class Engine:
                 self._set_status(c["plan_id"], c["node_id"], "running", error=None, finished_at=None)
         self.kick()
 
+    def retry_failed(self, plan_id: int) -> int:
+        """Retry every failed node in the plan tree, leaving done nodes alone."""
+        root = self.store.root_of(plan_id)
+        count = 0
+        for pid in self.store.descendant_plans(root["id"]):
+            for n in self.store.nodes(pid):
+                if n["status"] == "failed":
+                    self.retry_node(pid, n["node_id"])
+                    count += 1
+        return count
+
     async def reset_plan(self, plan_id: int) -> None:
         root = self.store.root_of(plan_id)
         await self.stop_plan(root["id"])
         for pid in self.store.descendant_plans(root["id"]):
             for n in self.store.nodes(pid):
                 self.store.clear_events(pid, n["node_id"])
+                self.store.clear_node_diffs(pid, n["node_id"])
                 self.store.update_node(pid, n["node_id"], status="pending", agent_kind=None, agent_name=None,
                                        session_id=None, agent_done=0, result=None, error=None,
                                        started_at=None, finished_at=None)
@@ -677,6 +763,7 @@ class Engine:
                 for n in self.store.nodes(pid):
                     if n["status"] == "ready" and not self._files_held_back(pid, n["node_id"]):
                         self.store.update_node(pid, n["node_id"], agent_done=0, result=None, error=None)
+                        self.store.clear_node_diffs(pid, n["node_id"])
                         self._set_status(pid, n["node_id"], "running", agent_kind="external", agent_name=agent_name)
                         self._emit(pid, n["node_id"], "system", {"text": f"claimed by external agent '{agent_name}'"})
                         hint = EXPAND_HINT.format(plan_id=pid, node_id=n["node_id"])
