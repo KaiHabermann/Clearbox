@@ -10,8 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .engine import ConflictCache, Engine
-from .harness import AgentJob, ClaudeSdkHarness, Harness, HarnessError, MockHarness, OpenAiHarness
-from .harness.claude_sdk import _as_json
+from .harness import AgentJob, HarnessError
 from .store import PlanError, public_profile, validate_working_directory
 
 # --------------------------------------------------------------------- reviews
@@ -126,29 +125,11 @@ def _plan_review_prompt(engine: Engine, plan_id: int) -> str:
     return "\n\n".join(parts)
 
 
-def _review_harness(engine: Engine, profile: dict[str, Any]) -> Harness:
-    """A read-only harness for a review session, independent of the profile's own tools/mcp
-    settings: no clearbox MCP tools (a reviewer must not mutate the plan) and only read/search
-    file tools (no write, no bash)."""
-    kind = profile["harness"]
-    defaults = engine.harnesses.defaults
-    if kind == "claude-sdk":
-        p = dict(profile)
-        p["tools"] = ["Read", "Grep", "Glob"]
-        return ClaudeSdkHarness(model=defaults.model, max_turns=defaults.max_turns, mcp_url=None, profile=p)
-    if kind == "openai":
-        p = dict(profile)
-        p["tools"] = {"preset": "readonly", "mcp": False}
-        return OpenAiHarness(profile=p, mcp_url=None)
-    if kind == "mock":
-        params = _as_json(profile.get("params"), {}) or {}
-        return MockHarness(speed=float(params.get("speed") or defaults.mock_speed))
-    raise HarnessError(f"agent profile {profile['name']!r}: unknown harness {kind!r}")
-
-
 async def _run_review_session(engine: Engine, plan_id: int, node_id: int | None, profile: dict[str, Any],
                               prompt: str) -> dict[str, Any]:
-    harness = _review_harness(engine, profile)
+    # The registry owns reviewer access (capability `run`: read, search and run the suite, but
+    # no edits). An on-demand review must behave exactly like an automatic one.
+    harness = engine.harnesses.review_harness_for(profile)
     job = AgentJob(
         plan_id=plan_id,
         node_id=node_id if node_id is not None else 0,
@@ -234,6 +215,9 @@ Building a plan:
   Results: an edge only orders work, it passes NOTHING. Nodes start with no earlier results in
   their prompt, so keep descriptions self-contained; when a node really needs an earlier node's
   output, list it in results_from=[...] (it must be a node it already depends on via edges).
+  User nodes: add_node(..., kind="user") marks a step as the user's own job (push a branch, open
+  an MR, deploy, approve). No agent runs it: the plan stops there until the user marks it done,
+  then the nodes after it start. Write its description for a person, not for an agent.
   4. start_plan(plan_id, executor="builtin") lets the service run an agent per node,
      or executor="external" lets outside agents pick nodes up with claim_next_node.
 
@@ -342,6 +326,8 @@ def build_mcp(engine: Engine) -> MCPServer:
                     "title": n["title"],
                     "description": n["description"],
                     "status": n["status"],
+                    "kind": n.get("kind") or "agent",
+                    "waiting_for_user": engine.waiting_for_user(n),
                     "agent": _resolved_agent(plan_id, n["node_id"]),
                     "agent_override": _profile_name(n["agent_profile_id"]),
                     "subplan_id": store.subplan_of(plan_id, n["node_id"]),
@@ -452,10 +438,15 @@ def build_mcp(engine: Engine) -> MCPServer:
         agent: str | int | None = None,
         files: list[str] | None = None,
         results_from: list[int] | None = None,
+        kind: str | None = None,
     ) -> tuple[int, int]:
         """Add a node (one piece of work) to a plan. Returns (plan_id, node_id).
 
         The description should be a self-contained instruction for the agent doing the work.
+        kind (optional): "agent" (default) or "user". A user node is the user's own job -- push a
+        branch, open an MR, deploy, approve something. No agent runs it: the plan stops there until
+        the user marks it done, then the nodes after it start as usual. Its description is the
+        instruction to the person, so write it for a human, not for an agent.
         agent (optional): name (or id) of the agent profile that runs this node, e.g. a cheap local
         model for a mechanical task and a strong one for a hard task; omit it to inherit the plan's.
         files (optional): list the files this node will CREATE or MODIFY; reading is always allowed
@@ -473,7 +464,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         profile_id = _profile_id(agent)
         try:
             ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id, files=files,
-                                 results_from=results_from)
+                                 results_from=results_from, kind=kind)
         except PlanError as e:
             raise _files_error(plan_id, e) from e
         if files:
@@ -549,6 +540,22 @@ def build_mcp(engine: Engine) -> MCPServer:
         return "updated"
 
     @mcp.tool()
+    def set_node_kind(plan_id: int, node_id: int, kind: str) -> str:
+        """Make a node the user's job (kind="user") or an agent's (kind="agent").
+
+        A user node is not run by any agent: the plan stops there until the user marks it done,
+        then the nodes after it start. Its description is the instruction to the person, so make
+        sure it reads that way. Only for nodes that have not run yet.
+        """
+        try:
+            store.set_node_kind(plan_id, node_id, kind)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.notify_plan(plan_id)
+        engine.kick()  # a ready node that just became an agent's job can start now
+        return f"node {node_id} of plan {plan_id} is now a {kind} node"
+
+    @mcp.tool()
     def set_node_files(plan_id: int, node_id: int, files: list[str] | None) -> list[str]:
         """Replace the files a node will CREATE or MODIFY; returns the stored list. [] or null clears it.
 
@@ -592,7 +599,9 @@ def build_mcp(engine: Engine) -> MCPServer:
         shows `default_agent` (its plan-wide default, or null). `files` lists the files the node
         declared; `conflicts` the [plan_id, node_id] of other nodes in the plan tree that share one
         of them and could run at the same time -- those run one at a time, lowest number first.
-        `results_from` lists the earlier nodes whose result text the node receives.
+        `results_from` lists the earlier nodes whose result text the node receives. `kind` is
+        "agent" or "user"; a user node with `waiting_for_user: true` is parked for the user to
+        mark it done (nothing runs it), not waiting for an agent.
         """
         try:
             return _plan_view(plan_id)
@@ -621,9 +630,10 @@ def build_mcp(engine: Engine) -> MCPServer:
     def list_agents() -> list[dict[str, Any]]:
         """List the agent profiles nodes can run on.
 
-        Each entry has name, harness, model, base_url, max_parallel, ... and `default: true` on the
-        server-wide default profile. Secrets are never shown: `has_api_key` says whether a key is
-        available (from the api_key_env variable, or one stored through the web UI).
+        Each entry has name, harness, model, base_url, max_parallel, capability, test_level, ... and
+        `default: true` on the server-wide default profile (see create_agent for what capability and
+        test_level mean; null = the default). Secrets are never shown: `has_api_key` says whether a
+        key is available (from the api_key_env variable, or one stored through the web UI).
         """
         return [_agent_view(p) for p in store.list_profiles()]
 
@@ -640,6 +650,8 @@ def build_mcp(engine: Engine) -> MCPServer:
         system_append: str | None = None,
         max_parallel: int | None = None,
         description: str = "",
+        capability: str | None = None,
+        test_level: str | None = None,
     ) -> dict[str, Any]:
         """Create an agent profile (a named harness + model) and return it.
 
@@ -657,8 +669,20 @@ def build_mcp(engine: Engine) -> MCPServer:
         A literal api key is deliberately NOT accepted here: secrets should not pass through a model's
         context. Set the environment variable on the server, or enter the key in the web UI.
         params: e.g. {"temperature": 0.2, "max_turns": 40, "timeout": 300}.
-        tools: {"preset": ..., "allow": [...], "deny": [...], "mcp": true|false}.
-        permission_mode (claude-sdk only); system_append: extra system prompt text;
+        capability: what the agent may do, the same for every harness (null = full for workers,
+          run for reviewers):
+            read   read and search only; no edits, no commands
+            run    read, search and run commands; no edits        (the right default for reviewers)
+            edit   read, search and edit files; no commands
+            full   everything                                     (the right default for worker agents)
+        test_level: how much a worker agent is told to test (null = standard):
+            none      do not test; the node says what to verify, or nothing needs verifying
+            light     a quick sanity check that the change works -- one script or a couple of cases
+            standard  run the existing tests covering what you touched, and fix what you broke
+            thorough  run the full suite, and add tests for behaviour you added
+        permission_mode (claude-sdk only) and tools: {"preset": ..., "allow": [...], "deny": [...],
+          "mcp": true|false} (openai) are raw escape hatches; prefer capability.
+        system_append: extra system prompt text;
         max_parallel: max nodes running on this profile at once, across all plans (null = no limit).
         Run test_agent afterwards to check that the endpoint answers.
         """
@@ -666,7 +690,8 @@ def build_mcp(engine: Engine) -> MCPServer:
             pid = store.create_profile(
                 name=name, harness=harness, model=model, base_url=base_url, api_key_env=api_key_env,
                 params=params, tools=tools, permission_mode=permission_mode, system_append=system_append,
-                max_parallel=max_parallel, description=description,
+                max_parallel=max_parallel, description=description, capability=capability,
+                test_level=test_level,
             )
             return _agent_view(store.get_profile(pid))
         except PlanError as e:
@@ -686,12 +711,15 @@ def build_mcp(engine: Engine) -> MCPServer:
         system_append: str | None = None,
         max_parallel: int | None = None,
         description: str | None = None,
+        capability: str | None = None,
+        test_level: str | None = None,
     ) -> dict[str, Any]:
         """Change an agent profile (by name or id); only the fields you pass change. Returns it.
 
-        Pass "" to clear a text field (model, base_url, api_key_env, permission_mode, system_append)
-        and 0 to remove the max_parallel limit; params/tools replace the whole object. Applies to
-        nodes that start afterwards. See create_agent for the fields; api keys are not accepted here.
+        Pass "" to clear a text field (model, base_url, api_key_env, permission_mode, system_append,
+        capability, test_level -- back to the default) and 0 to remove the max_parallel limit;
+        params/tools replace the whole object. Applies to nodes that start afterwards. See
+        create_agent for the fields and the capability/test_level values; api keys are not accepted here.
         """
         profile = _profile_ref(agent)
         fields: dict[str, Any] = {
@@ -701,7 +729,8 @@ def build_mcp(engine: Engine) -> MCPServer:
             if v is not None
         }
         for k, v in (("model", model), ("base_url", base_url), ("api_key_env", api_key_env),
-                     ("permission_mode", permission_mode), ("system_append", system_append)):
+                     ("permission_mode", permission_mode), ("system_append", system_append),
+                     ("capability", capability), ("test_level", test_level)):
             if v is not None:
                 fields[k] = v or None
         if max_parallel is not None:

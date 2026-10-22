@@ -28,6 +28,14 @@ node is running, and also while a conflicting ready node with a lower
 number first -- the same order the UI staggers them in. Nodes without
 declared files are never held back.
 
+User nodes (``kind='user'``): the user's own job (push a branch, open an MR,
+deploy, approve). It becomes "ready" like any node, but no scheduler ever picks
+it up: it waits there (``waiting_for_user``) until ``complete_node_manually``
+marks it done, and its dependants start from there as usual. It has no agent,
+so no diff, review or token count is ever taken for it, and it holds no file
+lock: the file conflict rules treat it as inert, so a user node parked for an
+hour never blocks an agent node that declares the same files.
+
 Rework: ``rework_node`` re-runs one finished node with a brief (the user's
 instructions, else its review's findings) added to its prompt, so the agent
 fixes what was raised instead of redoing the step. It is always a user action:
@@ -96,14 +104,50 @@ statements it has already contradicted.
 Keep it simple. Write the smallest change that does the job and matches the surrounding code.
 No speculative abstraction, no extra configuration, no defensive scaffolding for problems nobody
 has reported.
+""".strip()
 
-Test lightly. Enough to show your change works -- a couple of cases, or one short script. Do not
-build test suites, fixtures or browser automation unless the node explicitly asks for them: on a
-task this size they cost far more time and tokens than they are worth.
-
+SUMMARY_NOTE = """
 When you are done, end with a concise summary of what you did and what you produced (files,
 decisions, findings). That final message is handed to the nodes that depend on yours.
 """.strip()
+
+# One paragraph per agent_profiles.test_level (store.TEST_LEVELS), placed between SYSTEM_APPEND
+# and SUMMARY_NOTE for worker agents. Keep the wording in step with the Agents panel's help text.
+TEST_LEVEL_NOTES = {
+    "none": """
+Testing: none. Do not spend effort on tests; the node says what to verify, if anything does.
+""".strip(),
+    "light": """
+Testing: light. A quick sanity check that your change works -- one short script or a couple of
+cases. Do not build test suites or fixtures.
+""".strip(),
+    "standard": """
+Testing: standard. Run the existing tests that cover what you touched, and fix what you broke.
+Add a test only when you added behaviour nothing covers. Do not build new harnesses. Each test
+file's docstring in tests/ carries the exact commands to run it; most need a mock server of
+their own (`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`).
+Pick a high random port and temp paths; never use port 8765 or the project's own database, and
+stop the server when you are done.
+""".strip(),
+    "thorough": """
+Testing: thorough. Run the full suite and add tests for the behaviour you added. A change is not
+done while a test you can run is failing. Each test file's docstring in tests/ carries the exact
+commands to run it; most need a mock server of their own
+(`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`). Pick a high
+random port and temp paths; never use port 8765 or the project's own database, and stop the
+server when you are done.
+""".strip(),
+}
+DEFAULT_TEST_LEVEL = "standard"
+
+
+def worker_system_append(profile: dict[str, Any] | None) -> str:
+    """The worker prompt: SYSTEM_APPEND, the test-level paragraph for ``profile`` (NULL/absent =
+    standard), then SUMMARY_NOTE."""
+    level = (profile or {}).get("test_level") or DEFAULT_TEST_LEVEL
+    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL])
+    return "\n\n".join((SYSTEM_APPEND, note, SUMMARY_NOTE))
+
 
 EXPAND_HINT = """
 If your node turns out to be too large for one session, you may break it down: call the
@@ -171,6 +215,11 @@ leave a test asserting the behaviour it just replaced. Nobody sees that from the
 """.strip() + "\n\n" + RUN_TESTS_NOTE + "\n\n" + VERDICT_FORMAT
 
 _VERDICT_RE = re.compile(r"VERDICT:\s*(ok|concerns|error)", re.IGNORECASE)
+
+
+def is_user_node(node: dict[str, Any]) -> bool:
+    """Whether a node row is the user's own job (``kind='user'``; NULL means 'agent')."""
+    return node.get("kind") == "user"
 
 
 class Bus:
@@ -339,9 +388,20 @@ class Engine:
             validate_working_directory(directory)
         self.store.update_plan(plan_id, cwd=directory or None)
 
+    def waiting_for_user(self, node: dict[str, Any]) -> bool:
+        """Whether a node row is a user node parked for the user: ready, and no agent will
+        take it. The API/UI show it as "waiting for you" rather than "ready to run"."""
+        return is_user_node(node) and node["status"] == "ready"
+
     def rollup(self, plan_id: int) -> dict[str, int]:
-        """Status counts over all task (leaf) nodes of a plan, recursively."""
-        counts = {"total": 0, "pending": 0, "ready": 0, "running": 0, "done": 0, "failed": 0}
+        """Status counts over all task (leaf) nodes of a plan, recursively.
+
+        A user node waiting for the user is counted under ``ready`` (its real status, so the
+        plan stays unfinished for ``_dir_clash`` and the plan review) and once more under
+        ``waiting``, so a plan parked on one is neither "finished" nor "an agent is running".
+        """
+        counts = {"total": 0, "pending": 0, "ready": 0, "running": 0, "done": 0, "failed": 0,
+                  "waiting": 0}
         for n in self.store.nodes(plan_id):
             sub = self.store.subplan_of(plan_id, n["node_id"])
             if sub is not None:
@@ -353,6 +413,8 @@ class Engine:
             else:
                 counts["total"] += 1
                 counts[n["status"]] = counts.get(n["status"], 0) + 1
+                if self.waiting_for_user(n):
+                    counts["waiting"] += 1
         return counts
 
     def plan_status(self, plan_id: int) -> str:
@@ -405,6 +467,9 @@ class Engine:
                     self._emit(plan_id, nid, "system", {"text": f"executing subplan {sub}"})
                 else:
                     self._set_status(plan_id, nid, "ready")
+                    if is_user_node(n):
+                        self._emit(plan_id, nid, "system",
+                                   {"text": "waiting for you: this is your job, mark it done when it is"})
                 changed = True
             elif n["status"] == "running" and sub is not None and (n["agent_kind"] is None or n["agent_done"]):
                 changed |= self._advance(sub, executor)
@@ -459,6 +524,8 @@ class Engine:
                 n = self.store.get_node(pid, nid)
                 if n["status"] != "ready" or (pid, nid) in self._tasks:
                     continue
+                if is_user_node(n):
+                    continue  # the user's job: stays ready until complete_node_manually
                 try:
                     profile, harness = self.harnesses.resolve(pid, nid)
                 except HarnessError as e:
@@ -501,6 +568,8 @@ class Engine:
         extra bookkeeping. That automatic release is why the DB is the source of
         truth. A running node is never dependency-ordered with a ready one (all
         of a ready node's prerequisites are done), so no path check is needed.
+        A user node never runs, so it never holds anything (``agent_kind`` stays
+        NULL); the check below is enough, no kind test needed.
         """
         for ref in self.store.conflicting_nodes(plan_id, node_id):
             n = self.store.get_node(*ref)
@@ -528,12 +597,14 @@ class Engine:
         No starvation: only a ready node the scheduler will still start counts
         (``_still_scheduled``). A node left "ready" inside a subplan whose
         container failed is never spawned, and waiting for its turn would hold
-        the higher node back forever.
+        the higher node back forever. The same goes for a ready user node: it is
+        waiting for the user, not for a turn, and must not block anyone.
         """
         for ref in self.store.conflicting_nodes(plan_id, node_id):
             if ref >= (plan_id, node_id):
                 break  # sorted by (plan_id, node_id)
-            if self.store.get_node(*ref)["status"] == "ready" and self._still_scheduled(ref[0]):
+            other = self.store.get_node(*ref)
+            if other["status"] == "ready" and not is_user_node(other) and self._still_scheduled(ref[0]):
                 return ref
         return None
 
@@ -582,12 +653,16 @@ class Engine:
         never dependency-ordered with another ready or running node -- but a view
         of the whole plan does, or nodes in successive layers would look like
         they compete for a file. Pass the tree's file map and one cache when
-        rendering many nodes, so a whole plan costs one file query.
+        rendering many nodes, so a whole plan costs one file query. User nodes
+        are inert here as in the scheduler: they neither have nor are conflicts.
         """
         cache = cache if cache is not None else ConflictCache()
+        if is_user_node(self.store.get_node(plan_id, node_id)):
+            return []
         return [
             ref for ref in self.store.conflicting_nodes(plan_id, node_id, tree=tree)
             if not self._dependency_ordered((plan_id, node_id), ref, cache)
+            and not is_user_node(self.store.get_node(*ref))
         ]
 
     def _anchors(self, plan_id: int, node_id: int, cache: ConflictCache) -> list[tuple[int, int]]:
@@ -1090,7 +1165,7 @@ class Engine:
                            harness: Harness) -> None:
         key = (plan_id, node_id)
         try:
-            system_append = SYSTEM_APPEND
+            system_append = worker_system_append(profile)
             if self.config.expose_mcp_to_agents:
                 system_append += "\n\n" + EXPAND_HINT.format(plan_id=plan_id, node_id=node_id)
             job = AgentJob(
@@ -1255,8 +1330,9 @@ class Engine:
 
         The escape hatch for a node the service cannot finish by itself: an agent
         that hung, work the user finished by hand, a step that turned out to be
-        unnecessary. Dependants start as if the node had completed normally, so
-        the recorded result is what they will read.
+        unnecessary -- and the only way a user node (``kind='user'``) finishes.
+        Dependants start as if the node had completed normally, so the recorded
+        result is what they will read.
         """
         node = self.store.get_node(plan_id, node_id)
         if node["status"] == "done":
@@ -1366,7 +1442,8 @@ class Engine:
         for r in roots:
             for pid in sorted(self.store.descendant_plans(r["id"])):
                 for n in self.store.nodes(pid):
-                    if n["status"] == "ready" and not self._files_held_back(pid, n["node_id"]):
+                    if (n["status"] == "ready" and not is_user_node(n)
+                            and not self._files_held_back(pid, n["node_id"])):
                         self.store.update_node(pid, n["node_id"], agent_done=0, result=None, error=None)
                         self.store.clear_node_diffs(pid, n["node_id"])
                         self._cancel_review(pid, n["node_id"])
@@ -1379,7 +1456,7 @@ class Engine:
                             "title": n["title"],
                             "description": n["description"],
                             "workdir": self.plan_workdir(pid),
-                            "instructions": SYSTEM_APPEND + "\n\n" + hint
+                            "instructions": worker_system_append(None) + "\n\n" + hint
                             + "\n\nReport progress with report_progress, and finish with complete_node "
                               "(or fail_node).",
                             "context": self.build_context(pid, n["node_id"]),

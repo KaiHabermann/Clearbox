@@ -45,8 +45,11 @@ own Claude Code CLI and uses your existing Claude login (or `ANTHROPIC_API_KEY`)
 
 ```powershell
 uv run clearbox                                   # real Claude sessions, 3 in parallel
-uv run clearbox --max-concurrency 5 --permission-mode acceptEdits
+uv run clearbox --max-concurrency 5
 ```
+
+Agents may edit files and run commands in their plan's working directory by default; what each
+agent profile may do is its [capability](#capability-what-an-agent-may-do).
 
 Nodes can also run on any OpenAI-compatible endpoint instead — a local Ollama or vLLM model, or
 OpenAI itself — and one plan can mix them per node, see
@@ -73,16 +76,17 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 | Tool | What it does |
 | --- | --- |
 | `create_plan(title, description="", parent_plan_id=None, parent_node_id=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. |
-| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier nodes whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). |
+| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier nodes whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
 | `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
 | `remove_edge`, `remove_node` | Corrections while building. |
 | `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None)` | Change only what you pass; `files` / `results_from` omitted keeps the current value, `[]` clears it. |
 | `set_node_files(plan_id, node_id, files)` | Replace a node's declared files on their own, without touching title/description; `[]` or `null` clears them. Only before the node has run. |
 | `set_node_results_from(plan_id, node_id, node_ids)` | Replace the earlier nodes whose result text the node receives; `[]` or `null` clears them. Each must be a node it already depends on through edges. Only before the node has run. |
-| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)) and `results_from`. |
-| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default). |
-| `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="")` | New agent profile. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
-| `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field, `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
+| `set_node_kind(plan_id, node_id, kind)` | Make a node the user's job (`"user"`) or an agent's (`"agent"`), see [User-job nodes](#user-job-nodes-a-step-a-person-does). Only before the node has run. |
+| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
+| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. |
+| `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="", capability=None, test_level=None)` | New agent profile. `capability` (`read` \| `run` \| `edit` \| `full`) and `test_level` (`none` \| `light` \| `standard` \| `thorough`) are explained under [Capability](#capability-what-an-agent-may-do) and [Test levels](#test-levels-how-much-a-worker-agent-tests); `permission_mode` and `tools` are raw escape hatches. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
+| `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field (for `capability` / `test_level`: back to the default), `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
 | `delete_agent(agent)` | Delete a profile; nodes and plans that used it inherit again. |
 | `set_node_agent(plan_id, node_id, agent)` | Per-node override; `null` clears it. Applies the next time the node starts. |
 | `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
@@ -108,6 +112,8 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
   The agent's final message becomes the node's result; it reaches a later node only if that node
   requests it.
 * **external** executor: ready nodes wait until something calls `claim_next_node`.
+* **User-job nodes** (`kind="user"`): no agent runs them; the plan stops there until you mark the
+  node done, see [User-job nodes](#user-job-nodes-a-step-a-person-does).
 * **Subplans**: a node with a subplan skips the agent; when it is reached its subplan runs, and the
   node is done once the whole subplan is done (its result summarises the subplan's final nodes).
   Built-in agents also get the MCP tools, so an agent can decide mid-run that its node is too big
@@ -120,6 +126,33 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
   agents and re-queues their nodes; **Reset** clears all results and transcripts.
 * Everything is stored in `clearbox.db`. Built-in sessions that were running when the service
   stopped are re-queued on the next start.
+
+### User-job nodes: a step a person does
+
+Some steps of a plan are not an agent's to do: push a branch, open a merge request, deploy, approve
+something. Mark such a node with `kind="user"` (`add_node(..., kind="user")`, `set_node_kind`, or the
+**Done by** select in the node drawer; changeable while the node is pending or ready). Nothing else
+about the node changes: it has edges, it can declare `files` and request `results_from`, and it
+blocks its dependents like any other node.
+
+When its prerequisites finish the node becomes **ready** and the plan simply stops there: the
+built-in scheduler never starts a session for it, `claim_next_node` never hands it out, and it
+holds no file lock while it waits (a parked user node never delays an agent node that shares a
+file). It stays `ready` until you mark it done — the **✓ Mark done** button in its drawer, MCP's
+`complete_node`, or `POST /api/plans/{id}/nodes/{node_id}/complete` — with an optional result (the
+MR link, say) that later nodes can request through `results_from`. Then the nodes after it start as
+usual. A plan with a waiting user node is not finished: its plan review does not fire, and its
+`progress` rollup counts it under `waiting`.
+
+Write the description **for a person**, not for an agent: it is shown verbatim in the drawer as the
+instruction. No agent, prompt, transcript, diff, step review or token cost is involved; **Stop** on a
+waiting user node fails it ("stopped by user") and **Retry** puts it back to ready.
+
+Node views carry `kind` (`"agent"` | `"user"`) and `waiting_for_user` (true for a ready user node).
+`GET /api/plans/{id}` also lists every waiting user node of the tree under `waiting` as
+`{plan_id, node_id, title}`, which is what the topbar's "Waiting for you" chips show. REST sets the
+kind with `PUT /api/plans/{plan_id}/nodes/{node_id}/kind` (body `{"kind": "user"}`); switching a
+ready node back to `"agent"` starts it.
 
 ### File scoping: avoiding clobbered edits
 
@@ -233,7 +266,10 @@ There are two levels, deliberately kept apart so each stays inside a context it 
   reviewer is told which case applies, so it can treat a missing change in the declared scope as
   not made and stays cautious elsewhere. Agents are still asked to edit through the file tools: those
   edits show up in the transcript as reviewable steps, and they are the only ones captured outside
-  the declared scope.
+  the declared scope. The reviewer is asked to run the test suite before its verdict, so the
+  automatic reviews get capability `run` (read, search, shell; no edits) whatever the profile
+  allows for normal runs, see [Capability](#capability-what-an-agent-may-do). On-demand reviews
+  triggered with `review_node` / `review_plan` currently still run with read-only tools.
 * **Plan review** (`review_plan` / `POST /api/plans/{id}/review`): once every node in the tree is
   done, one reviewer looks at the plan as a whole — every node's title, description, result and
   step-review verdict — and asks what was missed, contradicted or left out across steps. This is
@@ -289,8 +325,8 @@ transcript events, so the UI, the database and the live stream look identical wh
 
 | Harness | What runs the node | Tools |
 | --- | --- | --- |
-| `claude-sdk` | The Claude Agent SDK (its bundled Claude Code CLI, your Claude login or `ANTHROPIC_API_KEY`). | Its own (Bash, Read, Edit, …), gated by `permission_mode`. |
-| `openai` | Any endpoint speaking the OpenAI chat-completions API, driven by Clearbox's own agent loop (ask → run the tool calls → feed results back → repeat until a reply without tool calls). | Clearbox's built-in toolset (below) + the MCP tools. |
+| `claude-sdk` | The Claude Agent SDK (its bundled Claude Code CLI, your Claude login or `ANTHROPIC_API_KEY`). | Its own (Bash, Read, Edit, …), gated by the profile's [capability](#capability-what-an-agent-may-do). |
+| `openai` | Any endpoint speaking the OpenAI chat-completions API, driven by Clearbox's own agent loop (ask → run the tool calls → feed results back → repeat until a reply without tool calls). | Clearbox's built-in toolset (below) + the MCP tools, gated by the same capability. |
 | `mock` | A fake agent that prints a plausible transcript. No cost. | Pretend ones. |
 
 On every start the server makes sure these profiles exist (created only when absent, never
@@ -316,11 +352,61 @@ $env:OPENAI_API_KEY = "sk-…"; uv run clearbox --agent-profile openai   # every
 | `api_key_env` | `openai` only: **name** of the server environment variable holding the key, read when a node starts. | none (`OPENAI_API_KEY` for the default OpenAI url) |
 | `api_key` | Literal key, settable from the UI / REST only. Write-only: responses only say `has_api_key`. | none |
 | `params` | JSON object. `openai`: `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `reasoning_effort`, `seed`, `parallel_tool_calls`, `max_turns` (50), `stream` (true; false for endpoints with broken streaming), `timeout` (600 s), `max_retries` (2), `extra_body` (passed through verbatim), `input_price_per_mtok` / `output_price_per_mtok` (USD, enables the cost shown in the transcript). `claude-sdk`: `max_turns`. `mock`: `speed`. | `{}` |
-| `tools` | JSON object, `openai` only: `{"preset": "all" \| "readonly" \| "none", "allow": […], "deny": […], "mcp": true \| false}`. `allow` adds to the preset, `deny` removes (deny wins); `mcp` overrides `--no-agent-mcp`'s on/off for this profile (it cannot turn the tools on when the server has `--no-agent-mcp`). | preset `all`, MCP as the server |
-| `permission_mode` | `claude-sdk` only, same values as `--permission-mode`. | `--permission-mode` |
+| `capability` | What the agent may do, the same for every harness: `read` \| `run` \| `edit` \| `full`, see [Capability](#capability-what-an-agent-may-do). | `null` = `full` as a worker, `run` as a reviewer |
+| `test_level` | How much a worker agent is told to test: `none` \| `light` \| `standard` \| `thorough`, see [Test levels](#test-levels-how-much-a-worker-agent-tests). | `null` = `standard` |
+| `tools` | JSON object, `openai` only, **raw escape hatch** (the capability picks this for you): `{"preset": "all" \| "readonly" \| "none", "allow": […], "deny": […], "mcp": true \| false}`. `allow` adds to the preset, `deny` removes (deny wins); `mcp` overrides `--no-agent-mcp`'s on/off for this profile (it cannot turn the tools on when the server has `--no-agent-mcp`) and is the one key the capability keeps. | from the capability; `mcp` as the server |
+| `permission_mode` | `claude-sdk` only, **raw escape hatch**: same values as `--permission-mode`, overrides the mode the capability chose. | from the capability |
 | `system_append` | Extra system-prompt text for every node on this profile. | none |
 | `max_parallel` | Max nodes running on this profile at once, across all plans (on top of `--max-concurrency`). Useful for a local GPU. | no limit |
 | `description` | Free text for humans. | `""` |
+
+### Capability: what an agent may do
+
+A profile's `capability` is one setting that means the same thing on every harness; the registry
+(`clearbox/harness/registry.py`) maps it to each harness's own gating.
+
+| `capability` | Allows | `claude-sdk` | `openai` |
+| --- | --- | --- | --- |
+| `read` | read and search only; no edits, no commands | Read, Grep, Glob | preset `readonly` |
+| `run` | read, search and run commands; no edits | + Bash | `readonly` + `allow: ["bash"]` |
+| `edit` | read, search and edit files; no commands | + Write, Edit, MultiEdit | `readonly` + `allow: ["write_file", "edit_file"]` |
+| `full` | everything | all of the above, in the server's `--permission-mode` | preset `all` |
+
+Unset (`null`) means **`full` for a worker agent and `run` for a reviewer** — a reviewer has to run
+the test suite but must never edit. **`full` lets an agent run arbitrary commands in the plan's
+working directory**, with the rights of the Clearbox process; that is the operator's choice, made
+when picking the profile (see the warning under [Tools of the `openai` harness](#tools-of-the-openai-harness)
+and use a sandbox for anything you do not trust).
+
+For `claude-sdk` the gating is done with the SDK's `allowed_tools`: everything listed is
+pre-approved and runs without a prompt. Below `full` the session runs in permission mode `dontAsk`,
+which *denies* any tool that is not pre-approved instead of prompting — an SDK session has nobody to
+answer a prompt, so any prompting mode would silently block the tool. `full` pre-approves every file
+and shell tool and keeps `--permission-mode` for whatever else the model reaches for. A profile's
+raw `permission_mode` still overrides the chosen mode, and `openai`'s raw `tools` config is still
+honoured for a profile that sets **no** capability, so profiles made before this setting existed
+behave as they did. Reviewers ignore the profile's normal-run capability and `tools` /
+`permission_mode` entirely and get `run`; `params.review_capability` changes that for one profile.
+An unknown value is rejected when the profile is saved.
+
+### Test levels: how much a worker agent tests
+
+Every worker prompt ends with a testing paragraph chosen by the profile's `test_level`; the UI's
+**Test level** select uses the same wording:
+
+| `test_level` | Meaning |
+| --- | --- |
+| `none` | do not test; the node says what to verify, or nothing needs verifying |
+| `light` | a quick sanity check that the change works — one script or a couple of cases |
+| `standard` | run the existing tests covering what you touched, and fix what you broke |
+| `thorough` | run the full suite, and add tests for behaviour you added |
+
+**`standard` is the default**, for new profiles and for every existing one (`null`), and for
+external agents claiming through `claim_next_node`. `standard` and `thorough` also tell the agent
+where the run commands live (each test file's docstring) and never to use port 8765 or the project's
+own database. The level is for worker agents only: reviewers keep their own prompt and **always run
+the suite** before giving a verdict, whatever the profile's level — which is why they need
+capability `run`.
 
 ### Which agent runs a node
 
@@ -404,7 +490,9 @@ uv run python examples/mixed_plan.py --start
 
 It creates the agents it needs if missing and prints them: `cheap` (an `openai` copy of the first
 configured `openai` profile with preset `readonly`, `max_turns` 20, `max_parallel` 1) and `strong`
-(`claude-sdk` in permission mode `default`, i.e. read tools only), then runs `test_agent` on
+(`claude-sdk` with raw permission mode `default` — note that with no `capability` set this is
+`full`, every tool pre-approved; set `capability="read"` on it for a genuinely read-only
+reviewer), then runs `test_agent` on
 `cheap`. It assigns them the three ways: `set_plan_agent` makes `cheap` the plan default (the
 inventory nodes inherit it), `add_node(..., agent="strong")` pins the assessment, and
 `set_node_agent` moves the review node. `--cheap NAME` / `--strong NAME` use profiles you already
@@ -427,8 +515,15 @@ the whole flow can be watched for free.
   (messages, thinking, tool calls with their results, final result with turns / time / cost).
 * Nodes whose agent differs from the plan's default carry a coloured chip naming it; a dot marks
   an override set on the node itself. The topbar sets the plan's default agent.
+* A user-job node is drawn as a pill with a double border, a person glyph and a "your job" chip;
+  while it waits for you it lights up and pulses. "Waiting for you:" in the topbar lists every such
+  node in the plan tree — click to jump. Its drawer shows the instruction in a box with a **✓ Mark
+  done** button under it, and the **Done by** row (an agent / you) switches a pending or ready
+  node's kind, see [User-job nodes](#user-job-nodes-a-step-a-person-does).
 * **Agents** in the sidebar manages the profiles: add one, pick its harness, model, endpoint and
-  key, choose its toolset, cap its parallelism, and **Test connection** before trusting it.
+  key, choose **What may this agent do** (the [capability](#capability-what-an-agent-may-do)) and
+  its **Test level**, cap its parallelism, and **Test connection** before trusting it. The raw
+  **Permission mode** and **Tools preset** selects sit under *Advanced* as escape hatches.
 * A reviewed node carries a small verdict marker (✓ / ! / ?) in its top-right corner; its full-view
   **Review** tab shows the verdict, summary and findings and a button to (re-)review it on demand.
   A review chip next to the plan status does the same for the plan-level review, see
@@ -489,9 +584,14 @@ profile is the source of truth — edit it in the Agents panel or with `update_a
 `--agent-profile` naming a profile that does not exist stops the server with a message listing the
 ones that do.
 
-`acceptEdits` lets agents edit files in their workspace but blocks other tools that would need
-approval; `bypassPermissions` lets them run anything (only use it in a sandbox). For `openai`
-agents the equivalent control is the profile's `tools` preset.
+What an agent may do is set per profile by its [capability](#capability-what-an-agent-may-do), not
+by `--permission-mode`. The flag is the fallback: it is the mode a `claude-sdk` session runs in at
+capability `full`, after every file and shell tool has already been pre-approved, so it only
+governs what the model reaches for beyond those. Below `full` the session runs in `dontAsk`
+regardless. On its own `acceptEdits` is **not** a usable default for unattended agents — it
+prompts for Bash, and an SDK session has nobody to answer, so agents could not run anything; that
+is what capability replaced. `bypassPermissions` lifts every check (only in a sandbox). For
+`openai` agents the raw equivalent is the profile's `tools` preset.
 
 ## Layout of the code
 

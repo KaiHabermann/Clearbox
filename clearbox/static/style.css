@@ -15,6 +15,7 @@
   --failed: #ef5f5f;
   --concerns: #e0a93d;  /* review verdict: advice, not a failure -- amber, not red */
   --files: #7d86a0;   /* shares-files connector between staggered nodes */
+  --user: #e8c268;    /* user-job nodes: a step a person does, the plan parks on it */
 
   /* harness colours: agent chips, legend, transcript header */
   --h-claude-sdk: #d97757;
@@ -89,14 +90,22 @@ button.danger:hover { border-color: var(--failed); color: var(--failed); }
 .pill.done { color: var(--done); border-color: rgba(76,195,138,.4); }
 .pill.failed { color: var(--failed); border-color: rgba(239,95,95,.4); }
 .pill.ready { color: var(--ready); border-color: rgba(91,156,245,.4); }
+.pill.waiting { color: var(--user); border-color: color-mix(in srgb, var(--user) 50%, transparent); }
 
 #active-bar { display: flex; gap: 8px; align-items: center; padding: 0 18px; flex-wrap: wrap; }
 #active-bar:not(:empty) { padding: 8px 18px; border-bottom: 1px solid var(--line); background: rgba(242,184,75,.04); }
 #active-bar .lbl { color: var(--muted); font-size: 12px; }
+#active-bar .lbl.user { color: var(--user); font-weight: 600; }
+#active-bar .lbl.user:not(:first-child) { margin-left: 14px; }
 .chip { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; padding: 3px 10px; border-radius: 99px; background: var(--panel-2); border: 1px solid rgba(242,184,75,.35); cursor: pointer; }
 .chip:hover { border-color: var(--running); }
 .chip .ref { font-family: var(--mono); color: var(--faint); }
 .chip .who { font-size: 11px; color: var(--hc, var(--muted)); }
+/* "Waiting for you": the whole plan is parked on this step, so it must not read like one more running chip */
+.chip.user { border-color: var(--user); background: color-mix(in srgb, var(--user) 14%, var(--panel-2)); color: var(--text); font-weight: 600; box-shadow: 0 0 0 0 color-mix(in srgb, var(--user) 60%, transparent); animation: pulse-user 1.8s ease-in-out infinite; }
+.chip.user:hover { filter: brightness(1.1); }
+@keyframes pulse-user { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--user) 55%, transparent); } 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--user) 0%, transparent); } }
+.user-ic { display: inline-block; width: 10px; height: 10px; border-radius: 50% 50% 2px 2px; border: 1.5px solid var(--user); border-bottom-width: 3px; }
 
 /* plan-wide default agent (topbar) */
 .agent-ctl { flex: none; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -146,6 +155,7 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .h-other { --hc: var(--h-other); }
 .fconn-icon { width: 16px; border-top: 1.5px dotted var(--files); }
 .stack-icon { width: 11px; height: 9px; border: 1px solid var(--muted); border-radius: 2px; box-shadow: 2px -2px 0 -1px var(--panel), 2px -2px 0 0 var(--muted); }
+.user-job-icon { width: 18px; height: 10px; border-radius: 99px; border: 1px solid var(--user); box-shadow: inset 0 0 0 1.5px var(--panel), inset 0 0 0 2.5px var(--user); }
 #zoom { position: absolute; right: 14px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
 #zoom button { width: 32px; height: 32px; padding: 0; font-size: 16px; }
 
@@ -193,6 +203,23 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .node.failed .stripe { fill: var(--failed); }
 .node.failed .card { stroke: var(--failed); }
 .node.sel .card { stroke: #fff; stroke-width: 2; }
+/* user-job nodes: pill-shaped, double border, person glyph where the stripe would be; no status stripe
+   since it is not an agent's queue slot. "for-you" = ready and parked on the person: lit and pulsing. */
+.node.user .card { stroke: color-mix(in srgb, var(--user) 55%, transparent); stroke-width: 1.4; }
+.node.user .card-inner { fill: none; stroke: color-mix(in srgb, var(--user) 35%, transparent); stroke-width: 1; }
+.node.user .user-glyph circle, .node.user .user-glyph path { fill: none; stroke: var(--user); stroke-width: 1.6; stroke-linecap: round; opacity: .7; }
+.node.user.done .card { stroke: rgba(76,195,138,.45); }
+.node.user.done .card-inner { stroke: rgba(76,195,138,.25); }
+.node.user.done .user-glyph circle, .node.user.done .user-glyph path { stroke: var(--done); }
+.node.user.failed .card { stroke: var(--failed); }
+.node.user.for-you .card { stroke: var(--user); stroke-width: 2; fill: color-mix(in srgb, var(--user) 7%, var(--panel)); }
+.node.user.for-you .user-glyph circle, .node.user.for-you .user-glyph path { opacity: 1; }
+.node.user.for-you .sub { fill: var(--user); }
+.node.user.for-you .halo { stroke: var(--user); animation: halo 1.8s ease-out infinite; }
+.node.user.sel .card { stroke: #fff; }
+.node .achip.ujob rect { fill: color-mix(in srgb, var(--user) 14%, var(--panel)); stroke: color-mix(in srgb, var(--user) 60%, transparent); stroke-dasharray: none; }
+.node .achip.ujob text { fill: var(--user); }
+.handglyph { fill: none; stroke: var(--user); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 @keyframes halo { 0% { opacity: .75; stroke-width: 2; transform: scale(1); } 100% { opacity: 0; stroke-width: 7; transform: scale(1.06); } }
 .node .halo { transform-box: fill-box; transform-origin: center; }
 .spinner { fill: none; stroke: var(--running); stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 18 40; transform-box: fill-box; transform-origin: center; animation: spin 1s linear infinite; }
@@ -231,6 +258,12 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 #node-info .agent-row .asrc { color: var(--faint); font-size: 12px; }
 #node-info .agent-row select { margin-left: auto; }
 #node-info .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* a user node's description is the instruction to the person: boxed, roomier, with Mark done right under it */
+#node-info .user-task { border: 1px solid color-mix(in srgb, var(--user) 40%, transparent); border-radius: 9px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; background: color-mix(in srgb, var(--user) 5%, transparent); }
+#node-info .user-task.now { border-color: var(--user); background: color-mix(in srgb, var(--user) 9%, transparent); }
+#node-info .user-task .k { color: var(--user); margin-bottom: 0; }
+#node-info .user-task .v { font-size: 14px; }
+#node-info .user-task .actions { margin-top: 2px; }
 #node-info .result-box { background: rgba(76,195,138,.07); border: 1px solid rgba(76,195,138,.25); border-radius: 8px; padding: 8px 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
 .files-row { display: flex; flex-direction: column; gap: 4px; }
 .files-empty { color: var(--faint); font-size: 12.5px; }
@@ -430,6 +463,7 @@ button.link:hover { color: var(--text); }
 .ag-form .adv summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
 .ag-form .adv[open] summary { margin-bottom: 6px; }
 .ag-form .adv small { display: block; margin-top: 4px; }
+.ag-form .adv .fld { margin-bottom: 10px; }  /* raw permission mode / tools preset, tucked under Advanced */
 .fld-err { color: var(--failed); font-size: 12px; font-family: var(--mono); }
 .fld-err:empty { display: none; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

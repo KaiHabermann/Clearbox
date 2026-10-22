@@ -138,6 +138,10 @@ function sourceText(a) {
   if (a.source === "inherited") return a.from_plan != null ? `inherited from plan ${a.from_plan}` : "inherited";
   return "server default";
 }
+// User-job nodes: a step a person does (push a branch, open an MR, approve something). No agent
+// runs one; the plan parks on it until the user marks it done. kind is "agent" or "user".
+const isUserNode = (n) => n.kind === "user";
+const isWaiting = (n) => isUserNode(n) && (n.waiting_for_user || n.status === "ready");
 function planDefaultAgent(d) {
   // the agent a node of this plan gets when it has no override of its own
   if (!d) return null;
@@ -383,6 +387,15 @@ function renderHeader() {
         el("i", { class: "dot running" }), a.title,
         a.agent_name && el("span", { class: `who ${h ? hcls(h) : ""}` }, a.agent_kind === "external" ? `ext · ${a.agent_name}` : a.agent_name),
         el("span", { class: "ref" }, `${a.plan_id}.${a.node_id}`)));
+    }
+  }
+  // user-job nodes the whole plan is parked on: impossible to miss, one click to jump there
+  if (d.waiting?.length) {
+    ab.append(el("span", { class: "lbl user" }, "Waiting for you:"));
+    for (const w of d.waiting) {
+      ab.append(el("span", { class: "chip user", title: "this step is your job: open the node and mark it done when it is", onclick: () => openPlan(w.plan_id, w.node_id) },
+        el("i", { class: "user-ic" }), w.title,
+        el("span", { class: "ref" }, `${w.plan_id}.${w.node_id}`)));
     }
   }
 }
@@ -675,9 +688,10 @@ function renderGraph() {
   for (const n of d.nodes) {
     const p = L.coords.get(n.node_id);
     const isSel = state.sel && state.sel.plan_id === d.plan.id && state.sel.node_id === n.node_id;
-    const bb = n.status === "ready" ? n.blocked_by : null;  // ready, but a node writing the same files goes first
+    const user = isUserNode(n), waitingUser = isWaiting(n);
+    const bb = n.status === "ready" && !user ? n.blocked_by : null;  // ready, but a node writing the same files goes first
     const g = el("svg:g", {
-      class: `node ${n.status}${bb ? " waiting" : ""}${isSel ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
+      class: `node ${n.status}${bb ? " waiting" : ""}${user ? " user" : ""}${waitingUser ? " for-you" : ""}${isSel ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
       onclick: (e) => { e.stopPropagation(); selectNode(d.plan.id, n.node_id); },
       ondblclick: (e) => { e.stopPropagation(); if (n.subplan_id) openPlan(n.subplan_id); },
     });
@@ -686,10 +700,21 @@ function renderGraph() {
       g.append(el("svg:rect", { class: "ghost", x: 8, y: -8, width: NODE_W, height: NODE_H, rx: 10 }));
       g.append(el("svg:rect", { class: "ghost", x: 4, y: -4, width: NODE_W, height: NODE_H, rx: 10 }));
     }
-    g.append(el("svg:rect", { class: "halo", x: 0, y: 0, width: NODE_W, height: NODE_H, rx: 10 }));
-    g.append(el("svg:rect", { class: "card", x: 0, y: 0, width: NODE_W, height: NODE_H, rx: 10 }));
-    g.append(el("svg:rect", { class: "stripe", x: 0, y: 10, width: 4, height: NODE_H - 20, rx: 2 }));
-    g.append(el("svg:text", { class: "title", x: 16, y: 27 }, truncate(n.title, 25)));
+    // a user job is a different kind of thing, not just a queued node: pill-shaped card with a
+    // double border, a person icon instead of the stripe, and no agent chip
+    const rx = user ? NODE_H / 2 : 10;
+    g.append(el("svg:rect", { class: "halo", x: 0, y: 0, width: NODE_W, height: NODE_H, rx }));
+    g.append(el("svg:rect", { class: "card", x: 0, y: 0, width: NODE_W, height: NODE_H, rx }));
+    if (user) {
+      g.append(el("svg:rect", { class: "card-inner", x: 4, y: 4, width: NODE_W - 8, height: NODE_H - 8, rx: rx - 4 }));
+      g.append(el("svg:g", { class: "user-glyph" },
+        el("svg:circle", { cx: 24, cy: 22, r: 4.5 }),
+        el("svg:path", { d: "M15,37 a9,9 0 0,1 18,0" })));
+    } else {
+      g.append(el("svg:rect", { class: "stripe", x: 0, y: 10, width: 4, height: NODE_H - 20, rx: 2 }));
+    }
+    const tx = user ? 36 : 16;
+    g.append(el("svg:text", { class: "title", x: tx, y: 27 }, truncate(n.title, user ? 21 : 25)));
 
     let sub;
     if (n.subplan_id) {
@@ -699,6 +724,8 @@ function renderGraph() {
       g.append(el("svg:rect", { class: "pbar-bg", x: 16, y: CHIP_Y + 6, width: w, height: 4, rx: 2 }));
       g.append(el("svg:rect", { class: "pbar", x: 16, y: CHIP_Y + 6, width: (w * pr.done) / tot, height: 4, rx: 2 }));
       if (pr.running) g.append(el("svg:rect", { class: "pbar run", x: 16 + (w * pr.done) / tot, y: CHIP_Y + 6, width: (w * pr.running) / tot, height: 4, rx: 2 }));
+    } else if (user) {
+      sub = waitingUser ? "waiting for you — mark done when it is" : n.status === "done" ? "done by you" : n.status === "failed" ? truncate(n.error || "failed", 32) : "your job · not its turn yet";
     } else if (n.status === "running") {
       const dur = n.started_at ? ` · ${fmtDur(Date.now() / 1000 - n.started_at)}` : "";
       sub = `${n.agent_name || (n.agent_kind === "external" ? "external" : "agent")} working${dur}`;
@@ -711,7 +738,7 @@ function renderGraph() {
         : n.status === "ready" ? "ready – waiting for agent" : truncate(n.description || "pending", 32);
     }
     g.append(el("svg:text", {
-      class: "sub", x: 16, y: n.subplan_id ? 47 : 50,
+      class: "sub", x: tx, y: n.subplan_id ? 47 : 50,
       "data-started": !n.subplan_id && n.status === "running" && n.started_at ? n.started_at : null,
       "data-who": n.agent_name || (n.agent_kind === "external" ? "external" : "agent"),
     }, truncate(sub, 34)));
@@ -726,7 +753,13 @@ function renderGraph() {
     // always on an explicit override, which gets a filled dot and a solid border
     const a = n.agent, override = a && a.source === "node";
     let chip = null;
-    if (a && !n.subplan_id && (override || agentKey(a) !== defKey)) {
+    if (user) {
+      chip = el("svg:g", { class: "achip ujob" },
+        el("svg:title", {}, "your job: no agent runs this step"),
+        el("svg:rect", { x: tx, y: CHIP_Y, width: 40, height: CHIP_H, rx: CHIP_H / 2 }),
+        el("svg:text", { x: tx + 8, y: CHIP_Y + 12.5 }, "your job"));
+      g.append(chip);
+    } else if (a && !n.subplan_id && (override || agentKey(a) !== defKey)) {
       chip = el("svg:g", { class: `achip ${hcls(a.harness)}${override ? " override" : ""}` },
         el("svg:title", {}, `agent: ${a.name} (${agentModel(a)}) · ${sourceText(a)}`),
         el("svg:rect", { x: 16, y: CHIP_Y, width: 40, height: CHIP_H, rx: CHIP_H / 2 }),
@@ -739,6 +772,7 @@ function renderGraph() {
     const gx = NODE_W - 22, gy = n.subplan_id ? 50 : CHIP_Y + CHIP_H / 2;
     if (n.status === "running") g.append(el("svg:circle", { class: "spinner", cx: gx, cy: gy, r: 7 }));
     else if (n.status === "done") g.append(el("svg:path", { class: "check", d: `M${gx - 6},${gy} l4,4 l8,-8` }));
+    else if (waitingUser) g.append(el("svg:path", { class: "handglyph", d: `M${gx - 7},${gy} h14 M${gx + 1},${gy - 6} l6,6 l-6,6` }));  // "over to you" arrow
     else if (bb) g.append(el("svg:path", { class: "waitglyph", d: `M${gx},${gy - 4} v4 l3,2 M${gx + 7},${gy} a7,7 0 1,1 -14,0 a7,7 0 1,1 14,0` }));
     else if (n.status === "failed") g.append(el("svg:path", { class: "cross", d: `M${gx - 5},${gy - 5} l10,10 M${gx + 5},${gy - 5} l-10,10` }));
 
@@ -754,7 +788,7 @@ function renderGraph() {
     }
     gN.append(g);
     if (chip) {  // size the pill to its rendered text, never past the status glyph
-      const t = chip.querySelector("text"), pad = +t.getAttribute("x") - 16;
+      const t = chip.querySelector("text"), pad = +t.getAttribute("x") - tx;
       chip.querySelector("rect").setAttribute("width", Math.min(t.getComputedTextLength() + pad + 9, NODE_W - 16 - 40));
     }
   }
@@ -980,12 +1014,13 @@ function renderNodeInfo(r) {
   const n = r.node, pid = state.sel.plan_id;
   const head = $("#drawer-head");
   head.innerHTML = "";
-  const agent = n.agent_kind ? (n.agent_kind === "external" ? `external · ${n.agent_name || "?"}` : `built-in · ${n.agent_name || "agent"}`) : null;
+  const user = isUserNode(n), waiting = isWaiting(n);
+  const agent = user ? "your job" : n.agent_kind ? (n.agent_kind === "external" ? `external · ${n.agent_name || "?"}` : `built-in · ${n.agent_name || "agent"}`) : null;
   head.append(
     el("div", { class: "t" },
       el("h2", {}, n.title),
       el("div", { class: "meta" },
-        el("span", { class: `pill ${n.status}` }, n.status),
+        el("span", { class: `pill ${waiting ? "waiting" : n.status}` }, waiting ? "waiting for you" : n.status),
         el("span", { style: "font-family:var(--mono)" }, `plan ${pid} · node ${n.node_id}`),
         agent && el("span", {}, agent),
         n.session_id && el("span", { title: "agent session id", style: "font-family:var(--mono)" }, truncate(n.session_id, 14)))),
@@ -994,9 +1029,23 @@ function renderNodeInfo(r) {
 
   const info = $("#node-info");
   info.innerHTML = "";
-  info.append(el("div", {}, el("div", { class: "k" }, "Task"), el("div", { class: "v", html: n.description ? md(n.description) : "—" })));
+  const markDone = (cls) => el("button", {
+    class: cls,
+    title: user ? "this step is done: mark it so the nodes after it start" : "stop whatever is working on this node and mark it done, so the nodes after it start",
+    onclick: () => completeNode(pid, n),
+  }, "✓ Mark done");
+  if (user) {
+    // the description is the instruction to the person, so it gets the room and the primary button
+    info.append(el("div", { class: `user-task${waiting ? " now" : ""}` },
+      el("div", { class: "k" }, waiting ? "Your job — the plan is waiting on this" : n.status === "done" ? "Your job — done" : n.status === "failed" ? "Your job — stopped; retry to park the plan here again" : "Your job — not its turn yet"),
+      el("div", { class: "v", html: n.description ? md(n.description) : "—" }),
+      n.status !== "done" && el("div", { class: "actions" }, markDone(waiting ? "primary" : ""))));
+  } else {
+    info.append(el("div", {}, el("div", { class: "k" }, "Task"), el("div", { class: "v", html: n.description ? md(n.description) : "—" })));
+  }
+  if (!n.subplan_id && (n.status === "pending" || n.status === "ready")) info.append(renderKindRow(pid, n));
   const a = n.agent || state.data?.nodes.find((m) => m.node_id === n.node_id)?.agent;
-  if (a && !n.subplan_id) {
+  if (a && !n.subplan_id && !user) {
     const running = n.status === "running", inh = planDefaultAgent(state.data);
     const sel = agentSelect(n.agent_profile_id ?? null, inh ? `— inherit: ${inh.name} —` : "— inherit —",
       async (id) => { await put(`/api/plans/${pid}/nodes/${n.node_id}/agent`, { agent: id }); await refreshPlan(); },
@@ -1016,26 +1065,38 @@ function renderNodeInfo(r) {
     v.append(el("span", { class: "hint" }, " — ordering only: runs after these, receives none of their results"));
     info.append(el("div", {}, el("div", { class: "k" }, "Depends on"), v));
   }
-  if (!n.subplan_id) info.append(renderResultsFromRow(pid, n), renderPromptRow(pid, n));
+  if (!n.subplan_id && !user) info.append(renderResultsFromRow(pid, n), renderPromptRow(pid, n));  // a user node gets no prompt
   if (n.error) info.append(el("div", {}, el("div", { class: "k" }, "Error"), el("div", { class: "v err" }, n.error)));
   if (n.result) info.append(el("div", {}, el("div", { class: "k" }, "Result"), el("div", { class: "result-box" }, n.result)));
-  if (!n.subplan_id) info.append(renderChangesRow(pid, n));
+  if (!n.subplan_id && !user) info.append(renderChangesRow(pid, n));
   const actions = el("div", { class: "actions" });
   if (n.subplan_id) actions.append(el("button", { class: "primary", onclick: () => openPlan(n.subplan_id) }, `Open subplan #${n.subplan_id} →`));
   if (n.status === "failed") actions.append(el("button", { onclick: () => act(post(`/api/plans/${pid}/nodes/${n.node_id}/retry`)) }, "↻ Retry"));
   if (n.status === "running" && n.agent_kind === "builtin" && !n.agent_done) actions.append(el("button", { class: "danger", onclick: () => act(post(`/api/plans/${pid}/nodes/${n.node_id}/stop`)) }, "■ Stop agent"));
-  if (n.status !== "done") actions.append(el("button", {
-    title: "stop whatever is working on this node and mark it done, so the nodes after it start",
-    onclick: () => completeNode(pid, n),
-  }, "✓ Mark done"));
+  if (n.status !== "done" && !user) actions.append(markDone(""));  // a user node's Mark done sits under its instruction above
   let rework = null;
-  if (n.status === "done" && !n.subplan_id) {
+  if (n.status === "done" && !n.subplan_id && !user) {
     actions.append(reviewButton(pid, n), reworkButton(pid, n));
     if (!state.fullOpen) rework = reworkForm(pid, n);  // in full view the form lives in the Review tab
   }
   if (actions.children.length) info.append(actions);
   if (rework) info.append(rework);
   relocateForFull();
+}
+
+// Done-by row: switch a not-yet-started node between an agent job and a user job (PUT .../kind).
+// The server rejects the change once the node has run, so the row is only drawn while pending/ready.
+function renderKindRow(pid, n) {
+  const sel = el("select", { class: "agent-sel", title: "who does this step: an agent, or you (the plan stops here until you mark it done)" },
+    el("option", { value: "agent" }, "an agent"),
+    el("option", { value: "user" }, "you — the plan waits here until you mark it done"));
+  sel.value = isUserNode(n) ? "user" : "agent";
+  sel.addEventListener("change", async () => {
+    sel.disabled = true;
+    try { await put(`/api/plans/${pid}/nodes/${n.node_id}/kind`, { kind: sel.value }); await refreshPlan(); }
+    catch (e) { alert(e.message); sel.value = isUserNode(n) ? "user" : "agent"; sel.disabled = false; }
+  });
+  return el("div", {}, el("div", { class: "k" }, "Done by"), el("div", { class: "v agent-row" }, sel));
 }
 
 function reviewButton(pid, n) {
@@ -1239,7 +1300,7 @@ function completeNode(pid, n) {
   const had = (n.result || "").trim();
   const result = prompt(
     `Mark "${n.title}" done.\n\nResult handed to the nodes that depend on it` +
-    (had ? "" : " (leave empty to use the agent's own closing summary, if it wrote one)") + ":",
+    (had ? "" : isUserNode(n) ? " (e.g. the MR link; optional)" : " (leave empty to use the agent's own closing summary, if it wrote one)") + ":",
     had);
   if (result === null) return;  // cancelled
   act(post(`/api/plans/${pid}/nodes/${n.node_id}/complete`, { result: result.trim() || null }));
@@ -1312,7 +1373,7 @@ function updateTyping() {
   t.querySelector(".typing")?.remove();
   const n = state.nodeData;
   if (!n) return;
-  if (!t.children.length && !n.agent_kind) t.append(el("div", { class: "none" }, n.subplan_id ? "This node is a subplan – open it to see its agents." : "No agent has worked on this node yet."));
+  if (!t.children.length && !n.agent_kind) t.append(el("div", { class: "none" }, n.subplan_id ? "This node is a subplan – open it to see its agents." : isUserNode(n) ? "This step is your job – no agent runs it." : "No agent has worked on this node yet."));
   if (n.status === "running" && n.agent_kind && !n.agent_done) { t.append(el("div", { class: "typing" }, el("i"), el("i"), el("i"))); scrollTranscript(); }
 }
 function scrollTranscript() {
@@ -1324,6 +1385,21 @@ function scrollTranscript() {
 // Agent profiles (harness + model + endpoint). The panel is a second right-hand drawer so it sits
 // next to the graph like the node drawer does; only one of the two is open at a time.
 const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"];
+// capability: what the harness lets the agent do, the same for every harness (the registry maps it
+// to the SDK's allowed tools or the openai tools preset). null = the role default: full for a worker, run for a reviewer.
+const CAPABILITIES = [
+  ["read", "read and search only; no edits, no commands"],
+  ["run", "read, search and run commands; no edits"],
+  ["edit", "read, search and edit files; no commands"],
+  ["full", "everything"],
+];
+// test level: how much a worker agent is told to test; wording identical to the prompt it gets
+const TEST_LEVELS = [
+  ["none", "do not test; the node says what to verify, or nothing needs verifying"],
+  ["light", "a quick sanity check that the change works -- one script or a couple of cases"],
+  ["standard", "run the existing tests covering what you touched, and fix what you broke"],
+  ["thorough", "run the full suite, and add tests for behaviour you added"],
+];
 const PARAMS_EXAMPLE = { temperature: 0.2, max_tokens: 4096, max_turns: 50, reasoning_effort: "medium", stream: true, input_price_per_mtok: 0.15, output_price_per_mtok: 0.6 };
 const DEFAULT_TIP = "server default: runs every node for which neither the node nor any of its plans picks an agent";
 
@@ -1447,6 +1523,8 @@ function renderAgentForm(body, a) {
   const preset = select("ag-preset", [["all", "all – read, write, edit, shell"], ["readonly", "readonly – read_file, list_dir, glob, grep"], ["none", "none – text only"]], tools.preset || "all");
   const mcp = el("input", { type: "checkbox", id: "ag-mcp" }); mcp.checked = tools.mcp ?? true;
   const perm = select("ag-perm", [["", "(server default)"], ...PERMISSION_MODES.map((m) => [m, m])], v.permission_mode || "");
+  const cap = select("ag-cap", [["", "default — full as a worker, run as a reviewer"], ...CAPABILITIES.map(([k, t]) => [k, `${k} — ${t}`])], v.capability || "");
+  const level = select("ag-level", TEST_LEVELS.map(([k, t]) => [k, `${k} — ${t}`]), v.test_level || "standard");
   const sys = el("textarea", { id: "ag-sys", rows: 3, placeholder: "extra system prompt text for this agent" }); sys.value = v.system_append || "";
   const paramsErr = el("div", { class: "fld-err", id: "ag-params-err", role: "alert" });
   const paramsTa = el("textarea", { id: "ag-params", rows: 7, spellcheck: "false", "aria-describedby": "ag-params-err ag-params-hint",
@@ -1479,15 +1557,17 @@ function renderAgentForm(body, a) {
       el("small", {}, isNew ? "leave empty for local endpoints or when using the env var"
         : (a.has_api_key ? "a key is available; leave empty to keep it" : "no key stored; type one to store it")),
       isNew ? null : el("label", { class: "chk" }, keyClear, " clear the stored key")),
-    fld("ag-perm", "Permission mode", perm, null, "claude-sdk"),
+    fld("ag-cap", "What may this agent do", cap, "same meaning on every harness; the default is full for a worker agent and run when it reviews"),
+    fld("ag-level", "Test level", level, "how much a worker agent is told to test; a reviewer always runs the suite"),
     fld("ag-maxpar", "Max parallel", inp("ag-maxpar", v.max_parallel, { type: "number", min: 1, step: 1, placeholder: "unlimited" }), "at most this many nodes run on this agent at once (e.g. 1 for a single local GPU)"),
     el("div", { class: "fld", "data-only": "openai" },
-      el("label", { for: "ag-preset" }, "Tools"), preset,
       el("label", { class: "chk" }, mcp, " expose clearbox MCP tools (plan building, report_progress)")),
     fld("ag-sys", "System prompt addition", sys),
-    el("details", { class: "fld adv", open: Object.keys(params).length ? true : null },
-      el("summary", {}, "Advanced params (JSON)"),
-      el("label", { for: "ag-params", class: "sr" }, "Advanced params as a JSON object"), paramsTa, paramsErr,
+    el("details", { class: "fld adv", open: Object.keys(params).length || v.permission_mode || (tools.preset && tools.preset !== "all") ? true : null },
+      el("summary", {}, "Advanced"),
+      fld("ag-perm", "Permission mode (raw)", perm, "escape hatch: overrides the capability's mode for the Claude SDK session; leave on server default unless you know why", "claude-sdk"),
+      fld("ag-preset", "Tools preset (raw)", preset, "escape hatch: the capability picks this for you; set it only to override", "openai"),
+      el("label", { for: "ag-params" }, "Advanced params (JSON)"), paramsTa, paramsErr,
       el("small", { id: "ag-params-hint" }, "temperature, top_p, max_tokens, max_turns, reasoning_effort, stream, timeout, extra_body, input_price_per_mtok, output_price_per_mtok (USD per 1M tokens) · ",
         el("a", { href: "#", onclick: (e) => { e.preventDefault(); paramsTa.value = JSON.stringify({ ...PARAMS_EXAMPLE, ...(checkParams() || {}) }, null, 2); checkParams(); state.agentDirty = true; } }, "insert example"))),
     msg,
@@ -1514,7 +1594,8 @@ function agentBody(a, form, checkParams) {
   const h = val("ag-harness"), mp = val("ag-maxpar");
   if (!val("ag-name")) throw new Error("Name is required.");
   if (mp && !/^[1-9]\d*$/.test(mp)) throw new Error("Max parallel must be a positive whole number (or empty for unlimited).");
-  const body = { name: val("ag-name"), harness: h, model: val("ag-model") || null, system_append: form.querySelector("#ag-sys").value.trim() || null, max_parallel: mp ? +mp : null, params };
+  const body = { name: val("ag-name"), harness: h, model: val("ag-model") || null, system_append: form.querySelector("#ag-sys").value.trim() || null, max_parallel: mp ? +mp : null, params,
+    capability: val("ag-cap") || null, test_level: val("ag-level") || null };
   if (h === "openai") {
     Object.assign(body, { base_url: val("ag-base") || null, api_key_env: val("ag-keyenv") || null });
     // tools is only meaningful for the sandboxed toolset of non-Claude harnesses; keep allow/deny lists

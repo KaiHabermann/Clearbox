@@ -17,6 +17,24 @@ does not pay construction cost per node. The whole row is compared rather than
 just ``updated_at`` because two edits can land in the same clock tick on Windows.
 A misconfigured profile raises ``HarnessError`` from ``resolve``; the engine
 turns that into a failed node with the message as its error.
+
+Capability
+----------
+A profile's ``capability`` says what its agent may do, and means the same thing
+for every harness:
+
+    read   read and search only; no edits, no commands
+    run    read, search and run commands; no edits
+    edit   read, search and edit files; no commands
+    full   everything
+
+The registry maps it to each harness's own gating (``claude_access`` and
+``openai_tools``). ``full`` means the agent can run arbitrary commands in the
+plan's working directory; that is the operator's choice, made when they pick the
+profile. When a profile sets no capability the default is ``full`` for worker
+agents and ``run`` for reviewers (a reviewer must run the suite but must not
+edit). A profile's raw ``permission_mode`` (claude-sdk) or ``tools`` config
+(openai) is still honoured as an escape hatch when set.
 """
 
 from __future__ import annotations
@@ -24,11 +42,59 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..store import PlanError, Store, public_profile
+from ..store import CAPABILITIES, PlanError, Store, public_profile
 from .base import Harness, HarnessError
 from .claude_sdk import ClaudeSdkHarness, _as_json
 from .mock import MockHarness
 from .openai_compat import OpenAiHarness
+
+DEFAULT_CAPABILITY = "full"         # worker agents
+DEFAULT_REVIEW_CAPABILITY = "run"   # reviewers
+
+_READ_TOOLS = ["Read", "Grep", "Glob"]
+_OPENAI_WRITE_TOOLS = ["write_file", "edit_file"]
+
+
+def _check_capability(capability: str, profile_name: str) -> str:
+    if capability not in CAPABILITIES:
+        raise HarnessError(
+            f"agent profile {profile_name!r}: unknown capability {capability!r}; expected one of {', '.join(CAPABILITIES)}")
+    return capability
+
+
+def claude_access(capability: str, fallback_mode: str) -> tuple[str, list[str]]:
+    """``(permission_mode, allowed_tools)`` for the Claude Agent SDK.
+
+    Gating is done with ``allowed_tools``: anything listed is pre-approved and runs
+    without a prompt. Below ``full`` the mode is ``dontAsk``, which denies every tool
+    that is not pre-approved instead of prompting -- an SDK session has nobody to
+    answer a prompt, so any prompting mode would silently block the tool. ``full``
+    pre-approves every file and shell tool and keeps ``fallback_mode`` (the server's
+    ``--permission-mode``) for whatever else the model reaches for.
+    """
+    tools = list(_READ_TOOLS)
+    if capability in ("run", "full"):
+        tools.append("Bash")
+    if capability in ("edit", "full"):
+        tools += ["Write", "Edit", "MultiEdit"]
+    return (fallback_mode if capability == "full" else "dontAsk"), tools
+
+
+def openai_tools(capability: str, tools_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The ``tools`` config for an OpenAI-compatible profile: the existing preset
+    plus allow list. Only the ``mcp`` flag survives from ``tools_config``; the bridge
+    stays governed by it, not by the capability."""
+    if capability == "full":
+        out: dict[str, Any] = {"preset": "all"}
+    else:
+        out = {"preset": "readonly"}
+        allow = (["bash"] if capability == "run" else []) + (_OPENAI_WRITE_TOOLS if capability == "edit" else [])
+        if allow:
+            out["allow"] = allow
+    mcp = (tools_config or {}).get("mcp")
+    if mcp is not None:
+        out["mcp"] = mcp
+    return out
 
 
 @dataclass
@@ -137,8 +203,10 @@ class HarnessRegistry:
             if d.agent == "mock":
                 self._implicit = MockHarness(speed=d.mock_speed)
             else:
+                mode, tools = claude_access(DEFAULT_CAPABILITY, d.permission_mode)
                 self._implicit = ClaudeSdkHarness(
-                    permission_mode=d.permission_mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
+                    permission_mode=mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
+                    allowed_tools=tools,
                 )
         return self._implicit
 
@@ -152,14 +220,22 @@ class HarnessRegistry:
         return harness
 
     def _build(self, profile: dict[str, Any]) -> Harness:
+        """A harness for a normal node run. The profile's ``capability`` (default
+        ``full``: the agent can run arbitrary commands in the plan's working directory,
+        the operator's choice) sets the tool access; an explicit ``permission_mode`` or
+        ``tools`` on the profile still overrides it as an escape hatch."""
         d = self.defaults
         kind = profile["harness"]
+        capability = _check_capability(profile.get("capability") or DEFAULT_CAPABILITY, profile["name"])
         if kind == "claude-sdk":
-            return ClaudeSdkHarness(
-                permission_mode=d.permission_mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
-                profile=profile,
+            mode, tools = claude_access(capability, d.permission_mode)
+            return ClaudeSdkHarness(  # the profile's own permission_mode / tools win inside, when set
+                permission_mode=mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
+                allowed_tools=tools, profile=profile,
             )
         if kind == "openai":
+            if profile.get("capability"):
+                profile = {**profile, "tools": openai_tools(capability, _as_json(profile.get("tools"), {}))}
             return OpenAiHarness(profile=profile, mcp_url=d.mcp_url)
         if kind == "mock":
             params = _as_json(profile.get("params"), {}) or {}
@@ -167,28 +243,28 @@ class HarnessRegistry:
         raise HarnessError(f"agent profile {profile['name']!r}: unknown harness {kind!r}")
 
     def review_harness_for(self, profile: dict[str, Any]) -> Harness:
-        """A harness for a review session: same model/endpoint as ``profile``, but forced
-        read-only regardless of what the profile allows for normal node runs.
+        """A harness for a review session: same model/endpoint as ``profile``, but with
+        capability ``run`` regardless of what the profile allows for normal node runs.
 
-        A reviewer must never edit files, so its own ``tools``/``permission_mode`` and the
-        clearbox MCP tools are ignored here: Claude Agent SDK sessions get ``permission_mode
-        "plan"`` plus a fixed tool list, and OpenAI-compatible ones get the ``"readonly"``
-        tools preset.
-
-        Shell access is part of that list because a reviewer has to be able to run the test
-        suite; the prompt forbids using it to change anything, and the node's diff would show
-        it if one tried.
+        A reviewer has to run the test suite but must never edit files, so its own
+        ``capability``/``tools``/``permission_mode`` and the clearbox MCP tools are ignored
+        here. A profile can set ``params.review_capability`` to choose otherwise. The prompt
+        forbids using the shell to change anything, and the node's diff would show it if one
+        tried.
         """
         d = self.defaults
         kind = profile["harness"]
+        params = _as_json(profile.get("params"), {}) or {}
+        capability = _check_capability(params.get("review_capability") or DEFAULT_REVIEW_CAPABILITY, profile["name"])
         if kind == "claude-sdk":
+            mode, tools = claude_access(capability, d.permission_mode)
             return ClaudeSdkHarness(
-                permission_mode="plan", model=profile.get("model") or d.model, max_turns=d.max_turns,
-                mcp_url=None, allowed_tools=["Read", "Grep", "Glob", "Bash"],
+                permission_mode=mode, model=profile.get("model") or d.model, max_turns=d.max_turns,
+                mcp_url=None, allowed_tools=tools,
             )
         if kind == "openai":
             return OpenAiHarness(
-                profile={**profile, "tools": {"preset": "readonly", "allow": ["bash"]}}, mcp_url=None)
+                profile={**profile, "tools": openai_tools(capability)}, mcp_url=None)
         if kind == "mock":
             params = _as_json(profile.get("params"), {}) or {}
             return MockHarness(speed=float(params.get("speed") or d.mock_speed))

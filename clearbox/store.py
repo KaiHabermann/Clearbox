@@ -153,7 +153,24 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("plans", "max_parallel", "INTEGER"),              # NULL = no plan-specific limit (root plans only)
     ("plans", "review_agent_profile_id", "INTEGER"),   # NULL = reviewing is off (the default)
     ("nodes", "rework_brief", "TEXT"),                 # what the last rework asked for; NULL = never reworked
+    ("nodes", "kind", "TEXT"),                         # NODE_KINDS; NULL = 'agent'
+    ("agent_profiles", "capability", "TEXT"),          # CAPABILITIES; NULL = the registry's default for the role
+    ("agent_profiles", "test_level", "TEXT"),          # TEST_LEVELS; NULL = 'standard'
 ]
+
+# nodes.kind: who does the work. 'agent' runs on an agent profile; 'user' is the
+# user's own job (push, open an MR, deploy, approve) and the plan waits there
+# until they mark it done.
+NODE_KINDS = ("agent", "user")
+
+# agent_profiles.capability: what the harness lets the agent do. The registry maps
+# it to each harness's own gating (allowed tools / tools preset); NULL means the
+# registry's default for the role (full for workers, run for reviewers).
+CAPABILITIES = ("read", "run", "edit", "full")
+
+# agent_profiles.test_level: how much a worker agent is told to test. Prompt text
+# lives in the engine; NULL means 'standard'.
+TEST_LEVELS = ("none", "light", "standard", "thorough")
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps
 # are store-managed.
@@ -164,7 +181,7 @@ HARNESSES = ("claude-sdk", "openai", "mock")
 # Every profile column a caller may set; id and timestamps are store-managed.
 PROFILE_FIELDS = (
     "name", "harness", "model", "base_url", "api_key_env", "api_key", "params", "tools",
-    "permission_mode", "system_append", "max_parallel", "description",
+    "permission_mode", "system_append", "max_parallel", "description", "capability", "test_level",
 )
 
 
@@ -241,6 +258,12 @@ def _check_max_parallel(value: Any) -> None:
         raise PlanError("max_parallel must be a positive integer or null")
 
 
+def _check_choice(name: str, value: Any, allowed: tuple[str, ...]) -> None:
+    """Raise PlanError unless value is None or one of `allowed`."""
+    if value is not None and value not in allowed:
+        raise PlanError(f"unknown {name} {value!r}; expected one of {', '.join(allowed)}")
+
+
 def validate_working_directory(path: str) -> None:
     """Raise PlanError unless path is an existing absolute directory.
 
@@ -287,6 +310,10 @@ def _profile_values(fields: dict[str, Any]) -> dict[str, Any]:
             out[key] = json.dumps(val)
     if "max_parallel" in out:
         _check_max_parallel(out["max_parallel"])
+    if "capability" in out:
+        _check_choice("capability", out["capability"], CAPABILITIES)
+    if "test_level" in out:
+        _check_choice("test_level", out["test_level"], TEST_LEVELS)
     if "description" in out and out["description"] is None:
         out["description"] = ""
     if out.get("api_key") == "":
@@ -450,7 +477,9 @@ class Store:
         agent_profile_id: int | None = None,
         files: list[str] | None = None,
         results_from: list[int] | None = None,
+        kind: str | None = None,
     ) -> tuple[int, int]:
+        _check_choice("node kind", kind, NODE_KINDS)
         with self._lock:
             p = self.get_plan(plan_id)
             if agent_profile_id is not None:
@@ -460,9 +489,9 @@ class Store:
             nid = p["next_node_id"]
             self._exec("UPDATE plans SET next_node_id=? WHERE id=?", (nid + 1, plan_id))
             self._exec(
-                "INSERT INTO nodes(plan_id, node_id, title, description, agent_profile_id, created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (plan_id, nid, title, description, agent_profile_id, time.time()),
+                "INSERT INTO nodes(plan_id, node_id, title, description, agent_profile_id, kind, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (plan_id, nid, title, description, agent_profile_id, kind, time.time()),
             )
             self._write_files(plan_id, nid, entries)
             self._write_results_from(plan_id, nid, from_ids)
@@ -485,6 +514,15 @@ class Store:
             f"UPDATE nodes SET {cols} WHERE plan_id=? AND node_id=?",
             (*fields.values(), plan_id, node_id),
         )
+
+    def set_node_kind(self, plan_id: int, node_id: int, kind: str | None) -> None:
+        """Change who does a node (NODE_KINDS; None = 'agent'), only while it is pending/ready."""
+        _check_choice("node kind", kind, NODE_KINDS)
+        with self._lock:
+            n = self.get_node(plan_id, node_id)
+            if n["status"] not in ("pending", "ready"):
+                raise PlanError(f"node ({plan_id}, {node_id}) is {n['status']}; cannot change its kind")
+            self.update_node(plan_id, node_id, kind=kind)
 
     def remove_node(self, plan_id: int, node_id: int) -> None:
         with self._lock:

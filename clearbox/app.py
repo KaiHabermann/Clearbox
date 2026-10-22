@@ -74,6 +74,13 @@ class CompleteBody(BaseModel):
     result: str | None = None
 
 
+class KindBody(BaseModel):
+    """Who does a node: "agent" (default) or "user" -- the user's own job, no agent runs it and
+    the plan waits there until the user marks it done (store.NODE_KINDS)."""
+
+    kind: str = "agent"
+
+
 class AgentPatch(BaseModel):
     """Partial update of an agent profile; fields left out of the body are unchanged.
 
@@ -94,6 +101,8 @@ class AgentPatch(BaseModel):
     system_append: str | None = None
     max_parallel: int | None = None
     description: str | None = None
+    capability: str | None = None   # store.CAPABILITIES: read | run | edit | full; null = the role default
+    test_level: str | None = None   # store.TEST_LEVELS: none | light | standard | thorough; null = standard
 
 
 class AgentBody(AgentPatch):
@@ -288,6 +297,8 @@ def create_app(settings: Settings) -> FastAPI:
         sub = store.subplan_of(plan_id, n["node_id"])
         return {
             **n,
+            "kind": n.get("kind") or "agent",
+            "waiting_for_user": engine.waiting_for_user(n),
             "subplan_id": sub,
             "progress": engine.rollup(sub) if sub is not None else None,
             "agent": harnesses.source_for(plan_id, n["node_id"]),
@@ -366,6 +377,14 @@ def create_app(settings: Settings) -> FastAPI:
                                 "agent_kind": n["agent_kind"], "agent_name": n["agent_name"]})
         return sorted(out, key=lambda x: (x["plan_id"], x["node_id"]))
 
+    def waiting_nodes(root_id: int) -> list[dict[str, Any]]:
+        """User nodes in the whole plan tree that are waiting for the user to mark them done."""
+        return [
+            {"plan_id": pid, "node_id": n["node_id"], "title": n["title"]}
+            for pid in store.descendant_plans(root_id)
+            for n in store.nodes(pid) if engine.waiting_for_user(n)
+        ]
+
     @app.get("/api/plans")
     def list_plans() -> list[dict[str, Any]]:
         return [
@@ -404,6 +423,7 @@ def create_app(settings: Settings) -> FastAPI:
             "progress": engine.rollup(plan_id),
             "ancestors": store.ancestors(plan_id),
             "active": active_nodes(root["id"]),
+            "waiting": waiting_nodes(root["id"]),
             "review": review_view(store.review(plan_id)),
             "review_agent_profile_id": p.get("review_agent_profile_id"),
             "nodes": [node_view(plan_id, n, scope) for n in store.nodes(plan_id)],
@@ -648,6 +668,18 @@ def create_app(settings: Settings) -> FastAPI:
             raise _err(e) from e
         bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
         agents_changed()
+        return node_view(plan_id, n)
+
+    @app.put("/api/plans/{plan_id}/nodes/{node_id}/kind")
+    async def set_node_kind(plan_id: int, node_id: int, body: KindBody) -> dict[str, Any]:
+        """Make a node the user's job ("user") or an agent's ("agent"); only while it is pending or ready."""
+        try:
+            store.set_node_kind(plan_id, node_id, body.kind)
+            n = store.get_node(plan_id, node_id)
+        except PlanError as e:
+            raise _err(e) from e
+        engine.notify_plan(plan_id)
+        engine.kick()  # a ready node that just became an agent's job can start now
         return node_view(plan_id, n)
 
     @app.put("/api/plans/{plan_id}/nodes/{node_id}/files")
