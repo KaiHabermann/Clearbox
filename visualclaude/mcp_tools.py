@@ -8,7 +8,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from .engine import Engine
+from .engine import ConflictCache, Engine
 from .harness import HarnessError
 from .store import PlanError, public_profile
 
@@ -25,6 +25,10 @@ Building a plan:
   A node can itself be a small plan: create_plan(..., parent_plan_id, parent_node_id) attaches
   a subplan to that node; the node then completes when its whole subplan is done.
   Write node descriptions so that an agent with no other context can do the work.
+  Files: independent nodes run in parallel, so give each node files=[...] listing the paths it
+  will CREATE or MODIFY (reads need no declaration). Two nodes that could run at the same time
+  and declare the same file then run one after the other, lowest node number first, instead of
+  clobbering each other; get_plan shows each node's `conflicts`.
   4. start_plan(plan_id, executor="builtin") lets the service run an agent per node,
      or executor="external" lets outside agents pick nodes up with claim_next_node.
 
@@ -88,8 +92,31 @@ def build_mcp(engine: Engine) -> MCPServer:
             return {"name": None, "harness": None, "model": None, "profile_id": None, "error": str(e)}
         return registry.describe(profile)
 
+    def _conflicts(plan_id: int, node_id: int, tree: dict[tuple[int, int], list[dict[str, Any]]],
+                   cache: ConflictCache) -> list[list[int]]:
+        """Other nodes of the plan tree that share a file with this one and could run concurrently."""
+        return [[p, n] for p, n in engine.file_conflicts(plan_id, node_id, tree=tree, cache=cache)]
+
+    def _files_error(plan_id: int, e: PlanError) -> ToolError:
+        """ToolError for a rejected file path, restating the rule with the actual directory."""
+        msg = str(e)
+        if msg.startswith("file"):  # a store message about a path or the files list
+            try:
+                msg += (f" (files lists the paths, relative to {engine.plan_workdir(plan_id)}, that the "
+                        "node will create or modify; a directory claims everything under it)")
+            except PlanError:
+                pass
+        return ToolError(msg)
+
+    def _notify_tree(plan_id: int) -> None:
+        """A change to one node's files can change `conflicts` anywhere in its plan tree."""
+        for pid in store.descendant_plans(store.root_of(plan_id)["id"]):
+            engine.notify_plan(pid)
+
     def _plan_view(plan_id: int) -> dict[str, Any]:
         p = store.get_plan(plan_id)
+        tree = store.files_of_plan_tree(store.root_of(plan_id)["id"])
+        cache = ConflictCache()
         nodes = []
         for n in store.nodes(plan_id):
             nodes.append(
@@ -101,6 +128,8 @@ def build_mcp(engine: Engine) -> MCPServer:
                     "agent": _resolved_agent(plan_id, n["node_id"]),
                     "agent_override": _profile_name(n["agent_profile_id"]),
                     "subplan_id": store.subplan_of(plan_id, n["node_id"]),
+                    "files": [f["path"] for f in tree.get((plan_id, n["node_id"]), [])],
+                    "conflicts": _conflicts(plan_id, n["node_id"], tree, cache),
                     "result": n["result"],
                     "error": n["error"],
                 }
@@ -153,20 +182,33 @@ def build_mcp(engine: Engine) -> MCPServer:
 
     @mcp.tool()
     def add_node(
-        plan_id: int, title: str, description: str = "", agent: str | int | None = None
+        plan_id: int,
+        title: str,
+        description: str = "",
+        agent: str | int | None = None,
+        files: list[str] | None = None,
     ) -> tuple[int, int]:
         """Add a node (one piece of work) to a plan. Returns (plan_id, node_id).
 
         The description should be a self-contained instruction for the agent doing the work.
         agent (optional): name (or id) of the agent profile that runs this node, e.g. a cheap local
         model for a mechanical task and a strong one for a hard task; omit it to inherit the plan's.
+        files (optional): list the files this node will CREATE or MODIFY; reading is always allowed
+        and needs no declaration. Paths are relative to the plan's working directory, may name
+        files that do not exist yet, and a directory claims everything under it.
+        Example: files=["visualclaude/store.py", "tests/"]. Two nodes that could otherwise run in
+        parallel and declare the same file run one after the other (lowest node number first)
+        instead of editing it at the same time. Nodes without files never wait for each other.
         """
         profile_id = _profile_id(agent)
         try:
-            ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id)
+            ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id, files=files)
         except PlanError as e:
-            raise ToolError(str(e)) from e
-        engine.notify_plan(plan_id)
+            raise _files_error(plan_id, e) from e
+        if files:
+            _notify_tree(plan_id)
+        else:
+            engine.notify_plan(plan_id)
         engine.kick()
         return ref
 
@@ -204,16 +246,47 @@ def build_mcp(engine: Engine) -> MCPServer:
         return "removed"
 
     @mcp.tool()
-    def update_node(plan_id: int, node_id: int, title: str | None = None, description: str | None = None) -> str:
-        """Change the title and/or description of a node."""
+    def update_node(
+        plan_id: int,
+        node_id: int,
+        title: str | None = None,
+        description: str | None = None,
+        files: list[str] | None = None,
+    ) -> str:
+        """Change the title, description and/or declared files of a node; only what you pass changes.
+
+        files: omit it (or pass null) to KEEP the node's current files; a list REPLACES the whole
+        set; [] clears it. Files can only change before the node has run. See add_node.
+        """
         try:
             store.get_node(plan_id, node_id)
+            if files is not None:
+                store.set_node_files(plan_id, node_id, files)
         except PlanError as e:
-            raise ToolError(str(e)) from e
+            raise _files_error(plan_id, e) from e
         fields = {k: v for k, v in (("title", title), ("description", description)) if v is not None}
         store.update_node(plan_id, node_id, **fields)
-        engine.notify_plan(plan_id)
+        if files is not None:
+            _notify_tree(plan_id)
+            engine.kick()  # a cleared or narrowed set may let a held-back node start
+        else:
+            engine.notify_plan(plan_id)
         return "updated"
+
+    @mcp.tool()
+    def set_node_files(plan_id: int, node_id: int, files: list[str] | None) -> list[str]:
+        """Replace the files a node will CREATE or MODIFY; returns the stored list. [] or null clears it.
+
+        Paths as for add_node: relative to the plan's working directory, a directory claims
+        everything under it, reads need no declaration. Only for nodes that have not run yet.
+        """
+        try:
+            stored = store.set_node_files(plan_id, node_id, files)
+        except PlanError as e:
+            raise _files_error(plan_id, e) from e
+        _notify_tree(plan_id)
+        engine.kick()  # a cleared or narrowed set may let a held-back node start
+        return [f["path"] for f in stored]
 
     @mcp.tool()
     def get_plan(plan_id: int) -> dict[str, Any]:
@@ -221,7 +294,9 @@ def build_mcp(engine: Engine) -> MCPServer:
 
         Each node shows `agent` (name, harness and model of the profile that will run it, after
         inheritance) and `agent_override` (the profile set on the node itself, or null); the plan
-        shows `default_agent` (its plan-wide default, or null).
+        shows `default_agent` (its plan-wide default, or null). `files` lists the files the node
+        declared; `conflicts` the [plan_id, node_id] of other nodes in the plan tree that share one
+        of them and could run at the same time -- those run one at a time, lowest number first.
         """
         try:
             return _plan_view(plan_id)

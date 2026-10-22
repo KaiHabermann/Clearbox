@@ -16,9 +16,9 @@ from pydantic import BaseModel
 
 from . import bootstrap
 from .harness.registry import HarnessDefaults, HarnessRegistry
-from .engine import Bus, Engine, EngineConfig
+from .engine import Bus, ConflictCache, Engine, EngineConfig
 from .mcp_tools import build_mcp
-from .store import PlanError, Store, public_profile
+from .store import PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
 
@@ -50,6 +50,12 @@ class Settings:
 
 class StartBody(BaseModel):
     executor: str = "builtin"
+
+
+class CompleteBody(BaseModel):
+    """Mark a node done by hand; null result = reuse the agent's own closing summary."""
+
+    result: str | None = None
 
 
 class AgentPatch(BaseModel):
@@ -89,6 +95,25 @@ class AgentRef(BaseModel):
 
 
 NodeAgentBody = PlanAgentBody = AgentRef
+
+
+class FilesBody(BaseModel):
+    """Replace the files a node may create or modify (paths relative to the plan's working dir); [] clears."""
+
+    files: list[str] = []
+
+
+@dataclass
+class FileScope:
+    """One request's view of a plan tree's declared files, shared by every node_view call.
+
+    `/api/plans/{id}` renders all nodes at once, so the tree's file map is
+    fetched once and the dependency closures are memoized across nodes.
+    """
+
+    tree: dict[tuple[int, int], list[dict[str, Any]]]
+    cache: ConflictCache
+    titles: dict[tuple[int, int], str]
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -146,7 +171,53 @@ def create_app(settings: Settings) -> FastAPI:
         return HTTPException(status_code=400, detail=str(e))
 
     # ------------------------------------------------------------- views
-    def node_view(plan_id: int, n: dict[str, Any]) -> dict[str, Any]:
+    def file_scope(plan_id: int) -> FileScope:
+        tree = store.files_of_plan_tree(store.root_of(plan_id)["id"])
+        return FileScope(tree=tree, cache=ConflictCache(), titles={})
+
+    def node_ref(scope: FileScope, ref: tuple[int, int], files: list[str]) -> dict[str, Any]:
+        if ref not in scope.titles:
+            scope.titles[ref] = store.get_node(*ref)["title"]
+        return {"plan_id": ref[0], "node_id": ref[1], "title": scope.titles[ref], "files": files}
+
+    def shared_files(scope: FileScope, mine: tuple[int, int], other: tuple[int, int]) -> list[str]:
+        """The files two nodes compete for: per conflicting pair the narrower path (a file
+        inside a declared directory), in this node's own spelling when both name the same one."""
+        out: list[str] = []
+        for a in scope.tree.get(mine, []):
+            for b in scope.tree.get(other, []):
+                if keys_conflict(a["key"], b["key"]):
+                    path = b["path"] if len(b["key"]) > len(a["key"]) else a["path"]
+                    if path not in out:
+                        out.append(path)
+        return out
+
+    def file_fields(plan_id: int, n: dict[str, Any], scope: FileScope) -> dict[str, Any]:
+        """files / conflicts / blocked_by: everything the UI needs to stagger and explain a node.
+
+        The conflict rule and the hold-back decision both come from the engine
+        (file_conflicts, files_blocked_by); nothing here re-derives them.
+        """
+        me = (plan_id, n["node_id"])
+        if me not in scope.tree:
+            return {"files": [], "conflicts": [], "blocked_by": None}
+        conflicts = [
+            node_ref(scope, ref, shared_files(scope, me, ref))
+            for ref in engine.file_conflicts(plan_id, n["node_id"], tree=scope.tree, cache=scope.cache)
+        ]
+        blocked_by = None
+        if n["status"] == "ready":
+            hit = engine.files_blocked_by(plan_id, n["node_id"])
+            if hit is not None:
+                ref, reason = hit
+                blocked_by = {**node_ref(scope, ref, shared_files(scope, me, ref)), "reason": reason}
+        return {
+            "files": [f["path"] for f in scope.tree[me]],
+            "conflicts": conflicts,
+            "blocked_by": blocked_by,
+        }
+
+    def node_view(plan_id: int, n: dict[str, Any], scope: FileScope | None = None) -> dict[str, Any]:
         sub = store.subplan_of(plan_id, n["node_id"])
         return {
             **n,
@@ -154,6 +225,7 @@ def create_app(settings: Settings) -> FastAPI:
             "progress": engine.rollup(sub) if sub is not None else None,
             "agent": harnesses.source_for(plan_id, n["node_id"]),
             "agent_override": n.get("agent_profile_id"),
+            **file_fields(plan_id, n, scope or file_scope(plan_id)),
         }
 
     def agent_view(p: dict[str, Any], default_id: int | None, usage: dict[int, int]) -> dict[str, Any]:
@@ -236,6 +308,7 @@ def create_app(settings: Settings) -> FastAPI:
             root = store.root_of(plan_id)
         except PlanError as e:
             raise HTTPException(404, str(e)) from e
+        scope = file_scope(plan_id)
         default_agent = None
         if p.get("default_agent_profile_id") is not None:
             with contextlib.suppress(PlanError):
@@ -249,7 +322,7 @@ def create_app(settings: Settings) -> FastAPI:
             "progress": engine.rollup(plan_id),
             "ancestors": store.ancestors(plan_id),
             "active": active_nodes(root["id"]),
-            "nodes": [node_view(plan_id, n) for n in store.nodes(plan_id)],
+            "nodes": [node_view(plan_id, n, scope) for n in store.nodes(plan_id)],
             "edges": store.edges(plan_id),
         }
 
@@ -304,6 +377,19 @@ def create_app(settings: Settings) -> FastAPI:
         except PlanError as e:
             raise _err(e) from e
         return {"ok": "retrying"}
+
+    @app.post("/api/plans/{plan_id}/nodes/{node_id}/complete")
+    async def complete_node(plan_id: int, node_id: int, body: CompleteBody | None = None) -> dict[str, str]:
+        """Stop the node's agent and mark it done, so its dependants start.
+
+        `result` is what dependants read; left out, the agent's own closing
+        summary is used when the transcript has one.
+        """
+        try:
+            await engine.complete_node_manually(plan_id, node_id, (body.result if body else None))
+        except PlanError as e:
+            raise _err(e) from e
+        return {"ok": "completed"}
 
     @app.post("/api/plans/{plan_id}/nodes/{node_id}/stop")
     async def stop_node(plan_id: int, node_id: int) -> dict[str, str]:
@@ -376,6 +462,21 @@ def create_app(settings: Settings) -> FastAPI:
             raise _err(e) from e
         bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
         agents_changed()
+        return node_view(plan_id, n)
+
+    @app.put("/api/plans/{plan_id}/nodes/{node_id}/files")
+    async def set_node_files(plan_id: int, node_id: int, body: FilesBody) -> dict[str, Any]:
+        """Replace the files a node may create or modify; only while it is pending or ready."""
+        try:
+            store.set_node_files(plan_id, node_id, body.files)
+            n = store.get_node(plan_id, node_id)
+        except PlanError as e:
+            raise _err(e) from e
+        # One plan message is enough: it carries the tree's root_id and every open view of that
+        # tree refetches, including views of other subplans whose conflicts just changed.
+        engine.notify_plan(plan_id)
+        # A narrower set can release a held-back node right away.
+        engine.kick()
         return node_view(plan_id, n)
 
     @app.put("/api/plans/{plan_id}/agent")

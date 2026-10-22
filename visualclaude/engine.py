@@ -16,6 +16,15 @@ per node by the ``HarnessRegistry`` (node profile -> plan defaults -> server
 default -> the CLI-configured harness); a profile's ``max_parallel`` further
 caps how many of its nodes run at once. With executor="external", ready nodes
 wait until an outside agent claims them through the MCP tools.
+
+File scoping: a node may declare the files it creates or modifies. Two nodes
+of one plan tree whose files conflict never run at the same time; this is a
+runtime lock, not an extra edge, so the DAG, layering and prompts are
+unchanged. A ready node is held back (it stays "ready") while a conflicting
+node is running, and also while a conflicting ready node with a lower
+(plan_id, node_id) is waiting for its turn, so conflicting nodes run lowest
+number first -- the same order the UI staggers them in. Nodes without
+declared files are never held back.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import asyncio
 import logging
 import os
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +42,14 @@ from .harness.registry import HarnessRegistry
 from .store import PlanError, Store
 
 log = logging.getLogger("visualclaude")
+
+
+@dataclass
+class ConflictCache:
+    """Per-view memo for ``Engine.file_conflicts``: plan -> ancestor nodes, plan -> edge closure."""
+
+    parents: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    reach: dict[int, dict[int, set[int]]] = field(default_factory=dict)
 
 SYSTEM_APPEND = """
 You are one worker inside VisualClaude, a service that executes a plan (a DAG of work items)
@@ -240,6 +258,8 @@ class Engine:
                     continue
                 if self._profile_full(profile):
                     continue  # stays ready; a finishing task kicks the scheduler again
+                if self._files_held_back(plan_id, nid):
+                    continue  # stays ready; the releasing node kicks the scheduler
                 self._spawn(plan_id, nid, profile, harness)
                 changed = True
         return changed
@@ -250,6 +270,152 @@ class Engine:
             return False
         running = sum(1 for pid in self._task_profiles.values() if pid == profile["id"])
         return running >= profile["max_parallel"]
+
+    def _files_busy(self, plan_id: int, node_id: int) -> tuple[int, int] | None:
+        """The running node of the same plan tree holding a file that conflicts with this node's.
+
+        Derived from node status in the DB on every call instead of an in-memory
+        lock table: a node holds its files exactly while status == 'running' and
+        its agent is not done (built-in or external alike; a node whose agent
+        finished but whose subplan is still executing holds nothing). ``_spawn``
+        and ``claim_next`` set 'running' synchronously, so two nodes started in
+        the same tick see each other, and a node that finishes, fails, is
+        stopped, retried or re-queued by a restart releases its files with no
+        extra bookkeeping. That automatic release is why the DB is the source of
+        truth. A running node is never dependency-ordered with a ready one (all
+        of a ready node's prerequisites are done), so no path check is needed.
+        """
+        for ref in self.store.conflicting_nodes(plan_id, node_id):
+            n = self.store.get_node(*ref)
+            if n["status"] == "running" and n["agent_kind"] and not n["agent_done"]:
+                return ref
+        return None
+
+    def _files_turn_pending(self, plan_id: int, node_id: int) -> tuple[int, int] | None:
+        """A lower-numbered ready node of the same plan tree that conflicts with this one.
+
+        Conflicting nodes run in (plan_id, node_id) order. Without this rule a
+        higher node could overtake a lower one that is ready but waiting on an
+        unrelated limit (``max_concurrency``, its profile's ``max_parallel``), or
+        merely visited later: ``_advance`` recurses into subplans before it
+        spawns, so traversal order is not rank order and the tuples are compared
+        explicitly. Unlike ``_files_busy`` this waits for a turn, not for a run
+        to finish. Two ready nodes are never dependency-ordered either.
+
+        No deadlock: every wait points either at a running node (which finishes
+        on its own) or at a strictly lower-ranked ready node, and files are taken
+        all at once at spawn time, so there is no hold-and-wait cycle; the lowest
+        ranked ready node of any wait chain waits only on running nodes or on
+        limits that free up as runs finish.
+
+        No starvation: only a ready node the scheduler will still start counts
+        (``_still_scheduled``). A node left "ready" inside a subplan whose
+        container failed is never spawned, and waiting for its turn would hold
+        the higher node back forever.
+        """
+        for ref in self.store.conflicting_nodes(plan_id, node_id):
+            if ref >= (plan_id, node_id):
+                break  # sorted by (plan_id, node_id)
+            if self.store.get_node(*ref)["status"] == "ready" and self._still_scheduled(ref[0]):
+                return ref
+        return None
+
+    def _still_scheduled(self, plan_id: int) -> bool:
+        """Whether ``_advance`` still descends into this plan: every containing node is running
+        with its own agent finished. Otherwise (a container failed) its ready nodes stay ready."""
+        for a in self.store.ancestors(plan_id):
+            c = self.store.get_node(a["plan_id"], a["node_id"])
+            if c["status"] != "running" or (c["agent_kind"] is not None and not c["agent_done"]):
+                return False
+        return True
+
+    def files_blocked_by(self, plan_id: int, node_id: int) -> tuple[tuple[int, int], str] | None:
+        """Why a ready node is held back by its files: (other node, "running" | "turn"), or None.
+
+        "running": the other node is running and holds a conflicting file
+        (``_files_busy``). "turn": it is a lower-numbered conflicting node that is
+        ready too and goes first (``_files_turn_pending``). The scheduler decides
+        through this method and the REST node view explains a waiting node
+        through it, so the two can never disagree.
+        """
+        ref = self._files_busy(plan_id, node_id)
+        if ref is not None:
+            return ref, "running"
+        ref = self._files_turn_pending(plan_id, node_id)
+        if ref is not None:
+            return ref, "turn"
+        return None
+
+    def _files_held_back(self, plan_id: int, node_id: int) -> bool:
+        """Whether a ready node must wait because of its declared files (either rule)."""
+        return self.files_blocked_by(plan_id, node_id) is not None
+
+    def file_conflicts(
+        self,
+        plan_id: int,
+        node_id: int,
+        tree: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+        cache: ConflictCache | None = None,
+    ) -> list[tuple[int, int]]:
+        """Nodes of the plan tree that share a file with this one AND could run at the same time.
+
+        The static view of the rule (MCP get_plan, REST node view, the UI's
+        stagger): ``Store.conflicting_nodes`` minus pairs that dependencies keep
+        apart anyway. The scheduler does not need that filter -- a ready node is
+        never dependency-ordered with another ready or running node -- but a view
+        of the whole plan does, or nodes in successive layers would look like
+        they compete for a file. Pass the tree's file map and one cache when
+        rendering many nodes, so a whole plan costs one file query.
+        """
+        cache = cache if cache is not None else ConflictCache()
+        return [
+            ref for ref in self.store.conflicting_nodes(plan_id, node_id, tree=tree)
+            if not self._dependency_ordered((plan_id, node_id), ref, cache)
+        ]
+
+    def _anchors(self, plan_id: int, node_id: int, cache: ConflictCache) -> list[tuple[int, int]]:
+        """The node and the nodes whose subplans contain it, the root plan's node first."""
+        if plan_id not in cache.parents:
+            chain: list[tuple[int, int]] = []
+            p = self.store.get_plan(plan_id)
+            while p["parent_plan_id"] is not None:
+                chain.append((p["parent_plan_id"], p["parent_node_id"]))
+                p = self.store.get_plan(p["parent_plan_id"])
+            cache.parents[plan_id] = chain[::-1]
+        return [*cache.parents[plan_id], (plan_id, node_id)]
+
+    def _reach(self, plan_id: int, cache: ConflictCache) -> dict[int, set[int]]:
+        """node_id -> every node_id reachable from it along the plan's edges."""
+        if plan_id not in cache.reach:
+            succ: dict[int, set[int]] = {}
+            for src, dst in self.store.edges(plan_id):
+                succ.setdefault(src, set()).add(dst)
+            closure: dict[int, set[int]] = {}
+            for start in succ:
+                seen: set[int] = set()
+                stack = [start]
+                while stack:
+                    for nxt in succ.get(stack.pop(), ()):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            stack.append(nxt)
+                closure[start] = seen
+            cache.reach[plan_id] = closure
+        return cache.reach[plan_id]
+
+    def _dependency_ordered(self, a: tuple[int, int], b: tuple[int, int], cache: ConflictCache) -> bool:
+        """True if dependencies force a and b apart, so they can never run at the same time.
+
+        Walk both anchor chains down to where they diverge: there both anchors are nodes of
+        the same plan, and they are ordered iff one reaches the other. If one chain is a prefix
+        of the other, one node lies inside the other's subplan, which only starts once that
+        node's own agent has finished.
+        """
+        for x, y in zip(self._anchors(*a, cache), self._anchors(*b, cache)):
+            if x != y:
+                r = self._reach(x[0], cache)
+                return y[1] in r.get(x[1], ()) or x[1] in r.get(y[1], ())
+        return True
 
     def _fail_misconfigured(self, plan_id: int, node_id: int, message: str) -> None:
         """A profile that cannot even build its harness fails the node, no retry loop."""
@@ -297,6 +463,15 @@ class Engine:
 
         parts.append(f"Your node: {node['title']}\n(plan_id={plan_id}, node_id={node_id})")
         parts.append(f"Task description:\n{node['description'] or '(no further description)'}")
+
+        files = self.store.node_files(plan_id, node_id)
+        if files:
+            parts.append(
+                "Your file scope. You may create or modify ONLY these paths (relative to the working "
+                "directory; a directory covers everything below it):\n"
+                + "\n".join(f"  - {f['path']}" for f in files)
+                + "\nYou may read any file. Every other file is owned by other nodes; do not write it."
+            )
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ builtin runs
@@ -327,12 +502,19 @@ class Engine:
                 node_title=self.store.get_node(plan_id, node_id)["title"],
             )
             result: dict[str, Any] | None = None
-            async for kind, data in harness.run(job):
-                if kind == "system" and data.get("session_id"):
-                    self.store.update_node(plan_id, node_id, session_id=data["session_id"])
-                if kind == "result":
-                    result = data
-                self._emit(plan_id, node_id, kind, data)
+            # aclosing + the break below: the "result" event finishes the node, so we never wait
+            # for a harness to close its own stream. The Claude SDK's iterator can stay open after
+            # its final message, which used to leave the node "running" forever with its result
+            # already in the transcript.
+            async with aclosing(harness.run(job)) as stream:
+                async for kind, data in stream:
+                    if kind == "system" and data.get("session_id"):
+                        self.store.update_node(plan_id, node_id, session_id=data["session_id"])
+                    if kind == "result":
+                        result = data
+                    self._emit(plan_id, node_id, kind, data)
+                    if result is not None:
+                        break
             if result is None or result.get("is_error"):
                 errs = (result or {}).get("errors") or [(result or {}).get("text") or "agent failed"]
                 self._finish(plan_id, node_id, ok=False, text="; ".join(map(str, errs)))
@@ -416,6 +598,49 @@ class Engine:
             self._set_status(plan_id, node_id, "failed", error="stopped by user", agent_done=1)
         self.kick()
 
+    def _last_result_text(self, plan_id: int, node_id: int) -> str:
+        """The agent's own closing summary, if it produced one.
+
+        A node can hold a finished transcript without having been finished (an
+        agent whose stream never closed, a run cut short). When the user marks
+        such a node done, its real summary is better downstream context than a
+        placeholder, so prefer the last ``result`` event, then the last ``text``.
+        """
+        for kinds in (("result",), ("text",)):
+            for ev in reversed(self.store.events(plan_id, node_id)):
+                if ev["kind"] in kinds:
+                    text = (ev["data"] or {}).get("text") or ""
+                    if text.strip():
+                        return text
+        return ""
+
+    async def complete_node_manually(self, plan_id: int, node_id: int, result: str | None = None) -> None:
+        """Stop whatever is working on a node and mark it done (user's decision).
+
+        The escape hatch for a node the service cannot finish by itself: an agent
+        that hung, work the user finished by hand, a step that turned out to be
+        unnecessary. Dependants start as if the node had completed normally, so
+        the recorded result is what they will read.
+        """
+        node = self.store.get_node(plan_id, node_id)
+        if node["status"] == "done":
+            raise PlanError(f"node ({plan_id}, {node_id}) is already done")
+        task = self._tasks.get((plan_id, node_id))
+        if task is not None:
+            await self._cancel(plan_id, node_id, task)
+        text = (result or "").strip() or self._last_result_text(plan_id, node_id)
+        note = "marked done by user" + ("" if text else " (no result recorded)")
+        self._emit(plan_id, node_id, "system", {"text": note})
+        self.store.update_node(plan_id, node_id, agent_done=1, error=None)
+        sub = self.store.subplan_of(plan_id, node_id)
+        if sub is not None:
+            # Leave the subplan alone: marking the container done must not silently
+            # discard nodes the user may still want. _advance skips a done container.
+            self._emit(plan_id, node_id, "system",
+                       {"text": f"subplan {sub} is no longer waited on"})
+        self._set_status(plan_id, node_id, "done", result=text or note)
+        self.kick()
+
     def retry_node(self, plan_id: int, node_id: int) -> None:
         n = self.store.get_node(plan_id, node_id)
         if n["status"] != "failed":
@@ -450,7 +675,7 @@ class Engine:
         for r in roots:
             for pid in sorted(self.store.descendant_plans(r["id"])):
                 for n in self.store.nodes(pid):
-                    if n["status"] == "ready":
+                    if n["status"] == "ready" and not self._files_held_back(pid, n["node_id"]):
                         self.store.update_node(pid, n["node_id"], agent_done=0, result=None, error=None)
                         self._set_status(pid, n["node_id"], "running", agent_kind="external", agent_name=agent_name)
                         self._emit(pid, n["node_id"], "system", {"text": f"claimed by external agent '{agent_name}'"})

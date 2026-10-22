@@ -44,6 +44,9 @@
           <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" class="arrow-head active"></path>
           </marker>
+          <marker id="arrow-files" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M1,1 L9,5 L1,9" class="arrow-head files"></path>
+          </marker>
         </defs>
         <g id="viewport"><g id="edges"></g><g id="nodes"></g></g>
       </svg>
@@ -55,6 +58,7 @@
         <span><i class="dot done"></i>done</span>
         <span><i class="dot failed"></i>failed</span>
         <span><i class="stack-icon"></i>subplan</span>
+        <span title="these nodes write the same file, so they take turns: lowest node number first, each later one drawn a step lower"><i class="fconn-icon"></i>shares files — runs after</span>
         <span title="agent harness colours; a filled dot on a node's agent chip = set on that node"><i class="hswatch h-claude-sdk"></i>claude-sdk</span>
         <span><i class="hswatch h-openai"></i>openai</span>
         <span><i class="hswatch h-mock"></i>mock</span>

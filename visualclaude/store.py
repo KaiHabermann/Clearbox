@@ -9,6 +9,13 @@ runs a node). Plans and nodes only reference a profile by id, so connection
 details live in exactly one place. A profile may hold a literal api key; it is
 write-only and must leave this module only through `public_profile`, which
 replaces it with a `has_api_key` flag.
+
+A node may declare the files it will create or modify (node_files); reads are
+never declared. The scheduler uses them to keep two nodes that write the same
+file from running at the same time; this module only stores them and answers
+"who else touches these?". Paths are relative to the plan tree's shared working
+directory and are compared only through their normalized `key`
+(`normalize_file`) and the single conflict rule (`keys_conflict`).
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans (
@@ -88,6 +95,15 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS node_files (
+    plan_id  INTEGER NOT NULL,
+    node_id  INTEGER NOT NULL,
+    path     TEXT NOT NULL,   -- as the author wrote it, for display
+    key      TEXT NOT NULL,   -- normalized form (normalize_file), the only thing ever compared
+    PRIMARY KEY (plan_id, node_id, key)
+);
+CREATE INDEX IF NOT EXISTS node_files_key ON node_files(key);
 """
 
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS never alters
@@ -109,6 +125,66 @@ PROFILE_FIELDS = (
 
 class PlanError(ValueError):
     """Raised for invalid plan operations (unknown ids, cycles, ...)."""
+
+
+def normalize_file(path: str) -> str:
+    """The match key of a declared file path. Raises PlanError if it is unusable.
+
+    Paths are relative to the plan tree's working directory, so absolute paths
+    (`/x`, `\\\\server\\x`, `C:\\x`, also drive-relative `C:x`) are rejected, as is
+    anything that escapes the root via `..` or names the root itself. Otherwise:
+    backslashes become forward slashes, repeated slashes collapse, `.` segments
+    are dropped, `..` is resolved lexically (no filesystem access) and a
+    trailing slash is stripped.
+
+    The key is casefolded on EVERY platform, not just Windows. The project is
+    developed on Windows; on a case-sensitive filesystem the only cost is that
+    two genuinely distinct files differing only in case get serialized
+    unnecessarily -- a safe false positive. The opposite mistake (treating
+    `App.js` and `app.js` as different on Windows) would let two agents write
+    the same file concurrently and lose an edit.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise PlanError("file path must be a non-empty string")
+    p = path.strip().replace("\\", "/")
+    if p.startswith("/") or (len(p) >= 2 and p[1] == ":" and p[0].isalpha()):
+        raise PlanError(f"file path {path!r} is absolute; paths are relative to the plan's working directory")
+    parts: list[str] = []
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                raise PlanError(f"file path {path!r} escapes the plan's working directory")
+            parts.pop()
+            continue
+        parts.append(seg)
+    if not parts:
+        raise PlanError(f"file path {path!r} names the working directory itself, not a file or directory in it")
+    return "/".join(parts).casefold()
+
+
+def keys_conflict(a: str, b: str) -> bool:
+    """Whether two normalized keys may name the same file.
+
+    True when equal or when one is a directory prefix of the other at a segment
+    boundary: `src` conflicts with `src/foo.py` (a node may declare a whole
+    directory it reorganises), `src` does not conflict with `srcfoo`. Every
+    caller compares keys through this function, never with plain equality.
+    """
+    return a == b or b.startswith(a + "/") or a.startswith(b + "/")
+
+
+def _normalize_files(paths: list[str] | None) -> list[tuple[str, str]]:
+    """Validate paths into (display path, key) pairs; the first spelling of a key wins."""
+    if paths is None:
+        return []
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise PlanError("files must be a list of paths")
+    out: dict[str, str] = {}
+    for p in paths:
+        out.setdefault(normalize_file(p), p.strip())
+    return [(path, key) for key, path in out.items()]
 
 
 def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -283,6 +359,7 @@ class Store:
             for pid in self.descendant_plans(plan_id):
                 self._exec("DELETE FROM events WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM edges WHERE plan_id=?", (pid,))
+                self._exec("DELETE FROM node_files WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM nodes WHERE plan_id=?", (pid,))
                 self._exec("DELETE FROM plans WHERE id=?", (pid,))
 
@@ -293,11 +370,13 @@ class Store:
         title: str,
         description: str = "",
         agent_profile_id: int | None = None,
+        files: list[str] | None = None,
     ) -> tuple[int, int]:
         with self._lock:
             p = self.get_plan(plan_id)
             if agent_profile_id is not None:
                 self.get_profile(agent_profile_id)
+            entries = _normalize_files(files)  # validate before inserting anything
             nid = p["next_node_id"]
             self._exec("UPDATE plans SET next_node_id=? WHERE id=?", (nid + 1, plan_id))
             self._exec(
@@ -305,6 +384,7 @@ class Store:
                 "VALUES (?,?,?,?,?,?)",
                 (plan_id, nid, title, description, agent_profile_id, time.time()),
             )
+            self._write_files(plan_id, nid, entries)
             return plan_id, nid
 
     def get_node(self, plan_id: int, node_id: int) -> dict[str, Any]:
@@ -335,7 +415,86 @@ class Store:
                 self.delete_plan(sub)
             self._exec("DELETE FROM edges WHERE plan_id=? AND (src=? OR dst=?)", (plan_id, node_id, node_id))
             self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            self._exec("DELETE FROM node_files WHERE plan_id=? AND node_id=?", (plan_id, node_id))
             self._exec("DELETE FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+
+    # --------------------------------------------------------------- node files
+    def _write_files(self, plan_id: int, node_id: int, entries: list[tuple[str, str]]) -> None:
+        with self._lock:
+            self._exec("DELETE FROM node_files WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+            for path, key in entries:
+                self._exec(
+                    "INSERT INTO node_files(plan_id, node_id, path, key) VALUES (?,?,?,?)",
+                    (plan_id, node_id, path, key),
+                )
+
+    def set_node_files(self, plan_id: int, node_id: int, paths: list[str] | None) -> list[dict[str, Any]]:
+        """Replace the whole set of files a node may create or modify (None or [] clears it).
+
+        Only while the node is pending/ready: the scheduler acts on the set before
+        spawning, so changing it once the node has run would be meaningless.
+        """
+        entries = _normalize_files(paths)
+        with self._lock:
+            n = self.get_node(plan_id, node_id)
+            if n["status"] not in ("pending", "ready"):
+                raise PlanError(f"node ({plan_id}, {node_id}) is {n['status']}; cannot change its files")
+            self._write_files(plan_id, node_id, entries)
+            return self.node_files(plan_id, node_id)
+
+    def node_files(self, plan_id: int, node_id: int) -> list[dict[str, Any]]:
+        return self._q(
+            "SELECT path, key FROM node_files WHERE plan_id=? AND node_id=? ORDER BY key", (plan_id, node_id)
+        )
+
+    def files_of_plan_tree(self, root_plan_id: int) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """{(plan_id, node_id): [{path, key}, ...]} for every node in the tree that declares files.
+
+        One query for the whole tree, so the scheduler can rebuild its conflict
+        map on every tick cheaply. Nodes without files are absent.
+        """
+        with self._lock:
+            pids = self.descendant_plans(root_plan_id)
+            marks = ",".join("?" * len(pids))
+            rows = self._q(
+                f"SELECT plan_id, node_id, path, key FROM node_files WHERE plan_id IN ({marks}) "
+                "ORDER BY plan_id, node_id, key",
+                tuple(pids),
+            )
+        out: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault((r["plan_id"], r["node_id"]), []).append({"path": r["path"], "key": r["key"]})
+        return out
+
+    def conflicting_nodes(
+        self,
+        plan_id: int,
+        node_id: int,
+        among: Iterable[tuple[int, int]] | None = None,
+        tree: dict[tuple[int, int], list[dict[str, Any]]] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Nodes of the same plan tree that share a conflicting file key with this one.
+
+        Excludes the node itself; optionally restricted to `among`. Sorted by
+        (plan_id, node_id), which is also the order conflicting nodes run in.
+        Dependency paths are NOT considered here -- dependency-ordered nodes
+        never overlap, and filtering them out is the scheduler's job.
+        `tree` is a files_of_plan_tree() result to reuse when checking many nodes.
+        """
+        if tree is None:
+            with self._lock:
+                tree = self.files_of_plan_tree(self.root_of(plan_id)["id"])
+        mine = [f["key"] for f in tree.get((plan_id, node_id), [])]
+        if not mine:
+            return []
+        wanted = None if among is None else {(int(a), int(b)) for a, b in among}
+        out = []
+        for ref, files in tree.items():
+            if ref == (plan_id, node_id) or (wanted is not None and ref not in wanted):
+                continue
+            if any(keys_conflict(k, f["key"]) for k in mine for f in files):
+                out.append(ref)
+        return sorted(out)
 
     # -------------------------------------------------------------------- edges
     def edges(self, plan_id: int) -> list[tuple[int, int]]:

@@ -13,6 +13,7 @@
   --running: #f2b84b;
   --done: #4cc38a;
   --failed: #ef5f5f;
+  --files: #7d86a0;   /* shares-files connector between staggered nodes */
 
   /* harness colours: agent chips, legend, transcript header */
   --h-claude-sdk: #d97757;
@@ -117,6 +118,7 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .h-openai { --hc: var(--h-openai); }
 .h-mock { --hc: var(--h-mock); }
 .h-other { --hc: var(--h-other); }
+.fconn-icon { width: 16px; border-top: 1.5px dotted var(--files); }
 .stack-icon { width: 11px; height: 9px; border: 1px solid var(--muted); border-radius: 2px; box-shadow: 2px -2px 0 -1px var(--panel), 2px -2px 0 0 var(--muted); }
 #zoom { position: absolute; right: 14px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
 #zoom button { width: 32px; height: 32px; padding: 0; font-size: 16px; }
@@ -129,6 +131,9 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .arrow-head { fill: #3a4150; }
 .arrow-head.done { fill: rgba(76,195,138,.7); }
 .arrow-head.active { fill: var(--running); }
+/* file stagger: "shares files - runs after". Not a dependency, so muted, thin and dashed */
+.fconn { fill: none; stroke: var(--files); stroke-width: 1.2; stroke-dasharray: 2 4; stroke-linecap: round; }
+.arrow-head.files { fill: none; stroke: var(--files); stroke-width: 1.6; stroke-linejoin: round; }
 
 .node { cursor: pointer; }
 .node .card { fill: var(--panel); stroke: var(--line); stroke-width: 1.4; }
@@ -149,6 +154,9 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 
 .node.ready .stripe { fill: var(--ready); }
 .node.ready .card { stroke: rgba(91,156,245,.55); }
+.node.ready.waiting .card { stroke: rgba(91,156,245,.35); stroke-dasharray: 5 4; }  /* waiting its turn on a file */
+.node.ready.waiting .stripe { opacity: .45; }
+.waitglyph { fill: none; stroke: rgba(91,156,245,.7); stroke-width: 1.5; stroke-linecap: round; }
 .node.running .stripe { fill: var(--running); }
 .node.running .card { stroke: var(--running); }
 .node.running .halo { animation: halo 1.8s ease-out infinite; }
@@ -186,6 +194,17 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 #node-info .agent-row select { margin-left: auto; }
 #node-info .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 #node-info .result-box { background: rgba(76,195,138,.07); border: 1px solid rgba(76,195,138,.25); border-radius: 8px; padding: 8px 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
+.files-row { display: flex; flex-direction: column; gap: 4px; }
+.files-empty { color: var(--faint); font-size: 12.5px; }
+.files-waiting { color: var(--files); font-size: 12.5px; background: color-mix(in srgb, var(--files) 12%, transparent); border: 1px solid color-mix(in srgb, var(--files) 35%, transparent); border-radius: 6px; padding: 5px 8px; }
+.file-item { font-family: var(--mono); font-size: 12.5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+.file-item.shared .fpath { color: var(--files); }
+.file-item .fshared { font-family: var(--sans); color: var(--muted); font-size: 12px; }
+.nref { color: var(--muted); text-decoration: none; cursor: pointer; }
+.nref:hover { color: var(--text); text-decoration: underline; }
+.files-edit-row { display: flex; gap: 8px; align-items: flex-start; }
+.files-edit-row textarea { flex: 1; resize: vertical; font-family: var(--mono); font-size: 12.5px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.files-edit-row textarea:disabled { opacity: .5; cursor: not-allowed; }
 .transcript-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 16px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--faint); position: sticky; top: 0; background: var(--panel); z-index: 1; }
 .follow { text-transform: none; letter-spacing: 0; display: flex; gap: 5px; align-items: center; font-size: 12px; color: var(--muted); }
 #transcript { padding: 4px 16px 24px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }

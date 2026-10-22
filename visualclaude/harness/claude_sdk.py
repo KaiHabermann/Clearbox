@@ -89,7 +89,6 @@ class ClaudeSdkHarness:
             max_turns=self.max_turns,
         )
 
-        got_result = False
         async for msg in query(prompt=job.prompt, options=options):
             if isinstance(msg, SystemMessage):
                 if msg.subtype == "init":
@@ -126,7 +125,6 @@ class ClaudeSdkHarness:
                                 "parent_tool_use_id": msg.parent_tool_use_id,
                             }
             elif isinstance(msg, ResultMessage):
-                got_result = True
                 yield "result", {
                     "text": msg.result or "",
                     "is_error": bool(msg.is_error),
@@ -137,5 +135,5 @@ class ClaudeSdkHarness:
                     "session_id": msg.session_id,
                     "errors": msg.errors,
                 }
-        if not got_result:
-            yield "result", {"text": "", "is_error": True, "errors": ["agent ended without a result"]}
+                return  # terminal event: stop pulling, the SDK's stream may stay open afterwards
+        yield "result", {"text": "", "is_error": True, "errors": ["agent ended without a result"]}

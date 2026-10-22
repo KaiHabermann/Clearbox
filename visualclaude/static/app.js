@@ -2,6 +2,7 @@
 "use strict";
 
 const NODE_W = 230, NODE_H = 88, H_GAP = 46, V_GAP = 66;
+const CONFLICT_DY = 26;            // file stagger: each later node of a shares-a-file group sits this much lower
 const CHIP_Y = 60, CHIP_H = 17;   // agent chip row inside a node box (between the subtitle and the bottom edge)
 const $ = (s) => document.querySelector(s);
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -252,7 +253,7 @@ async function act(p) {
 }
 
 // ---------------------------------------------------------------- layout
-function computeLayout(nodes, edges) {
+function computeLayout(nodes, edges, planId) {
   const ids = nodes.map((n) => n.node_id);
   const preds = new Map(ids.map((i) => [i, []])), succ = new Map(ids.map((i) => [i, []]));
   const valid = edges.filter(([a, b]) => preds.has(b) && succ.has(a));
@@ -304,7 +305,33 @@ function computeLayout(nodes, edges) {
       layers[li].forEach((v, i) => pos.set(v, i));
     }
   }
-  // 4. x positions: each layer centred, widths respected
+  // 4. file stagger: nodes of one layer that share files run one after the other (lowest node id
+  //    first), so each is nudged down one CONFLICT_DY per place in that order. Groups are the connected
+  //    components of "shares a file" within the layer: in a chain A-B, B-C all three need their own
+  //    slot, since B can run with neither. Conflicts come from the API (the scheduler's own rule,
+  //    directory prefixes included) and are never re-derived here; other layers and other plans of the
+  //    tree can conflict too, but only a same-layer group is drawn as a stagger.
+  const byLayer = new Map(nodes.map((n) => [n.node_id, layer.get(n.node_id)]));
+  const offset = new Map(), groups = [], seen = new Set();
+  const adj = new Map(nodes.map((n) => [n.node_id, (n.conflicts || [])
+    .filter((c) => c.plan_id === planId && c.node_id !== n.node_id && byLayer.get(c.node_id) === byLayer.get(n.node_id))
+    .map((c) => c.node_id)]));
+  for (const n of [...nodes].sort((a, b) => a.node_id - b.node_id)) {
+    if (seen.has(n.node_id) || !adj.get(n.node_id).length) continue;
+    const comp = [], stack = [n.node_id];
+    seen.add(n.node_id);
+    while (stack.length) {
+      const v = stack.pop(); comp.push(v);
+      for (const w of adj.get(v) || []) if (!seen.has(w)) { seen.add(w); stack.push(w); }
+    }
+    comp.sort((a, b) => a - b).forEach((v, r) => offset.set(v, r * CONFLICT_DY));
+    groups.push(comp);
+  }
+  // 5. y: a layer is as tall as its deepest nudged node, so baselines accumulate instead of being uniform
+  const maxOff = layers.map((L) => Math.max(0, ...L.map((v) => offset.get(v) || 0)));
+  const top = [0];
+  layers.forEach((_, li) => top.push(top[li] + NODE_H + maxOff[li] + V_GAP));
+  // 6. x positions: each layer centred, widths respected
   const gap = (a, b) => (typeof a === "number" && typeof b === "number" ? H_GAP : 18);
   const layerW = layers.map((L) => L.reduce((s, v, i) => s + width.get(v) + (i ? gap(L[i - 1], v) : 0), 0));
   const maxW = Math.max(NODE_W, ...layerW);
@@ -313,26 +340,71 @@ function computeLayout(nodes, edges) {
     let x = (maxW - layerW[li]) / 2;
     L.forEach((v, i) => {
       if (i) x += gap(L[i - 1], v);
-      coords.set(v, { x: x + (width.get(v) - NODE_W) / 2, cx: x + width.get(v) / 2, y: li * (NODE_H + V_GAP) });
+      const off = offset.get(v) || 0;  // virtual nodes keep the baseline: they only route edges
+      // top/bot: the layer's band, which edges leave and enter vertically so they never cut across a nudged card
+      coords.set(v, { x: x + (width.get(v) - NODE_W) / 2, cx: x + width.get(v) / 2, y: top[li] + off, off, top: top[li], bot: top[li] + NODE_H + maxOff[li] });
       x += width.get(v);
     });
   });
-  return { coords, chains, width: maxW, height: layers.length * (NODE_H + V_GAP) - V_GAP };
+  // 7. connectors between consecutive members of each group; one that would pass behind other cards
+  //    of its layer dips under the band instead, interleaved groups nesting at different depths
+  const links = [], arcs = layers.map(() => 0);
+  for (const grp of groups) {
+    for (let i = 0; i + 1 < grp.length; i++) {
+      const li = layer.get(grp[i]), xa = coords.get(grp[i]).x, xb = coords.get(grp[i + 1]).x;
+      const between = layers[li].some((v) => typeof v === "number" && coords.get(v).x > Math.min(xa, xb) && coords.get(v).x < Math.max(xa, xb));
+      links.push({ from: grp[i], to: grp[i + 1], arc: between ? 22 + 12 * (arcs[li]++ % 3) : 0 });
+    }
+  }
+  const last = layers.length - 1;
+  const arcBelow = arcs[last] ? 22 + 12 * Math.min(arcs[last] - 1, 2) : 0;  // arcs under the last layer still fit the frame
+  return { coords, chains, groups, links, width: maxW, height: top[last] + NODE_H + maxOff[last] + arcBelow };
 }
 
 function edgePath(chain, coords) {
-  // vertical-tangent cubic segments through each layer; virtual nodes are passed straight through
+  // vertical-tangent cubic segments between layer bands; virtual nodes are passed straight through.
+  // A node nudged down by the file stagger is entered (and left) by a straight vertical run through its
+  // layer's band, so the curve itself always bends in the gap between layers.
   let d = "";
   for (let i = 0; i + 1 < chain.length; i++) {
     const a = coords.get(chain[i]), b = coords.get(chain[i + 1]);
-    const x1 = a.cx, y1 = typeof chain[i] === "number" ? a.y + NODE_H : a.y + NODE_H;
-    const x2 = b.cx, y2 = typeof chain[i + 1] === "number" ? b.y - 3 : b.y;
+    const x1 = a.cx, y1 = a.bot;
+    const x2 = b.cx, y2 = typeof chain[i + 1] === "number" ? b.top - 3 : b.top;
     const dy = (y2 - y1) / 2;
-    if (!d) d = `M${x1},${typeof chain[i] === "number" ? y1 : a.y}` + (typeof chain[i] === "number" ? "" : ` L${x1},${y1}`);
+    const y0 = typeof chain[i] === "number" ? a.y + NODE_H : a.y;
+    if (!d) d = `M${x1},${y0}` + (y1 !== y0 ? ` L${x1},${y1}` : "");
     d += ` C${x1},${y1 + dy} ${x2},${y2 - dy} ${x2},${y2}`;
-    if (typeof chain[i + 1] !== "number") d += ` L${x2},${b.y + NODE_H}`;
+    if (typeof chain[i + 1] !== "number") d += ` L${x2},${b.bot}`;
+    else if (b.off) d += ` L${x2},${b.y - 3}`;
   }
   return d;
+}
+
+function nodeRef(planId, c) { return `${c.plan_id ?? planId}.${c.node_id} “${truncate(c.title, 40)}”`; }
+function fileNote(planId, n) {
+  // tooltip lines on a node's files: what it writes, which nodes it runs before/after, whom it waits for
+  if (!n.files?.length) return "";
+  const lines = [`writes: ${n.files.join(", ")}`];
+  const first = (c) => c.plan_id < planId || (c.plan_id === planId && c.node_id < n.node_id);  // (plan_id, node_id) order
+  for (const c of n.conflicts || []) lines.push(`${first(c) ? "runs after" : "runs before"} ${nodeRef(planId, c)} (both write ${c.files.join(", ")})`);
+  const bb = n.status === "ready" && n.blocked_by;
+  if (bb) lines.push(`waiting for ${nodeRef(planId, bb)}, which ${bb.reason === "running" ? "is running and writes" : "goes first on"} ${bb.files.join(", ")}`);
+  return lines.join("\n");
+}
+
+function fileConnector(a, b, arc = 0) {
+  // dashed line between two cards of one stagger group, clipped to their borders (+3 px) so the
+  // "runs after" arrowhead lands visibly on the later card's edge. When other cards sit between the
+  // two (the barycenter sweep may interleave groups), a straight line would hide behind them and cross
+  // the other group's connector, so it dips under the layer band instead, `arc` px deep.
+  if (arc) {
+    const dir = b.x > a.x ? 1 : -1, sx = a.cx + dir * (NODE_W / 2 - 28), ex = b.cx - dir * (NODE_W / 2 - 28), low = a.bot + arc;
+    return `M${sx},${a.y + NODE_H + 2} C${sx},${low} ${ex},${low} ${ex},${b.y + NODE_H + 3}`;
+  }
+  const c1 = { x: a.x + NODE_W / 2, y: a.y + NODE_H / 2 }, c2 = { x: b.x + NODE_W / 2, y: b.y + NODE_H / 2 };
+  const dx = c2.x - c1.x, dy = c2.y - c1.y;
+  const t = Math.min((NODE_W / 2 + 3) / Math.max(Math.abs(dx), 1e-6), (NODE_H / 2 + 3) / Math.max(Math.abs(dy), 1e-6));
+  return `M${c1.x + dx * t},${c1.y + dy * t} L${c2.x - dx * t},${c2.y - dy * t}`;
 }
 
 // ----------------------------------------------------------------- graph
@@ -347,10 +419,18 @@ function renderGraph() {
     return;
   }
   empty.classList.add("hidden");
-  const L = computeLayout(d.nodes, d.edges);
+  const L = computeLayout(d.nodes, d.edges, d.plan.id);
   state.layout = L;
   const byId = new Map(d.nodes.map((n) => [n.node_id, n]));
   const defKey = agentKey(planDefaultAgent(d));
+
+  // file-stagger connectors, under the dependency edges: muted and dashed, since they are not dependencies,
+  // only "shares files with, runs after"; they tie a group together however far apart the sweep put it
+  for (const { from, to, arc } of L.links) {
+    const a = byId.get(from), b = byId.get(to);
+    gE.append(el("svg:path", { class: "fconn", d: fileConnector(L.coords.get(from), L.coords.get(to), arc), "marker-end": "url(#arrow-files)" },
+      el("svg:title", {}, `${nodeRef(d.plan.id, b)} runs after ${nodeRef(d.plan.id, a)}: they write the same files`)));
+  }
 
   for (const [a, b] of d.edges) {
     const chain = L.chains.get(`${a}-${b}`);
@@ -363,12 +443,13 @@ function renderGraph() {
   for (const n of d.nodes) {
     const p = L.coords.get(n.node_id);
     const isSel = state.sel && state.sel.plan_id === d.plan.id && state.sel.node_id === n.node_id;
+    const bb = n.status === "ready" ? n.blocked_by : null;  // ready, but a node writing the same files goes first
     const g = el("svg:g", {
-      class: `node ${n.status}${isSel ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
+      class: `node ${n.status}${bb ? " waiting" : ""}${isSel ? " sel" : ""}`, transform: `translate(${p.x},${p.y})`,
       onclick: (e) => { e.stopPropagation(); selectNode(d.plan.id, n.node_id); },
       ondblclick: (e) => { e.stopPropagation(); if (n.subplan_id) openPlan(n.subplan_id); },
     });
-    g.append(el("svg:title", {}, `${n.title}\n\n${n.description || ""}${n.subplan_id ? "\n\n(double-click to open subplan)" : ""}`));
+    g.append(el("svg:title", {}, [n.title, n.description, fileNote(d.plan.id, n), n.subplan_id && "(double-click to open subplan)"].filter(Boolean).join("\n\n")));
     if (n.subplan_id) {
       g.append(el("svg:rect", { class: "ghost", x: 8, y: -8, width: NODE_W, height: NODE_H, rx: 10 }));
       g.append(el("svg:rect", { class: "ghost", x: 4, y: -4, width: NODE_W, height: NODE_H, rx: 10 }));
@@ -394,7 +475,8 @@ function renderGraph() {
     } else if (n.status === "failed") {
       sub = truncate(n.error || "failed", 32);
     } else {
-      sub = n.status === "ready" ? "ready – waiting for agent" : truncate(n.description || "pending", 32);
+      sub = bb ? `${bb.reason === "running" ? "waiting for" : "queued after"} ${bb.plan_id}.${bb.node_id} · shares files`
+        : n.status === "ready" ? "ready – waiting for agent" : truncate(n.description || "pending", 32);
     }
     g.append(el("svg:text", {
       class: "sub", x: 16, y: n.subplan_id ? 47 : 50,
@@ -420,6 +502,7 @@ function renderGraph() {
     const gx = NODE_W - 22, gy = n.subplan_id ? 50 : CHIP_Y + CHIP_H / 2;
     if (n.status === "running") g.append(el("svg:circle", { class: "spinner", cx: gx, cy: gy, r: 7 }));
     else if (n.status === "done") g.append(el("svg:path", { class: "check", d: `M${gx - 6},${gy} l4,4 l8,-8` }));
+    else if (bb) g.append(el("svg:path", { class: "waitglyph", d: `M${gx},${gy - 4} v4 l3,2 M${gx + 7},${gy} a7,7 0 1,1 -14,0 a7,7 0 1,1 14,0` }));
     else if (n.status === "failed") g.append(el("svg:path", { class: "cross", d: `M${gx - 5},${gy - 5} l10,10 M${gx + 5},${gy - 5} l-10,10` }));
     gN.append(g);
     if (chip) {  // size the pill to its rendered text, never past the status glyph
@@ -539,6 +622,7 @@ function renderNodeInfo(r) {
         el("span", { class: "asrc" }, sourceText(a)), sel),
       a.error && el("div", { class: "v err" }, a.error)));
   }
+  info.append(renderFilesRow(pid, n));
   if (r.predecessors.length) {
     const titles = r.predecessors.map((p) => { const x = state.data.nodes.find((m) => m.node_id === p); return x ? `[${p}] ${x.title}` : `[${p}]`; });
     info.append(el("div", {}, el("div", { class: "k" }, "Depends on"), el("div", { class: "v" }, titles.join(", "))));
@@ -549,7 +633,76 @@ function renderNodeInfo(r) {
   if (n.subplan_id) actions.append(el("button", { class: "primary", onclick: () => openPlan(n.subplan_id) }, `Open subplan #${n.subplan_id} →`));
   if (n.status === "failed") actions.append(el("button", { onclick: () => act(post(`/api/plans/${pid}/nodes/${n.node_id}/retry`)) }, "↻ Retry"));
   if (n.status === "running" && n.agent_kind === "builtin" && !n.agent_done) actions.append(el("button", { class: "danger", onclick: () => act(post(`/api/plans/${pid}/nodes/${n.node_id}/stop`)) }, "■ Stop agent"));
+  if (n.status !== "done") actions.append(el("button", {
+    title: "stop whatever is working on this node and mark it done, so the nodes after it start",
+    onclick: () => completeNode(pid, n),
+  }, "✓ Mark done"));
   if (actions.children.length) info.append(actions);
+}
+
+function nodeLink(ref) {
+  return el("a", { class: "nref", onclick: () => selectNode(ref.plan_id, ref.node_id) },
+    `${ref.plan_id}.${ref.node_id} “${truncate(ref.title, 28)}”`);
+}
+
+// Files row: what this node may create/modify, which of those are shared with another node (so
+// they are serialized rather than clobbering each other), and an editor for the set. A node that
+// has started (not pending/ready) locks the editor, since the server rejects the change anyway.
+function renderFilesRow(pid, n) {
+  const wrap = el("div", {}, el("div", { class: "k" }, "Files"));
+  const v = el("div", { class: "v files-row" });
+  if (n.blocked_by) {
+    const bb = n.blocked_by;
+    v.append(el("div", { class: "files-waiting" },
+      "waiting for ", nodeLink(bb), ` to release ${bb.files.join(", ")}`));
+  }
+  const sharedBy = new Map();  // file path -> [conflicting node refs]
+  for (const c of n.conflicts || []) for (const f of c.files) {
+    if (!sharedBy.has(f)) sharedBy.set(f, []);
+    sharedBy.get(f).push(c);
+  }
+  if (!n.files.length) {
+    v.append(el("div", { class: "files-empty" }, "no files declared — may run in parallel with any node"));
+  } else {
+    for (const f of n.files) {
+      const shared = sharedBy.get(f);
+      const row = el("div", { class: `file-item${shared ? " shared" : ""}` }, el("span", { class: "fpath" }, f));
+      if (shared) {
+        const fs = el("span", { class: "fshared" }, "shared with ");
+        shared.forEach((c, i) => { if (i) fs.append(", "); fs.append(nodeLink(c)); });
+        row.append(fs);
+      }
+      v.append(row);
+    }
+  }
+  const editable = n.status === "pending" || n.status === "ready";
+  const ta = el("textarea", {
+    class: "files-edit", rows: 3, placeholder: "one path per line, or comma-separated",
+    disabled: !editable,
+    title: editable ? "" : "locked: the node has started, so its files are fixed for this run",
+  }, n.files.join("\n"));
+  const err = el("div", { class: "fld-err" });
+  const save = el("button", { disabled: !editable }, "Save files");
+  save.addEventListener("click", async () => {
+    const files = ta.value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+    save.disabled = true; ta.disabled = true; err.textContent = "";
+    try { await put(`/api/plans/${pid}/nodes/${n.node_id}/files`, { files }); await refreshPlan(); }
+    catch (e) { err.textContent = e.message; save.disabled = false; ta.disabled = false; }
+  });
+  wrap.append(v, el("div", { class: "files-edit-row" }, ta, save), err);
+  return wrap;
+}
+
+// Manual completion: the escape hatch for a node the service cannot finish itself
+// (a hung agent, work done by hand, a step that turned out unnecessary).
+function completeNode(pid, n) {
+  const had = (n.result || "").trim();
+  const result = prompt(
+    `Mark "${n.title}" done.\n\nResult handed to the nodes that depend on it` +
+    (had ? "" : " (leave empty to use the agent's own closing summary, if it wrote one)") + ":",
+    had);
+  if (result === null) return;  // cancelled
+  act(post(`/api/plans/${pid}/nodes/${n.node_id}/complete`, { result: result.trim() || null }));
 }
 
 // ---------------------------------------------------------- transcript

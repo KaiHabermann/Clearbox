@@ -62,10 +62,12 @@ Then ask, e.g. *"Use visualclaude to make a plan for … and start it."*
 | Tool | What it does |
 | --- | --- |
 | `create_plan(title, description="", parent_plan_id=None, parent_node_id=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. |
-| `add_node(plan_id, title, description="", agent=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. |
+| `add_node(plan_id, title, description="", agent=None, files=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). |
 | `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. |
-| `remove_edge`, `remove_node`, `update_node` | Corrections while building. |
-| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`. |
+| `remove_edge`, `remove_node` | Corrections while building. |
+| `update_node(plan_id, node_id, title=None, description=None, files=None)` | Change only what you pass; `files` omitted keeps the current set, `[]` clears it. |
+| `set_node_files(plan_id, node_id, files)` | Replace a node's declared files on their own, without touching title/description; `[]` or `null` clears them. Only before the node has run. |
+| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)). |
 | `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default). |
 | `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="")` | New agent profile. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
 | `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field, `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
@@ -100,6 +102,50 @@ Then ask, e.g. *"Use visualclaude to make a plan for … and start it."*
   agents and re-queues their nodes; **Reset** clears all results and transcripts.
 * Everything is stored in `visualclaude.db`. Built-in sessions that were running when the service
   stopped are re-queued on the next start.
+
+### File scoping: avoiding clobbered edits
+
+Independent nodes run in parallel, and nothing stops two of them from editing the same file at the
+same time — in practice they overwrite each other's work. `files` on a node lists the paths it will
+**create or modify**; reading a file never needs declaring, since reads cannot clobber anything.
+Declare nothing and a node behaves exactly as before — no conflicts, no waiting; this is also how
+every plan made before this feature keeps working unchanged.
+
+Two nodes that could otherwise run at the same time and declare a shared file never actually run
+together: they run one after the other, **lowest node number first**. This spans the whole plan
+tree — a node in a subplan can conflict with one in the root plan or a sibling subplan — because all
+agents of one plan tree share a single working directory (`<workdir>/plan-<root id>`, see above).
+Nodes already ordered by a dependency edge are never held back for this: if `A` must finish before
+`B` starts, they cannot overlap, so sharing a file is fine and costs nothing extra. A node takes all
+of its declared files at once, never one at a time, so two nodes that each declare the other's file
+cannot deadlock — the lower-numbered one always gets to start.
+
+Paths are relative to the plan tree's working directory, exactly like the ones a node's agent reads
+and writes; they may name a file that does not exist yet (the node is about to create it) or a
+directory, which claims everything under it (e.g. `files=["visualclaude/"]` for a node that
+restructures a whole package). Matching is case-insensitive and treats `\` and `/` alike on every
+platform, not just Windows — `App.js` and `app.js` are treated as the same file even on a
+case-sensitive filesystem. That occasionally serializes two genuinely different files; the
+alternative is the opposite mistake, two agents writing what they each think is a different file and
+one edit getting silently lost, which is worse.
+
+Example: node 3 declares `files=["src/parser.py"]`, node 5 (no dependency between them) declares
+`files=["src/"]`. Both become ready at the same time. Node 3 starts; node 5 is held back with
+`blocked_by` reason `"running"` until node 3 finishes, then starts. Had node 5 instead been ready
+first purely by luck of scheduling, it would still wait — the rule is node number, not arrival order.
+
+REST exposes the same thing as `PUT /api/plans/{plan_id}/nodes/{node_id}/files` (body `{"files":
+[...]}`). Every node view, from REST and from MCP's `get_plan` alike, carries `files` (its own
+declared paths) and `conflicts` (the other nodes in the tree that share one and could run at the
+same time — these are the ones that get serialized); REST's node view adds `blocked_by` while a node
+is waiting: which node holds the file, and whether that node is `"running"` or merely has an earlier
+`"turn"`.
+
+In the UI, nodes that share a file are drawn one step lower than the last within their layer and
+joined by a dashed connector, so the stagger is visible at a glance even though it is not a
+dependency edge; a node waiting on one says so in its drawer ("waiting for 3 "Parse config" to
+release `src/parser.py`"), and the drawer's **Files** row lets you view and edit a node's declared
+files directly (disabled once it has started).
 
 ## Agents and harnesses
 
@@ -239,9 +285,12 @@ the whole flow can be watched for free.
 * Left: plans with progress bars. Top: breadcrumb (for subplans), status, Start / Stop / Reset.
 * "Working now" lists every node in the plan tree that has an agent on it right now — click to jump.
 * Graph: top-down layered DAG. Running nodes glow and spin, edges into them animate;
-  subplan nodes are drawn as a stack with a progress bar (double-click to open).
+  subplan nodes are drawn as a stack with a progress bar (double-click to open). Nodes within a
+  layer that share a declared file are nudged down a step each and joined by a dashed connector —
+  the file stagger, see [File scoping](#file-scoping-avoiding-clobbered-edits).
 * Click a node: task, prerequisites, result/error, the **agent** that runs it (with where that
-  came from, and a select to override it) and the **live agent session**
+  came from, and a select to override it), the **Files** row (its declared paths, which other nodes
+  share one, and — while waiting — which node to wait for) and the **live agent session**
   (messages, thinking, tool calls with their results, final result with turns / time / cost).
 * Nodes whose agent differs from the plan's default carry a coloured chip naming it; a dot marks
   an override set on the node itself. The topbar sets the plan's default agent.

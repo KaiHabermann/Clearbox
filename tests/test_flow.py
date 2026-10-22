@@ -1,9 +1,14 @@
 """End-to-end test against a running server started with --mock (fast).
 
+Also covers the file-scoping surface: `files`, `conflicts` and `blocked_by` in
+get_plan and the REST node view, update_node / set_node_files / PUT .../files.
+Scheduling with files is proven in test_file_conflicts.py.
+
 Run:  uv run visualclaude --mock --mock-speed 20      (one shell)
       uv run python tests/test_flow.py [http://127.0.0.1:8765]
 """
 import asyncio, json, sys, time
+import urllib.error
 import urllib.request
 from mcp.client.client import Client
 
@@ -133,5 +138,78 @@ async def main():
         assert view(r, r1) == view(r, r2) == view(rs, rs1) == ("server-default", server_default)
         assert not {fast, strong} & {x["name"] for x in await call("list_agents")}
         print("agent resolution OK")
+
+        # --- file scoping surface: files / conflicts / blocked_by over MCP and REST
+        def rest(method, path, body=None):
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(URL + path, data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        f = await call("create_plan", title="Files")
+        f1 = (await call("add_node", plan_id=f, title="one", files=["Shared.txt", "docs/"]))[1]
+        f2 = (await call("add_node", plan_id=f, title="two"))[1]
+        f3 = (await call("add_node", plan_id=f, title="three", files=[".\\shared.txt"]))[1]
+        f4 = (await call("add_node", plan_id=f, title="after one", files=["shared.txt"]))[1]
+        await call("add_edge", plan_id=f, from_node_id=f1, to_node_id=f4)  # ordered: no conflict
+        fs = await call("create_plan", title="files sub", parent_plan_id=f, parent_node_id=f2)
+        g1 = (await call("add_node", plan_id=fs, title="sub", files=["DOCS/readme.md"]))[1]
+        for bad in ("../up.txt", "/etc/passwd", "C:\\x.txt"):
+            try:
+                await call("add_node", plan_id=f, title="bad", files=[bad]); print("FAIL bad path accepted", bad)
+            except RuntimeError as e:
+                assert "working directory" in str(e), e
+        assert len((await call("get_plan", plan_id=f))["nodes"]) == 4  # rejected nodes were not created
+
+        st = {n["node_id"]: n for n in (await call("get_plan", plan_id=f))["nodes"]}
+        assert st[f1]["files"] == ["docs/", "Shared.txt"] and st[f2]["files"] == [], st[f1]
+        assert st[f3]["files"] == [".\\shared.txt"], st[f3]  # spelling kept for display
+        assert st[f1]["conflicts"] == [[f, f3], [fs, g1]] and st[f3]["conflicts"] == [[f, f1], [f, f4]], st
+        assert st[f2]["conflicts"] == [] and st[f4]["conflicts"] == [[f, f3]], st  # not f1: ordered
+
+        views = {n["node_id"]: n for n in rest("GET", f"/api/plans/{f}")[1]["nodes"]}
+        refs = lambda v: [(x["plan_id"], x["node_id"]) for x in v["conflicts"]]
+        assert views[f1]["conflicts"] == [
+            {"plan_id": f, "node_id": f3, "title": "three", "files": ["Shared.txt"]},
+            {"plan_id": fs, "node_id": g1, "title": "sub", "files": ["DOCS/readme.md"]}], views[f1]["conflicts"]
+        sub_view = rest("GET", f"/api/plans/{fs}/nodes/{g1}")[1]["node"]
+        assert refs(sub_view) == [(f, f1)] and refs(views[f3]) == [(f, f1), (f, f4)]  # symmetric
+        assert (views[f2]["files"], views[f2]["conflicts"], views[f2]["blocked_by"]) == ([], [], None)
+        assert all(v["blocked_by"] is None for v in views.values())  # not started
+
+        await call("update_node", plan_id=f, node_id=f3, title="three!")  # no files: set kept
+        assert rest("GET", f"/api/plans/{f}/nodes/{f3}")[1]["node"]["files"] == [".\\shared.txt"]
+        await call("update_node", plan_id=f, node_id=f3, files=[])  # [] clears
+        v = rest("GET", f"/api/plans/{f}/nodes/{f3}")[1]["node"]
+        assert (v["title"], v["files"], v["conflicts"]) == ("three!", [], []), v
+        assert refs(rest("GET", f"/api/plans/{f}/nodes/{f1}")[1]["node"]) == [(fs, g1)]
+        assert refs(rest("GET", f"/api/plans/{f}/nodes/{f4}")[1]["node"]) == []
+        code, v = rest("PUT", f"/api/plans/{f}/nodes/{f3}/files", {"files": ["shared.txt", "SHARED.TXT"]})
+        assert code == 200 and v["files"] == ["shared.txt"] and refs(v) == [(f, f1), (f, f4)], (code, v)
+        assert await call("set_node_files", plan_id=f, node_id=f3, files=["Shared.txt"]) == ["Shared.txt"]
+        code, v = rest("PUT", f"/api/plans/{f}/nodes/{f3}/files", {"files": ["../x"]})
+        assert code == 400 and "escapes" in v["detail"], (code, v)
+
+        # blocked_by while one holds the file (external, so nothing runs by itself)
+        await call("start_plan", plan_id=f, executor="external")
+        await asyncio.sleep(0.2)
+        job = await call("claim_next_node", agent_name="files-1", plan_id=f)
+        assert job["node_id"] == f1 and "Shared.txt" in job["context"], job
+        v = rest("GET", f"/api/plans/{f}/nodes/{f3}")[1]["node"]
+        assert v["status"] == "ready" and v["blocked_by"] == {
+            "plan_id": f, "node_id": f1, "title": "one", "files": ["Shared.txt"], "reason": "running"}, v
+        code, v = rest("PUT", f"/api/plans/{f}/nodes/{f1}/files", {"files": []})
+        assert code == 400 and "running" in v["detail"], (code, v)
+        try:
+            await call("set_node_files", plan_id=f, node_id=f1, files=None); print("FAIL running node changed")
+        except RuntimeError as e:
+            assert "running" in str(e), e
+        await call("stop_plan", plan_id=f)
+        rest("DELETE", f"/api/plans/{f}")
+        print("file scoping surface OK")
 
 asyncio.run(main())
