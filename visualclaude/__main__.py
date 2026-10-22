@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 
 import uvicorn
 
 from .app import Settings, create_app
+from .bootstrap import StartupError
 
 
 def main() -> None:
@@ -30,6 +32,15 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=None)
     ap.add_argument("--no-agent-mcp", action="store_true",
                     help="do not give built-in agents access to the visualclaude MCP tools")
+    ap.add_argument("--agent-profile", default=env("VISUALCLAUDE_AGENT_PROFILE"), metavar="NAME",
+                    help="server-wide default agent profile (default: 'mock' with --mock, else 'claude')")
+    ap.add_argument("--openai-base-url", default=env("OPENAI_BASE_URL"), metavar="URL",
+                    help="bootstrap the 'openai' profile for this OpenAI-compatible endpoint, "
+                         "e.g. http://localhost:11434/v1")
+    ap.add_argument("--openai-model", default=env("VISUALCLAUDE_OPENAI_MODEL"), metavar="NAME",
+                    help="model of the bootstrapped 'openai' profile")
+    ap.add_argument("--openai-api-key-env", default="OPENAI_API_KEY", metavar="NAME",
+                    help="NAME of the environment variable holding the 'openai' profile's api key")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -45,10 +56,19 @@ def main() -> None:
         model=args.model,
         max_turns=args.max_turns,
         expose_mcp_to_agents=not args.no_agent_mcp,
+        default_agent=args.agent_profile,
+        openai_base_url=args.openai_base_url,
+        openai_model=args.openai_model,
+        openai_api_key_env=args.openai_api_key_env,
     )
-    app = create_app(settings)
+    try:
+        app = create_app(settings)
+    except StartupError as e:
+        print(f"visualclaude: error: {e}", file=sys.stderr)
+        sys.exit(2)
     print(f"VisualClaude UI:  http://{settings.host}:{settings.port}/")
     print(f"MCP endpoint:     {settings.mcp_url}   (agents: {settings.agent})")
+    print(f"Agents:           {app.state.agents_line}")
     uvicorn.run(app, host=settings.host, port=settings.port, log_level="warning")
 
 

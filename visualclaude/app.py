@@ -14,10 +14,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .agents import ClaudeBackend, MockBackend
+from . import bootstrap
+from .harness.registry import HarnessDefaults, HarnessRegistry
 from .engine import Bus, Engine, EngineConfig
 from .mcp_tools import build_mcp
-from .store import PlanError, Store
+from .store import PlanError, Store, public_profile
 
 STATIC = Path(__file__).parent / "static"
 
@@ -28,13 +29,18 @@ class Settings:
     port: int = 8765
     db: str = "visualclaude.db"
     workdir: str = "workspace"
-    agent: str = "claude"          # 'claude' | 'mock'
+    agent: str = "claude"          # 'claude' | 'mock': the harness used when no agent profile applies
+    default_agent: str | None = None  # --agent-profile: name of the server-wide default profile
     max_concurrency: int = 3
     permission_mode: str = "acceptEdits"
     model: str | None = None
     max_turns: int | None = None
     expose_mcp_to_agents: bool = True
     mock_speed: float = 1.0
+    # --openai-*: only used to bootstrap the built-in "openai" profile when it does not exist yet
+    openai_base_url: str | None = None
+    openai_model: str | None = None
+    openai_api_key_env: str = "OPENAI_API_KEY"
 
     @property
     def mcp_url(self) -> str:
@@ -46,22 +52,68 @@ class StartBody(BaseModel):
     executor: str = "builtin"
 
 
+class AgentPatch(BaseModel):
+    """Partial update of an agent profile; fields left out of the body are unchanged.
+
+    ``api_key``: missing (or null) = keep the stored key, ``""`` = clear it, any
+    other string = replace it. The UI's edit form relies on this so it never has
+    to know, or re-send, the secret.
+    """
+
+    name: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    api_key: str | None = None
+    params: dict[str, Any] | None = None
+    tools: dict[str, Any] | None = None
+    permission_mode: str | None = None
+    system_append: str | None = None
+    max_parallel: int | None = None
+    description: str | None = None
+
+
+class AgentBody(AgentPatch):
+    """A new agent profile. Unlike MCP, REST may take a literal ``api_key``: it is
+    typed into a localhost form by the operator, not into a model's context."""
+
+    name: str
+    harness: str
+
+
+class AgentRef(BaseModel):
+    """Assign an agent profile by id or name; null clears the assignment (= inherit)."""
+
+    agent: int | str | None = None
+
+
+NodeAgentBody = PlanAgentBody = AgentRef
+
+
 def create_app(settings: Settings) -> FastAPI:
     store = Store(settings.db)
     bus = Bus()
-    if settings.agent == "mock":
-        backend: Any = MockBackend(speed=settings.mock_speed)
-    else:
-        backend = ClaudeBackend(
-            permission_mode=settings.permission_mode,
-            model=settings.model,
-            max_turns=settings.max_turns,
-            mcp_url=settings.mcp_url if settings.expose_mcp_to_agents else None,
-        )
+    bootstrap.ensure_profiles(store, bootstrap.OpenAiBootstrap(
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        api_key_env=settings.openai_api_key_env,
+    ))
+    default = bootstrap.resolve_default(store, settings.default_agent, mock=settings.agent == "mock")
+    harnesses = HarnessRegistry(store, HarnessDefaults(
+        agent=settings.agent,
+        permission_mode=settings.permission_mode,
+        model=settings.model,
+        max_turns=settings.max_turns,
+        mcp_url=settings.mcp_url if settings.expose_mcp_to_agents else None,
+        mock_speed=settings.mock_speed,
+        default_profile=default["id"],
+    ))
+    bootstrap.validate(harnesses, store, default)
     engine = Engine(
         store,
         bus,
-        backend,
+        harnesses,
         EngineConfig(
             workdir=settings.workdir,
             max_concurrency=settings.max_concurrency,
@@ -87,6 +139,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(title="VisualClaude", lifespan=lifespan)
     app.state.engine = engine
+    app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp
 
     def _err(e: Exception) -> HTTPException:
@@ -99,7 +152,57 @@ def create_app(settings: Settings) -> FastAPI:
             **n,
             "subplan_id": sub,
             "progress": engine.rollup(sub) if sub is not None else None,
+            "agent": harnesses.source_for(plan_id, n["node_id"]),
+            "agent_override": n.get("agent_profile_id"),
         }
+
+    def agent_view(p: dict[str, Any], default_id: int | None, usage: dict[int, int]) -> dict[str, Any]:
+        """The only shape an agent profile leaves this API in (public_profile drops api_key)."""
+        out = public_profile(p)
+        assert "api_key" not in out
+        out["default"] = p["id"] == default_id
+        out["in_use"] = usage.get(p["id"], 0)
+        return out
+
+    def agent_usage() -> dict[int, int]:
+        """profile id -> number of nodes and plans that reference it directly."""
+        rows = store._q(
+            "SELECT agent_profile_id AS id, COUNT(*) AS n FROM nodes WHERE agent_profile_id IS NOT NULL "
+            "GROUP BY agent_profile_id UNION ALL "
+            "SELECT default_agent_profile_id, COUNT(*) FROM plans WHERE default_agent_profile_id IS NOT NULL "
+            "GROUP BY default_agent_profile_id"
+        )
+        usage: dict[int, int] = {}
+        for r in rows:
+            usage[r["id"]] = usage.get(r["id"], 0) + r["n"]
+        return usage
+
+    def default_agent_id() -> int | None:
+        ref = harnesses.defaults.default_profile
+        if ref is None:
+            return None
+        try:
+            return store.resolve_profile_ref(ref)["id"]
+        except PlanError:
+            return None
+
+    def one_agent(agent_id: int) -> dict[str, Any]:
+        try:
+            p = store.get_profile(agent_id)
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
+        return agent_view(p, default_agent_id(), agent_usage())
+
+    def profile_id_of(ref: int | str | None) -> int | None:
+        if ref is None or ref == "":
+            return None
+        try:
+            return store.resolve_profile_ref(ref)["id"]
+        except PlanError as e:
+            raise _err(e) from e
+
+    def agents_changed() -> None:
+        bus.publish({"type": "agents"})
 
     def active_nodes(root_id: int) -> list[dict[str, Any]]:
         """Nodes in the whole plan tree that currently have an agent working on them."""
@@ -133,8 +236,14 @@ def create_app(settings: Settings) -> FastAPI:
             root = store.root_of(plan_id)
         except PlanError as e:
             raise HTTPException(404, str(e)) from e
+        default_agent = None
+        if p.get("default_agent_profile_id") is not None:
+            with contextlib.suppress(PlanError):
+                d = store.get_profile(p["default_agent_profile_id"])
+                default_agent = {"id": d["id"], "name": d["name"], "harness": d["harness"], "model": d["model"]}
         return {
             "plan": p,
+            "default_agent": default_agent,
             "root": {"id": root["id"], "started": bool(root["started"]), "executor": root["executor"]},
             "status": engine.plan_status(plan_id),
             "progress": engine.rollup(plan_id),
@@ -200,6 +309,87 @@ def create_app(settings: Settings) -> FastAPI:
     async def stop_node(plan_id: int, node_id: int) -> dict[str, str]:
         await engine.stop_node(plan_id, node_id)
         return {"ok": "stopped"}
+
+    # ------------------------------------------------------------ agents
+    @app.get("/api/agents")
+    async def list_agents() -> list[dict[str, Any]]:
+        default_id, usage = default_agent_id(), agent_usage()
+        return [agent_view(p, default_id, usage) for p in store.list_profiles()]
+
+    @app.post("/api/agents")
+    async def create_agent(body: AgentBody) -> dict[str, Any]:
+        fields = body.model_dump(exclude_unset=True)
+        if not fields.get("api_key"):
+            fields.pop("api_key", None)
+        try:
+            agent_id = store.create_profile(**fields)
+        except PlanError as e:
+            raise _err(e) from e
+        agents_changed()
+        return one_agent(agent_id)
+
+    @app.patch("/api/agents/{agent_id}")
+    async def update_agent(agent_id: int, body: AgentPatch) -> dict[str, Any]:
+        """Partial update: only fields present in the body change.
+
+        api_key: absent or null = leave the stored key unchanged; "" = clear it;
+        any other string = replace it. Other fields sent as null are reset.
+        """
+        fields = body.model_dump(exclude_unset=True)
+        if fields.get("api_key") is None:
+            fields.pop("api_key", None)
+        one_agent(agent_id)  # 404 for an unknown profile, 400 below for invalid fields
+        try:
+            store.update_profile(agent_id, **fields)
+        except PlanError as e:
+            raise _err(e) from e
+        agents_changed()
+        return one_agent(agent_id)
+
+    @app.delete("/api/agents/{agent_id}")
+    async def delete_agent(agent_id: int) -> dict[str, str]:
+        """Delete a profile; nodes and plans that used it go back to inheriting."""
+        try:
+            store.delete_profile(agent_id)
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
+        agents_changed()
+        return {"ok": "deleted"}
+
+    @app.post("/api/agents/{agent_id}/test")
+    async def test_agent(agent_id: int) -> dict[str, Any]:
+        """Connection test; the same implementation as the MCP test_agent tool (HarnessRegistry.test)."""
+        try:
+            return await harnesses.test(agent_id)
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.put("/api/plans/{plan_id}/nodes/{node_id}/agent")
+    async def set_node_agent(plan_id: int, node_id: int, body: NodeAgentBody) -> dict[str, Any]:
+        """Set (id or name) or clear (null) a node's own agent; takes effect on its next run."""
+        pid = profile_id_of(body.agent)
+        try:
+            store.set_node_profile(plan_id, node_id, pid)
+            n = store.get_node(plan_id, node_id)
+            root_id = store.root_of(plan_id)["id"]
+        except PlanError as e:
+            raise _err(e) from e
+        bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
+        agents_changed()
+        return node_view(plan_id, n)
+
+    @app.put("/api/plans/{plan_id}/agent")
+    async def set_plan_agent(plan_id: int, body: PlanAgentBody) -> dict[str, Any]:
+        """Set (id or name) or clear (null) a plan's default agent; subplans inherit it."""
+        pid = profile_id_of(body.agent)
+        try:
+            store.set_plan_profile(plan_id, pid)
+            root_id = store.root_of(plan_id)["id"]
+        except PlanError as e:
+            raise _err(e) from e
+        bus.publish({"type": "plan", "plan_id": plan_id, "root_id": root_id})
+        agents_changed()
+        return {"ok": "set", "plan_id": plan_id, "default_agent_profile_id": pid}
 
     # -------------------------------------------------------------- live
     @app.get("/api/stream")

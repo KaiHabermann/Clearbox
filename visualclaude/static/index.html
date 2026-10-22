@@ -11,6 +11,12 @@
     <div class="brand"><span class="logo"></span>VisualClaude</div>
     <div class="section-label">Plans</div>
     <ul id="plan-list"></ul>
+    <div class="section-label agents-label">
+      <span>Agents</span>
+      <button id="agent-all" class="link" title="overview of all agent profiles">all</button>
+    </div>
+    <ul id="agent-list" aria-label="agent profiles"></ul>
+    <div class="agent-new-wrap"><button id="agent-new" title="connect an OpenAI-compatible endpoint, a Claude model or a mock agent">+ New agent</button></div>
     <div class="sidebar-foot">
       <span id="conn" class="conn off" title="live connection"></span>
       <span id="conn-text">connecting…</span>
@@ -21,6 +27,7 @@
     <header id="topbar">
       <nav id="crumbs"></nav>
       <span id="plan-status" class="pill"></span>
+      <span id="plan-agent" class="agent-ctl"></span>
       <div class="spacer"></div>
       <div id="controls"></div>
     </header>
@@ -48,6 +55,9 @@
         <span><i class="dot done"></i>done</span>
         <span><i class="dot failed"></i>failed</span>
         <span><i class="stack-icon"></i>subplan</span>
+        <span title="agent harness colours; a filled dot on a node's agent chip = set on that node"><i class="hswatch h-claude-sdk"></i>claude-sdk</span>
+        <span><i class="hswatch h-openai"></i>openai</span>
+        <span><i class="hswatch h-mock"></i>mock</span>
       </div>
       <div id="zoom">
         <button data-z="in" title="zoom in">+</button>
@@ -67,6 +77,11 @@
       </div>
       <div id="transcript"></div>
     </div>
+  </aside>
+
+  <aside id="agent-drawer" class="closed" aria-labelledby="agent-title">
+    <div id="agent-head"></div>
+    <div id="agent-body"></div>
   </aside>
 
   <script src="/static/app.js"></script>

@@ -3,6 +3,12 @@
 Plan ids are plain auto-incrementing integers. Node ids count up per plan
 (plan 1 has nodes 1, 2, 3 ...; plan 2 starts again at 1), so a node is
 addressed by the tuple (plan_id, node_id).
+
+Agent profiles are named harness configurations (which agent / model / endpoint
+runs a node). Plans and nodes only reference a profile by id, so connection
+details live in exactly one place. A profile may hold a literal api key; it is
+write-only and must leave this module only through `public_profile`, which
+replaces it with a `has_api_key` flag.
 """
 
 from __future__ import annotations
@@ -64,7 +70,41 @@ CREATE TABLE IF NOT EXISTS events (
     data     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_node ON events(plan_id, node_id, id);
+
+CREATE TABLE IF NOT EXISTS agent_profiles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,      -- short slug used by MCP tools and the UI, e.g. "gpt-cheap"
+    harness         TEXT NOT NULL,             -- 'claude-sdk' | 'openai' | 'mock'
+    model           TEXT,                      -- harness default when NULL
+    base_url        TEXT,                      -- OpenAI-compatible endpoint, e.g. http://localhost:11434/v1
+    api_key_env     TEXT,                      -- NAME of the env var holding the key
+    api_key         TEXT,                      -- optional literal key; WRITE-ONLY, never serialized out
+    params          TEXT NOT NULL DEFAULT '{}',-- JSON: temperature, max_tokens, max_turns, reasoning_effort, top_p, ...
+    tools           TEXT NOT NULL DEFAULT '{}',-- JSON: {"preset": "all"|"readonly"|"none", "allow": [...], "deny": [...], "mcp": true}
+    permission_mode TEXT,                      -- claude-sdk only
+    system_append   TEXT,                      -- extra system prompt text for this profile
+    max_parallel    INTEGER,                   -- NULL = no profile-specific limit
+    description     TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
 """
+
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS never alters
+# an existing table, so Store._migrate adds whichever of these are missing.
+# Additive only (no data loss); append new (table, column, declaration) entries here.
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("nodes", "agent_profile_id", "INTEGER"),          # NULL = inherit from the plan chain
+    ("plans", "default_agent_profile_id", "INTEGER"),  # NULL = inherit from the parent plan
+]
+
+HARNESSES = ("claude-sdk", "openai", "mock")
+
+# Every profile column a caller may set; id and timestamps are store-managed.
+PROFILE_FIELDS = (
+    "name", "harness", "model", "base_url", "api_key_env", "api_key", "params", "tools",
+    "permission_mode", "system_append", "max_parallel", "description",
+)
 
 
 class PlanError(ValueError):
@@ -73,6 +113,50 @@ class PlanError(ValueError):
 
 def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(r) if r is not None else None
+
+
+def public_profile(row: dict[str, Any]) -> dict[str, Any]:
+    """A profile safe to send anywhere: the literal key is replaced by `has_api_key`.
+
+    REST, MCP, the UI and logs must only ever see profiles through this function.
+    """
+    out = {k: v for k, v in row.items() if k != "api_key"}
+    env_name = row.get("api_key_env")
+    out["has_api_key"] = bool(row.get("api_key")) or bool(env_name and os.environ.get(env_name))
+    return out
+
+
+def _profile_values(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validate caller-supplied profile fields and convert them to column values."""
+    unknown = set(fields) - set(PROFILE_FIELDS)
+    if unknown:
+        raise PlanError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+    out = dict(fields)
+    if "name" in out:
+        name = out["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise PlanError("profile name must be a non-empty string")
+        name = name.strip()
+        if name.isdigit():
+            # ids and names share one reference syntax (resolve_profile_ref)
+            raise PlanError("profile name must not be purely numeric")
+        out["name"] = name
+    if "harness" in out and out["harness"] not in HARNESSES:
+        raise PlanError(f"unknown harness {out['harness']!r}; expected one of {', '.join(HARNESSES)}")
+    for key in ("params", "tools"):
+        if key in out:
+            val = {} if out[key] is None else out[key]
+            if not isinstance(val, dict):
+                raise PlanError(f"profile {key} must be a JSON object")
+            out[key] = json.dumps(val)
+    mp = out.get("max_parallel")
+    if mp is not None and (isinstance(mp, bool) or not isinstance(mp, int) or mp < 1):
+        raise PlanError("max_parallel must be a positive integer or null")
+    if "description" in out and out["description"] is None:
+        out["description"] = ""
+    if out.get("api_key") == "":
+        out["api_key"] = None
+    return out
 
 
 class Store:
@@ -84,6 +168,15 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._lock = threading.RLock()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add the MIGRATIONS columns an older database lacks. Idempotent."""
+        with self._lock:
+            for table, column, decl in MIGRATIONS:
+                cols = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column not in cols:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     # ------------------------------------------------------------------ helpers
     def _q(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -194,14 +287,23 @@ class Store:
                 self._exec("DELETE FROM plans WHERE id=?", (pid,))
 
     # -------------------------------------------------------------------- nodes
-    def add_node(self, plan_id: int, title: str, description: str = "") -> tuple[int, int]:
+    def add_node(
+        self,
+        plan_id: int,
+        title: str,
+        description: str = "",
+        agent_profile_id: int | None = None,
+    ) -> tuple[int, int]:
         with self._lock:
             p = self.get_plan(plan_id)
+            if agent_profile_id is not None:
+                self.get_profile(agent_profile_id)
             nid = p["next_node_id"]
             self._exec("UPDATE plans SET next_node_id=? WHERE id=?", (nid + 1, plan_id))
             self._exec(
-                "INSERT INTO nodes(plan_id, node_id, title, description, created_at) VALUES (?,?,?,?,?)",
-                (plan_id, nid, title, description, time.time()),
+                "INSERT INTO nodes(plan_id, node_id, title, description, agent_profile_id, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (plan_id, nid, title, description, agent_profile_id, time.time()),
             )
             return plan_id, nid
 
@@ -290,3 +392,114 @@ class Store:
 
     def clear_events(self, plan_id: int, node_id: int) -> None:
         self._exec("DELETE FROM events WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+
+    # ----------------------------------------------------------- agent profiles
+    @staticmethod
+    def _profile_row(r: dict[str, Any] | None) -> dict[str, Any] | None:
+        if r is not None:
+            r["params"] = json.loads(r["params"] or "{}")
+            r["tools"] = json.loads(r["tools"] or "{}")
+        return r
+
+    def create_profile(self, **fields: Any) -> int:
+        for required in ("name", "harness"):
+            if not fields.get(required):
+                raise PlanError(f"profile {required} is required")
+        vals = _profile_values(fields)
+        vals.setdefault("params", "{}")
+        vals.setdefault("tools", "{}")
+        vals.setdefault("description", "")
+        vals["created_at"] = vals["updated_at"] = time.time()
+        cols = ", ".join(vals)
+        marks = ",".join("?" * len(vals))
+        try:
+            cur = self._exec(f"INSERT INTO agent_profiles({cols}) VALUES ({marks})", tuple(vals.values()))
+        except sqlite3.IntegrityError:
+            raise PlanError(f"an agent profile named {vals['name']!r} already exists") from None
+        return int(cur.lastrowid)
+
+    def get_profile(self, profile_id: int) -> dict[str, Any]:
+        p = self._profile_row(self._one("SELECT * FROM agent_profiles WHERE id=?", (profile_id,)))
+        if p is None:
+            raise PlanError(f"unknown agent profile {profile_id}")
+        return p
+
+    def get_profile_by_name(self, name: str) -> dict[str, Any] | None:
+        return self._profile_row(self._one("SELECT * FROM agent_profiles WHERE name=?", (name,)))
+
+    def resolve_profile_ref(self, ref: int | str) -> dict[str, Any]:
+        """Look a profile up by id or by name (MCP/REST callers may use either)."""
+        if isinstance(ref, int) and not isinstance(ref, bool):
+            return self.get_profile(ref)
+        if isinstance(ref, str):
+            ref = ref.strip()
+            if ref.isdigit():  # names are never purely numeric, so this is unambiguous
+                return self.get_profile(int(ref))
+            p = self.get_profile_by_name(ref)
+            if p is not None:
+                return p
+        raise PlanError(f"unknown agent profile {ref!r}")
+
+    def list_profiles(self) -> list[dict[str, Any]]:
+        return [self._profile_row(r) for r in self._q("SELECT * FROM agent_profiles ORDER BY name")]
+
+    def update_profile(self, profile_id: int, **fields: Any) -> None:
+        """Partial update. api_key=None keeps the stored key; api_key="" clears it."""
+        if "api_key" in fields and fields["api_key"] is None:
+            del fields["api_key"]
+        for required in ("name", "harness"):
+            if required in fields and not fields[required]:
+                raise PlanError(f"profile {required} cannot be empty")
+        vals = _profile_values(fields)
+        with self._lock:
+            self.get_profile(profile_id)
+            if not vals:
+                return
+            vals["updated_at"] = time.time()
+            cols = ", ".join(f"{k}=?" for k in vals)
+            try:
+                self._exec(f"UPDATE agent_profiles SET {cols} WHERE id=?", (*vals.values(), profile_id))
+            except sqlite3.IntegrityError:
+                raise PlanError(f"an agent profile named {vals['name']!r} already exists") from None
+
+    def delete_profile(self, profile_id: int) -> None:
+        with self._lock:
+            self.get_profile(profile_id)
+            self._exec("UPDATE nodes SET agent_profile_id=NULL WHERE agent_profile_id=?", (profile_id,))
+            self._exec(
+                "UPDATE plans SET default_agent_profile_id=NULL WHERE default_agent_profile_id=?", (profile_id,)
+            )
+            self._exec("DELETE FROM agent_profiles WHERE id=?", (profile_id,))
+
+    def set_node_profile(self, plan_id: int, node_id: int, profile_id: int | None) -> None:
+        with self._lock:
+            self.get_node(plan_id, node_id)
+            if profile_id is not None:
+                self.get_profile(profile_id)
+            self.update_node(plan_id, node_id, agent_profile_id=profile_id)
+
+    def set_plan_profile(self, plan_id: int, profile_id: int | None) -> None:
+        with self._lock:
+            self.get_plan(plan_id)
+            if profile_id is not None:
+                self.get_profile(profile_id)
+            self._exec("UPDATE plans SET default_agent_profile_id=? WHERE id=?", (profile_id, plan_id))
+
+    def profile_for_node(self, plan_id: int, node_id: int) -> dict[str, Any] | None:
+        """The profile that should run a node, or None (= use the server-wide default).
+
+        Order: the node's own profile, then its plan's default, then each
+        ancestor plan's default up to the root. First hit wins.
+        """
+        with self._lock:
+            pid = self.get_node(plan_id, node_id)["agent_profile_id"]
+            p = self.get_plan(plan_id)
+            while pid is None:
+                pid = p["default_agent_profile_id"]
+                if p["parent_plan_id"] is None:
+                    break
+                p = self.get_plan(p["parent_plan_id"])
+            if pid is None:
+                return None
+            # delete_profile clears references, but tolerate a hand-edited db
+            return self._profile_row(self._one("SELECT * FROM agent_profiles WHERE id=?", (pid,)))

@@ -9,7 +9,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .engine import Engine
-from .store import PlanError
+from .harness import HarnessError
+from .store import PlanError, public_profile
 
 INSTRUCTIONS = """
 VisualClaude lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
@@ -24,8 +25,17 @@ Building a plan:
   A node can itself be a small plan: create_plan(..., parent_plan_id, parent_node_id) attaches
   a subplan to that node; the node then completes when its whole subplan is done.
   Write node descriptions so that an agent with no other context can do the work.
-  4. start_plan(plan_id, executor="builtin") lets the service run a Claude agent per node,
+  4. start_plan(plan_id, executor="builtin") lets the service run an agent per node,
      or executor="external" lets outside agents pick nodes up with claim_next_node.
+
+Choosing agents (optional; without it every node runs on the server's default agent):
+  An agent profile is a named harness + model: 'claude-sdk' (Claude Agent SDK), 'openai' (any
+  OpenAI-compatible endpoint: OpenAI, OpenRouter, vLLM, Ollama, LM Studio, ...) or 'mock'.
+  list_agents shows them, create_agent adds one, test_agent checks it answers. A plan may mix
+  them per node: cheap/local models for mechanical nodes, strong models for the hard ones.
+  add_node(..., agent="name") or set_node_agent picks a node's agent; set_plan_agent sets a
+  plan-wide default. Resolution: node's agent -> its plan's default -> each ancestor plan's
+  default -> the server default. get_plan shows the resolved agent of every node.
 
 Working on nodes as an external agent:
   claim_next_node -> do the work -> report_progress (optional, repeatedly) -> complete_node / fail_node
@@ -35,6 +45,48 @@ Working on nodes as an external agent:
 def build_mcp(engine: Engine) -> MCPServer:
     mcp = MCPServer("visualclaude", instructions=INSTRUCTIONS)
     store = engine.store
+
+    registry = engine.harnesses
+
+    def _profile_ref(agent: int | str) -> dict[str, Any]:
+        """Raw profile row for an id or name (ToolError if unknown)."""
+        try:
+            return store.resolve_profile_ref(agent)
+        except PlanError as e:
+            raise ToolError(f"{e}; list_agents shows the configured agent profiles") from e
+
+    def _profile_id(agent: int | str | None) -> int | None:
+        return None if agent is None or agent == "" else _profile_ref(agent)["id"]
+
+    def _default_profile_id() -> int | None:
+        ref = registry.defaults.default_profile
+        if ref is None:
+            return None
+        try:
+            return store.resolve_profile_ref(ref)["id"]
+        except PlanError:
+            return None
+
+    def _agent_view(profile: dict[str, Any]) -> dict[str, Any]:
+        out = public_profile(profile)
+        out["default"] = out["id"] == _default_profile_id()
+        return out
+
+    def _profile_name(profile_id: int | None) -> str | None:
+        if profile_id is None:
+            return None
+        try:
+            return store.get_profile(profile_id)["name"]
+        except PlanError:
+            return None
+
+    def _resolved_agent(plan_id: int, node_id: int) -> dict[str, Any]:
+        """Name, harness and model of the agent that would run this node right now."""
+        try:
+            profile = registry.profile_for(plan_id, node_id)
+        except HarnessError as e:
+            return {"name": None, "harness": None, "model": None, "profile_id": None, "error": str(e)}
+        return registry.describe(profile)
 
     def _plan_view(plan_id: int) -> dict[str, Any]:
         p = store.get_plan(plan_id)
@@ -46,6 +98,8 @@ def build_mcp(engine: Engine) -> MCPServer:
                     "title": n["title"],
                     "description": n["description"],
                     "status": n["status"],
+                    "agent": _resolved_agent(plan_id, n["node_id"]),
+                    "agent_override": _profile_name(n["agent_profile_id"]),
                     "subplan_id": store.subplan_of(plan_id, n["node_id"]),
                     "result": n["result"],
                     "error": n["error"],
@@ -57,6 +111,7 @@ def build_mcp(engine: Engine) -> MCPServer:
             "description": p["description"],
             "working_directory": engine.plan_workdir(plan_id),
             "parent": [p["parent_plan_id"], p["parent_node_id"]] if p["parent_plan_id"] else None,
+            "default_agent": _profile_name(p["default_agent_profile_id"]),
             "started": bool(store.root_of(plan_id)["started"]),
             "status": engine.plan_status(plan_id),
             "nodes": nodes,
@@ -97,13 +152,18 @@ def build_mcp(engine: Engine) -> MCPServer:
         return pid
 
     @mcp.tool()
-    def add_node(plan_id: int, title: str, description: str = "") -> tuple[int, int]:
+    def add_node(
+        plan_id: int, title: str, description: str = "", agent: str | int | None = None
+    ) -> tuple[int, int]:
         """Add a node (one piece of work) to a plan. Returns (plan_id, node_id).
 
         The description should be a self-contained instruction for the agent doing the work.
+        agent (optional): name (or id) of the agent profile that runs this node, e.g. a cheap local
+        model for a mechanical task and a strong one for a hard task; omit it to inherit the plan's.
         """
+        profile_id = _profile_id(agent)
         try:
-            ref = store.add_node(plan_id, title, description)
+            ref = store.add_node(plan_id, title, description, agent_profile_id=profile_id)
         except PlanError as e:
             raise ToolError(str(e)) from e
         engine.notify_plan(plan_id)
@@ -157,7 +217,12 @@ def build_mcp(engine: Engine) -> MCPServer:
 
     @mcp.tool()
     def get_plan(plan_id: int) -> dict[str, Any]:
-        """Return a plan with its nodes (status, results, subplan ids) and edges."""
+        """Return a plan with its nodes (status, results, subplan ids) and edges.
+
+        Each node shows `agent` (name, harness and model of the profile that will run it, after
+        inheritance) and `agent_override` (the profile set on the node itself, or null); the plan
+        shows `default_agent` (its plan-wide default, or null).
+        """
         try:
             return _plan_view(plan_id)
         except PlanError as e:
@@ -179,6 +244,172 @@ def build_mcp(engine: Engine) -> MCPServer:
                 }
             )
         return out
+
+    # -------------------------------------------------------------- agents
+    @mcp.tool()
+    def list_agents() -> list[dict[str, Any]]:
+        """List the agent profiles nodes can run on.
+
+        Each entry has name, harness, model, base_url, max_parallel, ... and `default: true` on the
+        server-wide default profile. Secrets are never shown: `has_api_key` says whether a key is
+        available (from the api_key_env variable, or one stored through the web UI).
+        """
+        return [_agent_view(p) for p in store.list_profiles()]
+
+    @mcp.tool()
+    def create_agent(
+        name: str,
+        harness: str,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
+        params: dict[str, Any] | None = None,
+        tools: dict[str, Any] | None = None,
+        permission_mode: str | None = None,
+        system_append: str | None = None,
+        max_parallel: int | None = None,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Create an agent profile (a named harness + model) and return it.
+
+        name: unique and not purely numeric; nodes and plans refer to the profile by it.
+        harness: 'claude-sdk' (Claude Agent SDK; model e.g. "claude-opus-5-5", empty = server default),
+          'openai' (any OpenAI-compatible chat-completions endpoint) or 'mock' (fake agent for tests).
+        For 'openai': model is required; base_url is the endpoint root ending in /v1 (empty = the real
+          OpenAI API); api_key_env is the NAME of an environment variable of the VisualClaude server
+          holding the key (local endpoints usually need none). Examples:
+            create_agent(name="gpt-mini", harness="openai", model="gpt-4o-mini",
+                         api_key_env="OPENAI_API_KEY")
+            create_agent(name="local-qwen", harness="openai", model="qwen2.5-coder:14b",
+                         base_url="http://localhost:11434/v1", max_parallel=1)   # Ollama
+            (LM Studio's default is base_url="http://localhost:1234/v1".)
+        A literal api key is deliberately NOT accepted here: secrets should not pass through a model's
+        context. Set the environment variable on the server, or enter the key in the web UI.
+        params: e.g. {"temperature": 0.2, "max_turns": 40, "timeout": 300}.
+        tools: {"preset": ..., "allow": [...], "deny": [...], "mcp": true|false}.
+        permission_mode (claude-sdk only); system_append: extra system prompt text;
+        max_parallel: max nodes running on this profile at once, across all plans (null = no limit).
+        Run test_agent afterwards to check that the endpoint answers.
+        """
+        try:
+            pid = store.create_profile(
+                name=name, harness=harness, model=model, base_url=base_url, api_key_env=api_key_env,
+                params=params, tools=tools, permission_mode=permission_mode, system_append=system_append,
+                max_parallel=max_parallel, description=description,
+            )
+            return _agent_view(store.get_profile(pid))
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool()
+    def update_agent(
+        agent: str | int,
+        name: str | None = None,
+        harness: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
+        params: dict[str, Any] | None = None,
+        tools: dict[str, Any] | None = None,
+        permission_mode: str | None = None,
+        system_append: str | None = None,
+        max_parallel: int | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Change an agent profile (by name or id); only the fields you pass change. Returns it.
+
+        Pass "" to clear a text field (model, base_url, api_key_env, permission_mode, system_append)
+        and 0 to remove the max_parallel limit; params/tools replace the whole object. Applies to
+        nodes that start afterwards. See create_agent for the fields; api keys are not accepted here.
+        """
+        profile = _profile_ref(agent)
+        fields: dict[str, Any] = {
+            k: v
+            for k, v in (("name", name), ("harness", harness), ("params", params), ("tools", tools),
+                         ("description", description))
+            if v is not None
+        }
+        for k, v in (("model", model), ("base_url", base_url), ("api_key_env", api_key_env),
+                     ("permission_mode", permission_mode), ("system_append", system_append)):
+            if v is not None:
+                fields[k] = v or None
+        if max_parallel is not None:
+            fields["max_parallel"] = max_parallel or None
+        try:
+            store.update_profile(profile["id"], **fields)
+            updated = _agent_view(store.get_profile(profile["id"]))
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.kick()  # a raised max_parallel may let waiting nodes start
+        return updated
+
+    @mcp.tool()
+    def delete_agent(agent: str | int) -> str:
+        """Delete an agent profile (by name or id).
+
+        Nodes and plans that used it lose that setting and inherit again (plan default -> server default).
+        """
+        profile = _profile_ref(agent)
+        # plans whose view changes: those with a node or a plan default on this profile
+        affected = {r["plan_id"] for r in store._q(
+            "SELECT plan_id FROM nodes WHERE agent_profile_id=? "
+            "UNION SELECT id FROM plans WHERE default_agent_profile_id=?", (profile["id"], profile["id"]))}
+        try:
+            store.delete_profile(profile["id"])
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        for pid in affected:
+            engine.notify_plan(pid)
+        engine.kick()
+        return f"agent profile {profile['name']!r} deleted"
+
+    @mcp.tool()
+    def set_node_agent(plan_id: int, node_id: int, agent: str | int | None) -> str:
+        """Choose the agent profile (name or id) that runs one node; null clears the override so the
+        node inherits its plan's default again. Applies the next time the node starts."""
+        profile_id = _profile_id(agent)
+        try:
+            store.set_node_profile(plan_id, node_id, profile_id)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        engine.notify_plan(plan_id)
+        if profile_id is None:
+            return f"node {node_id} of plan {plan_id} now inherits its agent ({_resolved_agent(plan_id, node_id)['name']})"
+        return f"node {node_id} of plan {plan_id} runs on agent {_profile_name(profile_id)!r}"
+
+    @mcp.tool()
+    def set_plan_agent(plan_id: int, agent: str | int | None) -> str:
+        """Set a plan-wide default agent profile (name or id); null clears it.
+
+        The default applies to every node of the plan that has no agent of its own and is inherited
+        by its subplans. Resolution order for a node, first hit wins: the node's own agent -> its
+        plan's default -> the nearest ancestor plan's default -> ... -> the root plan's default ->
+        the server-wide default profile -> the server's built-in agent.
+        """
+        profile_id = _profile_id(agent)
+        try:
+            store.set_plan_profile(plan_id, profile_id)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+        for pid in [plan_id, *store.descendant_plans(plan_id)]:
+            engine.notify_plan(pid)
+        if profile_id is None:
+            return f"plan {plan_id} no longer has a default agent"
+        return f"plan {plan_id} (and its subplans) default to agent {_profile_name(profile_id)!r}"
+
+    @mcp.tool()
+    async def test_agent(agent: str | int) -> dict[str, Any]:
+        """Quick liveness check of an agent profile (by name or id). Never raises.
+
+        For 'openai' profiles it lists the endpoint's models (~10s timeout; endpoints without
+        /models get a tiny completion instead) and returns {ok, detail, reachable, model_listed,
+        models_sample, credential}; credential says where the key comes from ("env:OPENAI_API_KEY",
+        "literal", "none"), never the key itself. 'claude-sdk' and 'mock' need no check.
+        """
+        try:
+            return await registry.test(agent)  # shared with POST /api/agents/{id}/test
+        except PlanError as e:
+            return {"ok": False, "detail": f"{e}; list_agents shows the configured agent profiles", "models_sample": []}
 
     # ----------------------------------------------------------- execution
     @mcp.tool()

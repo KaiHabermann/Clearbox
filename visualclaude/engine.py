@@ -10,9 +10,12 @@ every node of the subplan is done. A task node whose agent creates a subplan
 for it while running ("expanding" itself) is done once the agent has finished
 *and* that subplan is complete.
 
-With executor="builtin" the service spawns a Claude agent session for every
-ready node (up to ``max_concurrency`` at a time). With executor="external",
-ready nodes wait until an outside agent claims them through the MCP tools.
+With executor="builtin" the service spawns an agent session for every ready
+node (up to ``max_concurrency`` at a time). Which agent runs a node is decided
+per node by the ``HarnessRegistry`` (node profile -> plan defaults -> server
+default -> the CLI-configured harness); a profile's ``max_parallel`` further
+caps how many of its nodes run at once. With executor="external", ready nodes
+wait until an outside agent claims them through the MCP tools.
 """
 
 from __future__ import annotations
@@ -24,7 +27,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .agents import AgentJob
+from .harness import AgentJob, Harness, HarnessError
+from .harness.registry import HarnessRegistry
 from .store import PlanError, Store
 
 log = logging.getLogger("visualclaude")
@@ -78,7 +82,7 @@ class EngineConfig:
 class Engine:
     store: Store
     bus: Bus
-    backend: Any
+    harnesses: HarnessRegistry
     config: EngineConfig = field(default_factory=EngineConfig)
 
     def __post_init__(self) -> None:
@@ -86,6 +90,9 @@ class Engine:
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
         self._stopping: set[tuple[int, int]] = set()
+        # profile id each running builtin task resolved to (None = implicit harness);
+        # in memory like _tasks, since builtin runs do not survive a restart either
+        self._task_profiles: dict[tuple[int, int], int | None] = {}
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -223,10 +230,32 @@ class Engine:
                 if len(self._tasks) >= self.config.max_concurrency:
                     break
                 n = self.store.get_node(plan_id, nid)
-                if n["status"] == "ready" and (plan_id, nid) not in self._tasks:
-                    self._spawn(plan_id, nid)
+                if n["status"] != "ready" or (plan_id, nid) in self._tasks:
+                    continue
+                try:
+                    profile, harness = self.harnesses.resolve(plan_id, nid)
+                except HarnessError as e:
+                    self._fail_misconfigured(plan_id, nid, str(e))
                     changed = True
+                    continue
+                if self._profile_full(profile):
+                    continue  # stays ready; a finishing task kicks the scheduler again
+                self._spawn(plan_id, nid, profile, harness)
+                changed = True
         return changed
+
+    def _profile_full(self, profile: dict[str, Any] | None) -> bool:
+        """Whether the profile already runs ``max_parallel`` nodes (across all plans)."""
+        if profile is None or not profile.get("max_parallel"):
+            return False
+        running = sum(1 for pid in self._task_profiles.values() if pid == profile["id"])
+        return running >= profile["max_parallel"]
+
+    def _fail_misconfigured(self, plan_id: int, node_id: int, message: str) -> None:
+        """A profile that cannot even build its harness fails the node, no retry loop."""
+        self.store.update_node(plan_id, node_id, result=None)
+        self._emit(plan_id, node_id, "error", {"text": f"agent misconfigured: {message}"})
+        self._set_status(plan_id, node_id, "failed", error=message, agent_kind="builtin", agent_done=1)
 
     def _subplan_summary(self, sub: int) -> str:
         nodes = self.store.nodes(sub)
@@ -271,13 +300,18 @@ class Engine:
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------ builtin runs
-    def _spawn(self, plan_id: int, node_id: int) -> None:
+    def _spawn(self, plan_id: int, node_id: int, profile: dict[str, Any] | None, harness: Harness) -> None:
         self.store.update_node(plan_id, node_id, agent_done=0, result=None, error=None)
-        self._set_status(plan_id, node_id, "running", agent_kind="builtin", agent_name="claude")
-        task = asyncio.create_task(self._run_builtin(plan_id, node_id))
+        self._set_status(plan_id, node_id, "running", agent_kind="builtin",
+                         agent_name=self.harnesses.agent_name(profile))
+        self._emit(plan_id, node_id, "system", {"text": self.harnesses.label(profile),
+                                                "agent": self.harnesses.describe(profile)})
+        task = asyncio.create_task(self._run_builtin(plan_id, node_id, profile, harness))
         self._tasks[(plan_id, node_id)] = task
+        self._task_profiles[(plan_id, node_id)] = profile["id"] if profile else None
 
-    async def _run_builtin(self, plan_id: int, node_id: int) -> None:
+    async def _run_builtin(self, plan_id: int, node_id: int, profile: dict[str, Any] | None,
+                           harness: Harness) -> None:
         key = (plan_id, node_id)
         try:
             system_append = SYSTEM_APPEND
@@ -289,9 +323,11 @@ class Engine:
                 prompt=self.build_context(plan_id, node_id),
                 system_append=system_append,
                 cwd=self.plan_workdir(plan_id),
+                profile=profile,
+                node_title=self.store.get_node(plan_id, node_id)["title"],
             )
             result: dict[str, Any] | None = None
-            async for kind, data in self.backend.run(job):
+            async for kind, data in harness.run(job):
                 if kind == "system" and data.get("session_id"):
                     self.store.update_node(plan_id, node_id, session_id=data["session_id"])
                 if kind == "result":
@@ -306,12 +342,16 @@ class Engine:
             if key in self._stopping:
                 self._stopping.discard(key)
             raise
+        except HarnessError as e:  # setup problem surfaced by the harness: actionable, no traceback
+            self._emit(plan_id, node_id, "error", {"text": f"agent misconfigured: {e}"})
+            self._finish(plan_id, node_id, ok=False, text=str(e))
         except Exception as e:  # noqa: BLE001
             log.exception("agent for node %s failed", key)
             self._emit(plan_id, node_id, "error", {"text": f"{type(e).__name__}: {e}"})
             self._finish(plan_id, node_id, ok=False, text=f"{type(e).__name__}: {e}")
         finally:
             self._tasks.pop(key, None)
+            self._task_profiles.pop(key, None)
             self.kick()
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
@@ -364,6 +404,7 @@ class Engine:
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
         self._tasks.pop((plan_id, node_id), None)
+        self._task_profiles.pop((plan_id, node_id), None)
 
     async def stop_node(self, plan_id: int, node_id: int) -> None:
         task = self._tasks.get((plan_id, node_id))

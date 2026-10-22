@@ -1,7 +1,8 @@
 // VisualClaude frontend: plan DAG view + live agent transcripts. No build step, no deps.
 "use strict";
 
-const NODE_W = 230, NODE_H = 74, H_GAP = 46, V_GAP = 70;
+const NODE_W = 230, NODE_H = 88, H_GAP = 46, V_GAP = 66;
+const CHIP_Y = 60, CHIP_H = 17;   // agent chip row inside a node box (between the subtitle and the bottom edge)
 const $ = (s) => document.querySelector(s);
 const SVGNS = "http://www.w3.org/2000/svg";
 
@@ -15,6 +16,9 @@ const state = {
   view: { x: 0, y: 0, k: 1 },
   fittedFor: null,
   layout: null,
+  agents: [],          // /api/agents (public profiles: no secrets)
+  agentSel: null,      // agent panel: null (closed) | "list" | "new" | profile id
+  agentDirty: false,   // the open agent form has unsaved edits
 };
 
 // ------------------------------------------------------------------ utils
@@ -28,7 +32,7 @@ function el(tag, attrs = {}, ...kids) {
     else if (k === "html") e.innerHTML = v;
     else e.setAttribute(k, v);
   }
-  for (const kid of kids.flat()) if (kid != null) e.append(kid.nodeType ? kid : document.createTextNode(kid));
+  for (const kid of kids.flat()) if (kid != null && kid !== false) e.append(kid.nodeType ? kid : document.createTextNode(kid));
   return e;
 }
 async function api(path, opts = {}) {
@@ -49,19 +53,76 @@ function md(text) {
   }).join("");
 }
 function truncate(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+const put = (p, body) => api(p, { method: "PUT", body: JSON.stringify(body || {}) });
+
+// ---------------------------------------------------------------- agents
+// Nodes carry their resolved agent ({name, harness, model, profile_id, source, from_plan});
+// these helpers turn that into chips, labels and selects. Colours come from --h-<harness>.
+const HARNESSES = ["claude-sdk", "openai", "mock"];
+const hcls = (harness) => `h-${HARNESSES.includes(harness) ? harness : "other"}`;
+const agentKey = (a) => (a ? (a.profile_id != null ? `p${a.profile_id}` : `n${a.name}`) : "");
+const agentModel = (a) => (a.harness === "mock" ? "mock" : `${a.harness} / ${a.model || "default model"}`);
+function harnessOfName(name) {
+  // active_nodes only carries agent_name; map it back to a harness via the profile list
+  const p = state.agents.find((x) => x.name === name);
+  if (p) return p.harness;
+  return name === "mock" ? "mock" : name === "claude" ? "claude-sdk" : null;
+}
+function sourceText(a) {
+  if (a.source === "node") return "set on this node";
+  if (a.source === "plan") return "plan default";
+  if (a.source === "inherited") return a.from_plan != null ? `inherited from plan ${a.from_plan}` : "inherited";
+  return "server default";
+}
+function planDefaultAgent(d) {
+  // the agent a node of this plan gets when it has no override of its own
+  if (!d) return null;
+  if (d.default_agent) return { ...d.default_agent, profile_id: d.default_agent.id };
+  return d.nodes.map((n) => n.agent).find((a) => a && a.source !== "node") || null;
+}
+async function loadAgents() {
+  try { state.agents = await api("/api/agents"); } catch { state.agents = []; }
+  agentsLoaded();
+}
+const loadAgentsSoon = debounce(async () => { await loadAgents(); refreshPlan(); }, 150);
+function agentSelect(current, inheritLabel, onchange, attrs = {}) {
+  // "" = inherit (PUT agent: null); otherwise a profile id
+  const sel = el("select", { class: "agent-sel", ...attrs },
+    el("option", { value: "" }, inheritLabel),
+    state.agents.map((p) => el("option", { value: p.id }, `${p.name} (${agentModel(p)})${p.default ? " ★" : ""}`)));
+  if (current != null && !state.agents.some((p) => p.id === current)) sel.append(el("option", { value: current }, `profile #${current}`));
+  sel.value = current == null ? "" : String(current);
+  sel.addEventListener("change", async () => {
+    sel.disabled = true;
+    try { await onchange(sel.value === "" ? null : +sel.value); }
+    catch (e) { alert(e.message); sel.value = current == null ? "" : String(current); sel.disabled = false; }
+  });
+  return sel;
+}
 
 // ---------------------------------------------------------------- routing
 function parseHash() {
   const m = location.hash.match(/^#\/plan\/(\d+)(?:\/node\/(\d+))?/);
   return m ? { plan: +m[1], node: m[2] ? +m[2] : null } : null;
 }
+function parseAgentHash() {
+  const m = location.hash.match(/^#\/agents(?:\/(\d+|new))?\/?$/);
+  return m ? { agent: m[1] == null ? "list" : m[1] === "new" ? "new" : +m[1] } : null;
+}
 function setHash() {
-  if (state.planId == null) return;
-  let h = `#/plan/${state.planId}`;
-  if (state.sel && state.sel.plan_id === state.planId) h += `/node/${state.sel.node_id}`;
+  let h;
+  if (state.agentSel != null) h = state.agentSel === "list" ? "#/agents" : `#/agents/${state.agentSel}`;
+  else if (state.planId != null) {
+    h = `#/plan/${state.planId}`;
+    if (state.sel && state.sel.plan_id === state.planId) h += `/node/${state.sel.node_id}`;
+  } else if (parseAgentHash()) h = location.pathname + location.search;  // agent panel closed, no plan shown
+  else return;
   if (location.hash !== h) history.replaceState(null, "", h);
 }
 window.addEventListener("hashchange", () => {
+  const ag = parseAgentHash();
+  if (ag) { if (ag.agent !== state.agentSel) openAgentPanel(ag.agent); return; }
+  if (state.agentSel != null) closeAgentPanel(false);
   const r = parseHash();
   if (r && r.plan !== state.planId) openPlan(r.plan, r.node);
 });
@@ -119,7 +180,7 @@ const loadPlansSoon = debounce(loadPlans, 400);
 function renderEmpty(html) {
   $("#nodes").innerHTML = ""; $("#edges").innerHTML = "";
   const e = $("#empty"); e.innerHTML = html; e.classList.remove("hidden");
-  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = "";
+  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = "";
 }
 
 function renderHeader() {
@@ -138,6 +199,18 @@ function renderHeader() {
   pill.className = `pill ${st}`;
   pill.textContent = d.root.started ? `${st} · ${d.root.executor}` : st;
   pill.title = `${d.progress.done}/${d.progress.total} tasks done`;
+
+  // plan-wide default agent: applies to this plan's nodes and (unless they set their own) its subplans
+  const pa = $("#plan-agent");
+  pa.innerHTML = "";
+  const eff = planDefaultAgent(d), own = d.plan.default_agent_profile_id ?? null;
+  const inherit = d.ancestors.length ? "inherit from parent plan" : "server default";
+  pa.className = `agent-ctl ${eff ? hcls(eff.harness) : ""}`;
+  pa.title = "Default agent for every node of this plan and its subplans (a node or subplan can override it)."
+    + (eff ? `\nNow: ${eff.name} (${agentModel(eff)})` : "");
+  pa.append(el("i", { class: "hsw" }), el("span", { class: "lbl" }, "Agent (plan + subplans)"),
+    agentSelect(own, own == null && eff ? `— ${inherit}: ${eff.name} —` : `— ${inherit} —`,
+      async (id) => { await put(`/api/plans/${d.plan.id}/agent`, { agent: id }); await refreshPlan(); }));
 
   const c = $("#controls");
   c.innerHTML = "";
@@ -163,9 +236,13 @@ function renderHeader() {
   ab.innerHTML = "";
   if (d.active.length) {
     ab.append(el("span", { class: "lbl" }, "Working now:"));
-    for (const a of d.active)
-      ab.append(el("span", { class: "chip", title: `${a.agent_kind} agent ${a.agent_name || ""}`, onclick: () => openPlan(a.plan_id, a.node_id) },
-        el("i", { class: "dot running" }), a.title, el("span", { class: "ref" }, `${a.plan_id}.${a.node_id}`)));
+    for (const a of d.active) {
+      const h = a.agent_kind === "external" ? null : harnessOfName(a.agent_name);
+      ab.append(el("span", { class: "chip", title: `${a.agent_kind} agent ${a.agent_name || ""}${h ? ` (${h})` : ""}`, onclick: () => openPlan(a.plan_id, a.node_id) },
+        el("i", { class: "dot running" }), a.title,
+        a.agent_name && el("span", { class: `who ${h ? hcls(h) : ""}` }, a.agent_kind === "external" ? `ext · ${a.agent_name}` : a.agent_name),
+        el("span", { class: "ref" }, `${a.plan_id}.${a.node_id}`)));
+    }
   }
 }
 
@@ -273,6 +350,7 @@ function renderGraph() {
   const L = computeLayout(d.nodes, d.edges);
   state.layout = L;
   const byId = new Map(d.nodes.map((n) => [n.node_id, n]));
+  const defKey = agentKey(planDefaultAgent(d));
 
   for (const [a, b] of d.edges) {
     const chain = L.chains.get(`${a}-${b}`);
@@ -305,12 +383,12 @@ function renderGraph() {
       const pr = n.progress;
       sub = `subplan #${n.subplan_id} · ${pr.done}/${pr.total} done${pr.running ? ` · ${pr.running} running` : ""}`;
       const w = NODE_W - 32, tot = Math.max(pr.total, 1);
-      g.append(el("svg:rect", { class: "pbar-bg", x: 16, y: NODE_H - 14, width: w, height: 4, rx: 2 }));
-      g.append(el("svg:rect", { class: "pbar", x: 16, y: NODE_H - 14, width: (w * pr.done) / tot, height: 4, rx: 2 }));
-      if (pr.running) g.append(el("svg:rect", { class: "pbar run", x: 16 + (w * pr.done) / tot, y: NODE_H - 14, width: (w * pr.running) / tot, height: 4, rx: 2 }));
+      g.append(el("svg:rect", { class: "pbar-bg", x: 16, y: CHIP_Y + 6, width: w, height: 4, rx: 2 }));
+      g.append(el("svg:rect", { class: "pbar", x: 16, y: CHIP_Y + 6, width: (w * pr.done) / tot, height: 4, rx: 2 }));
+      if (pr.running) g.append(el("svg:rect", { class: "pbar run", x: 16 + (w * pr.done) / tot, y: CHIP_Y + 6, width: (w * pr.running) / tot, height: 4, rx: 2 }));
     } else if (n.status === "running") {
       const dur = n.started_at ? ` · ${fmtDur(Date.now() / 1000 - n.started_at)}` : "";
-      sub = `${n.agent_kind === "external" ? (n.agent_name || "external") : "claude"} working${dur}`;
+      sub = `${n.agent_name || (n.agent_kind === "external" ? "external" : "agent")} working${dur}`;
     } else if (n.status === "done" && n.started_at && n.finished_at) {
       sub = `done in ${fmtDur(n.finished_at - n.started_at)}`;
     } else if (n.status === "failed") {
@@ -321,16 +399,33 @@ function renderGraph() {
     g.append(el("svg:text", {
       class: "sub", x: 16, y: n.subplan_id ? 47 : 50,
       "data-started": !n.subplan_id && n.status === "running" && n.started_at ? n.started_at : null,
-      "data-who": n.agent_kind === "external" ? (n.agent_name || "external") : "claude",
+      "data-who": n.agent_name || (n.agent_kind === "external" ? "external" : "agent"),
     }, truncate(sub, 34)));
     g.append(el("svg:text", { class: "ref", x: NODE_W - 12, y: 20, "text-anchor": "end" }, `${d.plan.id}.${n.node_id}`));
 
+    // agent chip: only where this node's agent differs from the plan's default (uniform plans stay quiet);
+    // always on an explicit override, which gets a filled dot and a solid border
+    const a = n.agent, override = a && a.source === "node";
+    let chip = null;
+    if (a && !n.subplan_id && (override || agentKey(a) !== defKey)) {
+      chip = el("svg:g", { class: `achip ${hcls(a.harness)}${override ? " override" : ""}` },
+        el("svg:title", {}, `agent: ${a.name} (${agentModel(a)}) · ${sourceText(a)}`),
+        el("svg:rect", { x: 16, y: CHIP_Y, width: 40, height: CHIP_H, rx: CHIP_H / 2 }),
+        override && el("svg:circle", { cx: 25, cy: CHIP_Y + CHIP_H / 2, r: 3 }),
+        el("svg:text", { x: override ? 32 : 24, y: CHIP_Y + 12.5 }, truncate(a.name, 22)));
+      g.append(chip);
+    }
+
     // status glyph
-    const gx = NODE_W - 22, gy = NODE_H - (n.subplan_id ? 34 : 24);
+    const gx = NODE_W - 22, gy = n.subplan_id ? 50 : CHIP_Y + CHIP_H / 2;
     if (n.status === "running") g.append(el("svg:circle", { class: "spinner", cx: gx, cy: gy, r: 7 }));
     else if (n.status === "done") g.append(el("svg:path", { class: "check", d: `M${gx - 6},${gy} l4,4 l8,-8` }));
     else if (n.status === "failed") g.append(el("svg:path", { class: "cross", d: `M${gx - 5},${gy - 5} l10,10 M${gx + 5},${gy - 5} l-10,10` }));
     gN.append(g);
+    if (chip) {  // size the pill to its rendered text, never past the status glyph
+      const t = chip.querySelector("text"), pad = +t.getAttribute("x") - 16;
+      chip.querySelector("rect").setAttribute("width", Math.min(t.getComputedTextLength() + pad + 9, NODE_W - 16 - 40));
+    }
   }
 
   if (state.fittedFor !== d.plan.id) { fit(); state.fittedFor = d.plan.id; }
@@ -376,6 +471,7 @@ window.addEventListener("resize", debounce(fit, 150));
 // --------------------------------------------------------------- drawer
 async function selectNode(planId, nodeId) {
   if (planId !== state.planId) return openPlan(planId, nodeId);
+  closeAgentPanel(false);
   const same = state.sel && state.sel.plan_id === planId && state.sel.node_id === nodeId;
   state.sel = { plan_id: planId, node_id: nodeId };
   if (!same) { state.lastEventId = 0; $("#transcript").innerHTML = ""; toolCards.clear(); }
@@ -415,7 +511,7 @@ function renderNodeInfo(r) {
   const n = r.node, pid = state.sel.plan_id;
   const head = $("#drawer-head");
   head.innerHTML = "";
-  const agent = n.agent_kind ? (n.agent_kind === "external" ? `external · ${n.agent_name || "?"}` : "built-in claude") : null;
+  const agent = n.agent_kind ? (n.agent_kind === "external" ? `external · ${n.agent_name || "?"}` : `built-in · ${n.agent_name || "agent"}`) : null;
   head.append(
     el("div", { class: "t" },
       el("h2", {}, n.title),
@@ -429,6 +525,20 @@ function renderNodeInfo(r) {
   const info = $("#node-info");
   info.innerHTML = "";
   info.append(el("div", {}, el("div", { class: "k" }, "Task"), el("div", { class: "v" }, n.description || "—")));
+  const a = n.agent || state.data?.nodes.find((m) => m.node_id === n.node_id)?.agent;
+  if (a && !n.subplan_id) {
+    const running = n.status === "running", inh = planDefaultAgent(state.data);
+    const sel = agentSelect(n.agent_profile_id ?? null, inh ? `— inherit: ${inh.name} —` : "— inherit —",
+      async (id) => { await put(`/api/plans/${pid}/nodes/${n.node_id}/agent`, { agent: id }); await refreshPlan(); },
+      { disabled: running,
+        title: running ? "Locked while the node is running: a session keeps the agent it started with. Stop it or wait until it finishes; the change applies to the next run."
+          : "Agent for this node only; \"— inherit —\" clears the override and uses the plan default." });
+    info.append(el("div", {}, el("div", { class: "k" }, "Agent"),
+      el("div", { class: `v agent-row ${hcls(a.harness)}` },
+        el("span", { class: "aname" }, a.name), el("span", {}, `(${agentModel(a)})`),
+        el("span", { class: "asrc" }, sourceText(a)), sel),
+      a.error && el("div", { class: "v err" }, a.error)));
+  }
   if (r.predecessors.length) {
     const titles = r.predecessors.map((p) => { const x = state.data.nodes.find((m) => m.node_id === p); return x ? `[${p}] ${x.title}` : `[${p}]`; });
     info.append(el("div", {}, el("div", { class: "k" }, "Depends on"), el("div", { class: "v" }, titles.join(", "))));
@@ -458,7 +568,15 @@ function appendEvent(ev) {
   let node = null;
   switch (ev.kind) {
     case "status": node = el("div", { class: "ev-status" }, `${d.from} → ${d.to} · ${fmtTime(ev.ts)}`); break;
-    case "system": node = el("div", { class: "ev-system" }, `⏺ ${d.text || ""}${d.model ? ` (${d.model})` : ""}`); break;
+    case "system":
+      // the engine opens every built-in session with "agent: <profile> (<harness> / <model>)" + data.agent
+      if (d.agent && d.agent.name) {
+        node = el("div", { class: `ev-agent ${hcls(d.agent.harness)}`, title: d.text || "" },
+          el("span", { class: "lbl" }, "agent"), el("span", { class: "aname" }, d.agent.name),
+          el("span", { class: "am" }, agentModel(d.agent)), el("span", { class: "spacer" }), el("span", { class: "ts" }, fmtTime(ev.ts)));
+        break;
+      }
+      node = el("div", { class: "ev-system" }, `⏺ ${d.text || ""}${d.model ? ` (${d.model})` : ""}`); break;
     case "text": node = el("div", { class: "ev-text", html: md(d.text) }); break;
     case "thinking": node = el("div", { class: "ev-thinking" }, d.text); break;
     case "log": node = el("div", { class: "ev-log" }, d.text); break;
@@ -509,16 +627,284 @@ function scrollTranscript() {
   const b = $("#drawer-body"); b.scrollTop = b.scrollHeight;
 }
 
+// ---------------------------------------------------------------- agents
+// Agent profiles (harness + model + endpoint). The panel is a second right-hand drawer so it sits
+// next to the graph like the node drawer does; only one of the two is open at a time.
+const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"];
+const PARAMS_EXAMPLE = { temperature: 0.2, max_tokens: 4096, max_turns: 50, reasoning_effort: "medium", stream: true, input_price_per_mtok: 0.15, output_price_per_mtok: 0.6 };
+const DEFAULT_TIP = "server default: runs every node for which neither the node nor any of its plans picks an agent";
+
+// called by loadAgents() whenever /api/agents was (re-)fetched, e.g. on an SSE {"type":"agents"}
+function agentsLoaded() {
+  renderAgentList();
+  refreshAgentPanel();
+}
+const agentById = (id) => state.agents.find((a) => a.id === id);
+const asObj = (x) => { if (typeof x !== "string") return x || {}; try { return JSON.parse(x || "{}"); } catch { return {}; } };
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+function renderAgentList() {
+  const ul = $("#agent-list");
+  ul.innerHTML = "";
+  if (!state.agents.length) ul.append(el("li", { class: "none" }, "No agents yet"));
+  for (const a of state.agents) {
+    const open = () => openAgentPanel(a.id);
+    ul.append(el("li", {
+      class: state.agentSel === a.id ? "sel" : "", tabindex: 0, role: "button",
+      title: `${a.name} · ${a.harness}${a.model ? " · " + a.model : ""}${a.default ? "\n" + DEFAULT_TIP : ""}`,
+      onclick: open, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } },
+    },
+      el("span", { class: "ag-name" }, a.name, a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, " ●") : null),
+      el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness),
+      el("span", { class: "ag-model" }, a.model || "default model")));
+  }
+}
+
+function openAgentPanel(sel) {
+  if (state.sel) closeDrawer(false);
+  state.agentSel = sel; state.agentDirty = false;
+  $("#agent-drawer").classList.remove("closed");
+  renderAgentPanel();
+  renderAgentList();
+  if (state.data) renderGraph();
+  setHash();
+}
+function closeAgentPanel(update = true) {
+  if (state.agentSel == null) return;
+  state.agentSel = null; state.agentDirty = false;
+  $("#agent-drawer").classList.add("closed");
+  renderAgentList();
+  if (update) setHash();
+}
+
+function agentHead(title, meta) {
+  const head = $("#agent-head");
+  head.innerHTML = "";
+  head.append(el("div", { class: "t" }, el("h2", { id: "agent-title" }, title), el("div", { class: "meta" }, meta)),
+    el("button", { class: "close", title: "close (Esc)", "aria-label": "close agent panel", onclick: () => closeAgentPanel() }, "✕"));
+}
+function agentMeta(a) {
+  return [
+    el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness),
+    el("span", { style: "font-family:var(--mono)" }, `agent #${a.id}`),
+    a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, "● server default") : null,
+    a.harness !== "openai" ? null : el("span", { title: "a literal key is stored, or the api_key_env variable is set on the server" }, a.has_api_key ? "key: set" : "key: none"),
+    el("span", {}, a.in_use ? `used by ${plural(a.in_use, "node/plan")}` : "not assigned"),
+  ];
+}
+
+function renderAgentPanel() {
+  const sel = state.agentSel, body = $("#agent-body");
+  if (sel == null) return;
+  body.innerHTML = "";
+  if (sel === "list") return renderAgentOverview(body);
+  if (sel === "new") { agentHead("New agent", [el("span", {}, "not saved yet")]); return renderAgentForm(body, null); }
+  const a = agentById(sel);
+  if (!a) {
+    agentHead(`Agent #${sel}`, []);
+    body.append(el("div", { class: "ag-missing" }, "This agent does not exist (any more).", el("br"), el("br"),
+      el("button", { onclick: () => openAgentPanel("new") }, "+ New agent")));
+    return;
+  }
+  agentHead(a.name, agentMeta(a));
+  renderAgentForm(body, a);
+}
+
+// after /api/agents was re-fetched: refresh what is shown without throwing away the operator's typing
+function refreshAgentPanel() {
+  const sel = state.agentSel;
+  if (sel == null || sel === "new") return;
+  if (sel === "list") return renderAgentPanel();
+  const a = agentById(sel), form = $("#agent-form");
+  if (!a || !form || form.dataset.agentId !== String(sel)) return renderAgentPanel();
+  agentHead(a.name, agentMeta(a));
+  if (!state.agentDirty) {
+    const test = $("#agent-test"), msg = $("#agent-form .form-msg");
+    renderAgentPanel();
+    $("#agent-test").replaceWith(test); $("#agent-form .form-msg").replaceWith(msg);
+  }
+}
+
+function renderAgentOverview(body) {
+  agentHead("Agents", [el("span", {}, plural(state.agents.length, "profile"))]);
+  const wrap = el("div", { class: "ag-overview" });
+  for (const a of state.agents)
+    wrap.append(el("button", { class: "ag-card", onclick: () => openAgentPanel(a.id) },
+      el("div", { class: "ag-card-h" }, el("b", {}, a.name), a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, "●") : null, el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness)),
+      el("div", { class: "ag-card-m" }, [a.model || "default model", a.base_url, a.max_parallel ? `max ${a.max_parallel} parallel` : null, a.in_use ? `used by ${a.in_use}` : null].filter(Boolean).join(" · "))));
+  if (!state.agents.length) wrap.append(el("div", { class: "ag-missing" }, "No agent profiles yet. Nodes run with the server's CLI harness."));
+  wrap.append(el("div", {}, el("button", { class: "primary", onclick: () => openAgentPanel("new") }, "+ New agent")));
+  body.append(wrap);
+}
+
+function renderAgentForm(body, a) {
+  const isNew = !a;
+  const v = a || { harness: "openai" };  // new agents default to the OpenAI-compatible harness
+  const tools = asObj(v.tools), params = asObj(v.params);
+  const fld = (id, label, input, hint, only) => el("div", { class: "fld", "data-only": only || null },
+    el("label", { for: id }, label), input, hint ? el("small", {}, hint) : null);
+  const inp = (id, value, attrs = {}) => el("input", { id, value: value ?? "", autocomplete: "off", ...attrs });
+  const select = (id, opts, value) => {
+    const s = el("select", { id }, opts.map(([val, txt]) => el("option", { value: val }, txt)));
+    s.value = value ?? opts[0][0];
+    return s;
+  };
+
+  const harness = select("ag-harness", HARNESSES.map((h) => [h, h]), v.harness);
+  const preset = select("ag-preset", [["all", "all – read, write, edit, shell"], ["readonly", "readonly – read_file, list_dir, glob, grep"], ["none", "none – text only"]], tools.preset || "all");
+  const mcp = el("input", { type: "checkbox", id: "ag-mcp" }); mcp.checked = tools.mcp ?? true;
+  const perm = select("ag-perm", [["", "(server default)"], ...PERMISSION_MODES.map((m) => [m, m])], v.permission_mode || "");
+  const sys = el("textarea", { id: "ag-sys", rows: 3, placeholder: "extra system prompt text for this agent" }); sys.value = v.system_append || "";
+  const paramsErr = el("div", { class: "fld-err", id: "ag-params-err", role: "alert" });
+  const paramsTa = el("textarea", { id: "ag-params", rows: 7, spellcheck: "false", "aria-describedby": "ag-params-err ag-params-hint",
+    onkeydown: (e) => { if (e.key === "Enter") e.stopPropagation(); }, oninput: () => checkParams() });
+  paramsTa.value = Object.keys(params).length ? JSON.stringify(params, null, 2) : "{}";
+  const checkParams = () => {
+    let p = null, err = "";
+    try {
+      p = JSON.parse(paramsTa.value.trim() || "{}");
+      if (!p || typeof p !== "object" || Array.isArray(p)) { err = 'must be a JSON object, e.g. {"temperature": 0.2}'; p = null; }
+    } catch (e) { err = `invalid JSON: ${e.message}`; }
+    paramsErr.textContent = err; paramsTa.classList.toggle("bad", !!err);
+    return p;
+  };
+  const keyClear = el("input", { type: "checkbox", id: "ag-key-clear" });
+  const msg = el("div", { class: "form-msg", role: "status", "aria-live": "polite" });
+  const ctx = { checkParams, msg };
+
+  const form = el("form", { id: "agent-form", class: "ag-form", "data-agent-id": a ? a.id : "new", "aria-labelledby": "agent-title", novalidate: true,
+    oninput: () => { state.agentDirty = true; }, onchange: () => { state.agentDirty = true; },
+    onsubmit: (e) => { e.preventDefault(); saveAgent(a, form, ctx); } },
+    fld("ag-name", "Name", inp("ag-name", v.name, { required: true, placeholder: "e.g. local-qwen" })),
+    fld("ag-harness", "Harness", harness, "openai = any OpenAI-compatible chat-completions endpoint (OpenAI, Azure, OpenRouter, vLLM, llama.cpp, LM Studio, Ollama …)"),
+    fld("ag-model", "Model", inp("ag-model", v.model, { placeholder: "e.g. gpt-4.1-mini, qwen2.5-coder:14b" })),
+    fld("ag-base", "Base URL", inp("ag-base", v.base_url, { placeholder: "https://api.openai.com/v1", spellcheck: "false" }), "the part before /chat/completions, e.g. http://localhost:11434/v1", "openai"),
+    fld("ag-keyenv", "API key env var", inp("ag-keyenv", v.api_key_env, { placeholder: "e.g. OPENROUTER_API_KEY", spellcheck: "false" }), "preferred: the server reads the key from this environment variable", "openai"),
+    el("div", { class: "fld", "data-only": "openai" },
+      el("label", { for: "ag-key" }, "API key"),
+      el("input", { id: "ag-key", type: "password", autocomplete: "off", spellcheck: "false", placeholder: isNew ? "optional – stored on the server, never shown again" : "unchanged" }),
+      el("small", {}, isNew ? "leave empty for local endpoints or when using the env var"
+        : (a.has_api_key ? "a key is available; leave empty to keep it" : "no key stored; type one to store it")),
+      isNew ? null : el("label", { class: "chk" }, keyClear, " clear the stored key")),
+    fld("ag-perm", "Permission mode", perm, null, "claude-sdk"),
+    fld("ag-maxpar", "Max parallel", inp("ag-maxpar", v.max_parallel, { type: "number", min: 1, step: 1, placeholder: "unlimited" }), "at most this many nodes run on this agent at once (e.g. 1 for a single local GPU)"),
+    el("div", { class: "fld", "data-only": "openai" },
+      el("label", { for: "ag-preset" }, "Tools"), preset,
+      el("label", { class: "chk" }, mcp, " expose visualclaude MCP tools (plan building, report_progress)")),
+    fld("ag-sys", "System prompt addition", sys),
+    el("details", { class: "fld adv", open: Object.keys(params).length ? true : null },
+      el("summary", {}, "Advanced params (JSON)"),
+      el("label", { for: "ag-params", class: "sr" }, "Advanced params as a JSON object"), paramsTa, paramsErr,
+      el("small", { id: "ag-params-hint" }, "temperature, top_p, max_tokens, max_turns, reasoning_effort, stream, timeout, extra_body, input_price_per_mtok, output_price_per_mtok (USD per 1M tokens) · ",
+        el("a", { href: "#", onclick: (e) => { e.preventDefault(); paramsTa.value = JSON.stringify({ ...PARAMS_EXAMPLE, ...(checkParams() || {}) }, null, 2); checkParams(); state.agentDirty = true; } }, "insert example"))),
+    msg,
+    el("div", { class: "actions" },
+      el("button", { type: "submit", class: "primary" }, isNew ? "Create agent" : "Save"),
+      el("button", { type: "button", id: "ag-test-btn", title: isNew ? "saves the agent first, then tests it" : "lists the endpoint's models, or sends a tiny completion",
+        onclick: () => testAgent(a, form, ctx) }, isNew ? "Save & test connection" : "Test connection"),
+      el("div", { class: "spacer" }),
+      isNew ? null : el("button", { type: "button", class: "danger", onclick: () => deleteAgent(a.id) }, "Delete")),
+    el("div", { id: "agent-test" }));
+  form.dataset.mcpInit = tools.mcp == null ? "" : String(tools.mcp);
+  const applyHarness = () => form.querySelectorAll("[data-only]").forEach((x) => x.classList.toggle("hidden", !x.dataset.only.split(" ").includes(harness.value)));
+  harness.addEventListener("change", applyHarness);
+  applyHarness();
+  body.append(form);
+  if (isNew) setTimeout(() => $("#ag-name")?.focus(), 200);
+}
+
+// the JSON body for POST/PATCH; null when the params JSON is invalid (the error is already shown inline)
+function agentBody(a, form, checkParams) {
+  const val = (id) => form.querySelector(`#${id}`).value.trim();
+  const params = checkParams();
+  if (!params) { form.querySelector(".adv").open = true; form.querySelector("#ag-params").focus(); return null; }
+  const h = val("ag-harness"), mp = val("ag-maxpar");
+  if (!val("ag-name")) throw new Error("Name is required.");
+  if (mp && !/^[1-9]\d*$/.test(mp)) throw new Error("Max parallel must be a positive whole number (or empty for unlimited).");
+  const body = { name: val("ag-name"), harness: h, model: val("ag-model") || null, system_append: form.querySelector("#ag-sys").value.trim() || null, max_parallel: mp ? +mp : null, params };
+  if (h === "openai") {
+    Object.assign(body, { base_url: val("ag-base") || null, api_key_env: val("ag-keyenv") || null });
+    // tools is only meaningful for the sandboxed toolset of non-Claude harnesses; keep allow/deny lists
+    const tools = { ...asObj(a?.tools), preset: val("ag-preset") };
+    const mcp = form.querySelector("#ag-mcp").checked;
+    if (form.dataset.mcpInit !== "" || !mcp) tools.mcp = mcp; else delete tools.mcp;  // untouched + on = follow the server setting
+    body.tools = tools;
+    const key = form.querySelector("#ag-key").value;  // only ever sent when the operator typed something
+    if (key) body.api_key = key;
+    else if (form.querySelector("#ag-key-clear")?.checked) body.api_key = "";
+  } else if (h === "claude-sdk") body.permission_mode = val("ag-perm") || null;
+  if (!a) for (const k of Object.keys(body)) if (body[k] == null) delete body[k];
+  return body;
+}
+
+async function saveAgent(a, form, { checkParams, msg }) {
+  msg.className = "form-msg"; msg.textContent = "";
+  let body;
+  try { body = agentBody(a, form, checkParams); } catch (e) { msg.className = "form-msg err"; msg.textContent = e.message; return null; }
+  if (!body) return null;
+  let saved;
+  try { saved = a ? await api(`/api/agents/${a.id}`, { method: "PATCH", body: JSON.stringify(body) }) : await post("/api/agents", body); }
+  catch (e) { msg.className = "form-msg err"; msg.textContent = e.message; return null; }
+  const i = state.agents.findIndex((x) => x.id === saved.id);
+  if (i >= 0) state.agents[i] = saved; else state.agents.push(saved);
+  state.agentDirty = false;
+  if (state.agentSel === (a ? a.id : "new")) {
+    state.agentSel = saved.id; setHash();
+    renderAgentPanel();
+    const m = $("#agent-form .form-msg"); m.className = "form-msg ok"; m.textContent = a ? "Saved." : "Agent created.";
+  }
+  renderAgentList();
+  return saved;
+}
+
+async function testAgent(a, form, ctx) {
+  let id = a?.id;
+  if (!a || state.agentDirty) { const saved = await saveAgent(a, form, ctx); if (!saved) return; id = saved.id; }
+  const btn = $("#ag-test-btn"), box = $("#agent-test");
+  btn.disabled = true; btn.textContent = "Testing…";
+  box.className = "test-box wait"; box.textContent = "Contacting the endpoint…";
+  let r;
+  try { r = await post(`/api/agents/${id}/test`); } catch (e) { r = { ok: false, detail: e.message }; }
+  if (state.agentSel !== id) return;
+  const btn2 = $("#ag-test-btn"), out = $("#agent-test");  // the form may have been re-rendered meanwhile
+  btn2.disabled = false; btn2.textContent = "Test connection";
+  out.className = `test-box ${r.ok ? "ok" : "bad"}`; out.innerHTML = "";
+  const kv = [["server", r.base_url], ["credential", r.credential], ["reachable", r.reachable], ["model listed", r.model_listed]].filter(([, x]) => x != null);
+  out.append(...[el("div", { class: "th" }, r.ok ? "✓ Connection OK" : "✕ Connection failed"),
+    el("div", { class: "td" }, r.detail || ""),
+    kv.length ? el("div", { class: "tkv" }, kv.map(([k, x]) => el("span", {}, `${k}: `, el("b", {}, String(x))))) : null,
+    r.models_sample?.length ? el("div", { class: "tmodels" }, el("span", {}, "models:"), r.models_sample.map((m) => el("code", {}, m))) : null].filter(Boolean));
+}
+
+async function deleteAgent(id) {
+  const a = agentById(id); if (!a) return;
+  const refs = a.in_use ? `${plural(a.in_use, "node/plan")} reference${a.in_use === 1 ? "s" : ""} this agent; they will go back to inheriting their plan's agent or the server default.`
+    : "No nodes or plans reference this agent.";
+  if (!confirm(`Delete agent "${a.name}"?\n\n${refs}${a.default ? "\n\nIt is the server default agent." : ""}`)) return;
+  try { await api(`/api/agents/${id}`, { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+  state.agents = state.agents.filter((x) => x.id !== id);
+  openAgentPanel("list");
+  loadAgents();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.agentSel != null && !e.defaultPrevented) closeAgentPanel();
+});
+$("#agent-new").addEventListener("click", () => openAgentPanel("new"));
+$("#agent-all").addEventListener("click", () => openAgentPanel("list"));
+
 // ----------------------------------------------------------- live feed
 function connect() {
   const es = new EventSource("/api/stream");
-  es.addEventListener("hello", () => { $("#conn").className = "conn on"; $("#conn-text").textContent = "live"; refreshPlan(); loadPlans(); });
+  es.addEventListener("hello", () => { $("#conn").className = "conn on"; $("#conn-text").textContent = "live"; loadAgentsSoon(); loadPlans(); });
   es.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.type === "plan") {
       loadPlansSoon();
       if (state.data && msg.root_id === state.data.root.id) refreshPlanSoon();
       else if (msg.deleted && state.planId === msg.plan_id) { state.planId = null; renderEmpty("Plan deleted."); }
+    } else if (msg.type === "agents") {
+      loadAgentsSoon();
     } else if (msg.type === "event") {
       const ev = msg.event;
       if (state.sel && ev.plan_id === state.sel.plan_id && ev.node_id === state.sel.node_id) {
@@ -540,13 +926,15 @@ document.addEventListener("click", () => document.querySelectorAll(".menu-pop").
 
 // ------------------------------------------------------------------ boot
 async function autoOpen() {
+  const ag = parseAgentHash();
+  if (ag) openAgentPanel(ag.agent);  // the graph behind it still shows a plan
   const r = parseHash();
   if (r) return openPlan(r.plan, r.node);
   if (state.plans.length) return openPlan(state.plans[0].id);
   renderEmpty(`No plans yet.<br><br>Connect a model to the MCP endpoint <code>${location.origin}/mcp</code><br>and ask it to <code>create_plan</code>, <code>add_node</code> and <code>add_edge</code>.`);
 }
 (async () => {
-  await loadPlans();
+  await Promise.all([loadPlans(), loadAgents()]);
   await autoOpen();
   connect();
 })();
