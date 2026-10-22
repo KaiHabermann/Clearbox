@@ -8,6 +8,7 @@ addressed by the tuple (plan_id, node_id).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -76,6 +77,8 @@ def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
 
 class Store:
     def __init__(self, path: str):
+        path = os.path.abspath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
