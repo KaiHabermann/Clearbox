@@ -520,11 +520,9 @@ class Engine:
         if self._plan_full(root_id):
             return False  # stays ready; a finishing task of this plan kicks the scheduler again
         for pid in sorted(self.store.descendant_plans(root_id)):
-            # A subplan whose container failed is no longer advanced, so its leftover ready
-            # nodes must not be started either. `_files_turn_pending` already assumes that:
-            # it lets a higher-numbered conflicting node past such a node instead of waiting
-            # for a turn that never comes. Spawning one anyway would let both run at once on
-            # the same file, which is the clobbering the lock exists to prevent.
+            # A failed container's subplan is no longer advanced, so its leftover ready nodes
+            # must not start either -- `_files_turn_pending` already waves higher conflicting
+            # nodes past them, so starting one would put both on the same file at once.
             if not self._still_scheduled(pid):
                 continue
             for nid in sorted(n["node_id"] for n in self.store.nodes(pid)):
