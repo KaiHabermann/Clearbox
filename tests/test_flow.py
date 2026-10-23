@@ -7,10 +7,15 @@ Scheduling with files is proven in test_file_conflicts.py.
 Run:  uv run clearbox --mock --mock-speed 20      (one shell)
       uv run python tests/test_flow.py [http://127.0.0.1:8765]
 """
-import asyncio, json, sys, time
+import asyncio, json, sys, tempfile, time
 import urllib.error
 import urllib.request
 from mcp.client.client import Client
+
+# Each top-level plan needs its own working directory: it is required, and two plans
+# must not run in the same folder at once.
+def wd():
+    return tempfile.mkdtemp(prefix="cb-test-")
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
 
@@ -24,7 +29,7 @@ async def main():
             return sc.get("result", sc) if sc is not None else json.loads(r.content[0].text)
 
         # --- cycle rejection
-        p = await call("create_plan", title="External flow")
+        p = await call("create_plan", title="External flow", working_directory=wd())
         a = (await call("add_node", plan_id=p, title="A"))[1]
         b = (await call("add_node", plan_id=p, title="B"))[1]
         cc = (await call("add_node", plan_id=p, title="C"))[1]
@@ -76,7 +81,8 @@ async def main():
         print("external flow OK")
 
         # --- builtin flow with a wide graph, wait for completion
-        q = await call("create_plan", title="Wide builtin graph", description="layout test")
+        q = await call("create_plan", title="Wide builtin graph", description="layout test",
+                       working_directory=wd())
         ids = [(await call("add_node", plan_id=q, title=f"Step {i}", description=f"do {i}"))[1] for i in range(8)]
         for x, y in [(0,1),(0,2),(0,3),(1,4),(2,4),(3,5),(4,6),(5,6),(0,6),(6,7),(1,7)]:
             await call("add_edge", plan_id=q, from_node_id=ids[x], to_node_id=ids[y])
@@ -101,7 +107,7 @@ async def main():
         fast, strong = f"flow-fast-{tag}", f"flow-strong-{tag}"
         await call("create_agent", name=fast, harness="mock", params={"speed": 20}, max_parallel=1)
         await call("create_agent", name=strong, harness="mock")
-        r = await call("create_plan", title="Agent resolution")
+        r = await call("create_plan", title="Agent resolution", working_directory=wd())
         r1 = (await call("add_node", plan_id=r, title="plain"))[1]
         r2 = (await call("add_node", plan_id=r, title="override"))[1]
         r3 = (await call("add_node", plan_id=r, title="expands"))[1]
@@ -152,7 +158,7 @@ async def main():
             except urllib.error.HTTPError as e:
                 return e.code, json.loads(e.read())
 
-        f = await call("create_plan", title="Files")
+        f = await call("create_plan", title="Files", working_directory=wd())
         f1 = (await call("add_node", plan_id=f, title="one", files=["Shared.txt", "docs/"]))[1]
         f2 = (await call("add_node", plan_id=f, title="two"))[1]
         f3 = (await call("add_node", plan_id=f, title="three", files=[".\\shared.txt"]))[1]

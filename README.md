@@ -545,7 +545,7 @@ clearbox --db $HOME\.clearbox\vc.db --workdir $HOME\.clearbox\workspace
 ```
 
 The repo contains a `.mcp.json`, so Claude Code started in this folder offers the `clearbox`
-server automatically. Create plans with `working_directory` set to the repo path so built-in agents
+server automatically. Plans take `working_directory`, so point it at the repo path and built-in agents
 work on the code. To pick up the agents' changes, stop the service and run
 `uv tool install --force .` again.
 
@@ -564,8 +564,8 @@ and every later plan can use it. Two things worth knowing when a plan builds Cle
 | Flag | Env | Default |
 | --- | --- | --- |
 | `--host`, `--port` | `CLEARBOX_HOST`, `CLEARBOX_PORT` | `127.0.0.1`, `8765` |
-| `--db` | `CLEARBOX_DB` | `clearbox.db` |
-| `--workdir` | `CLEARBOX_WORKDIR` | `workspace` |
+| `--db` | `CLEARBOX_DB` | `<data dir>/clearbox.db` |
+| `--workdir` | `CLEARBOX_WORKDIR` | `<data dir>/workspace` |
 | `--max-concurrency` | `CLEARBOX_MAX_CONCURRENCY` | `3` |
 | `--permission-mode` | `CLEARBOX_PERMISSION_MODE` | `acceptEdits` |
 | `--model` | `CLEARBOX_MODEL` | SDK default |
@@ -621,6 +621,25 @@ tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rule
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
 tests/test_openai_harness.py  the agent loop against tests/fake_openai.py (no network, no DB)
 ```
+
+## Where Clearbox keeps its data
+
+The database and the fallback workspace live in the platform's data directory:
+
+| OS | path |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\clearbox\` |
+| macOS | `~/Library/Application Support/clearbox/` |
+| Linux | `$XDG_DATA_HOME/clearbox/`, else `~/.local/share/clearbox/` |
+
+`--db` / `CLEARBOX_DB` and `--workdir` / `CLEARBOX_WORKDIR` override both. Before 0.2.2 these
+defaulted to `clearbox.db` and `workspace/` relative to the current directory, so launching from
+two folders gave you two unrelated databases; a `clearbox.db` already sitting in the directory you
+start from is still used, and the banner says so.
+
+Every top-level plan must name its own `working_directory` -- the directory its agents work in,
+normally a repository. Subplans inherit it. Two plans with overlapping directories cannot run at
+the same time, since file-conflict locking only orders nodes within one plan tree.
 
 ## Releasing
 

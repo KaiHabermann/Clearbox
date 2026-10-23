@@ -169,7 +169,9 @@ async def main():
 
         async def plan(title, specs, edges=(), parent=None, start=True):
             """specs: list of files lists (None = declare nothing); returns (plan_id, [node ids])."""
-            kw = {"parent_plan_id": parent[0], "parent_node_id": parent[1]} if parent else {}
+            # a top-level plan needs its own working directory; two plans must not share one
+            kw = ({"parent_plan_id": parent[0], "parent_node_id": parent[1]} if parent
+                  else {"working_directory": tempfile.mkdtemp(prefix="cb-test-")})
             pid = await call("create_plan", title=f"{title} {TAG}", **kw)
             if parent is None:
                 plans.append(pid)

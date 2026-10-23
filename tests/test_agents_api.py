@@ -7,10 +7,15 @@ and -- explicitly -- that no response body ever contains `api_key` or the secret
 Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_agents_api.py [http://127.0.0.1:8765]
 """
-import asyncio, json, sys, threading, time, uuid
+import asyncio, json, sys, tempfile, threading, time, uuid
 import urllib.error
 import urllib.request
 from mcp.client.client import Client
+
+# Each top-level plan needs its own working directory: it is required, and two plans
+# must not run in the same folder at once.
+def wd():
+    return tempfile.mkdtemp(prefix="cb-test-")
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
 SECRET = "sk-test-" + uuid.uuid4().hex
@@ -50,7 +55,7 @@ async def main():
             sc = r.structured_content
             return sc.get("result", sc) if sc is not None else json.loads(r.content[0].text)
 
-        p = await call("create_plan", title="Agents API")
+        p = await call("create_plan", title="Agents API", working_directory=wd())
         sp_node = (await call("add_node", plan_id=p, title="parent"))[1]
         n2 = (await call("add_node", plan_id=p, title="leaf"))[1]
         sp = await call("create_plan", title="sub", parent_plan_id=p, parent_node_id=sp_node)

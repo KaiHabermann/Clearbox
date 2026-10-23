@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import tempfile
 
 from mcp.client.client import Client
 
 
-async def main(url: str, start: bool) -> None:
+async def main(url: str, start: bool, workdir: str | None = None) -> None:
     async with Client(url) as c:
         async def call(name: str, **args):
             res = await c.call_tool(name, args)
@@ -24,8 +25,11 @@ async def main(url: str, start: bool) -> None:
                 return res.structured_content.get("result", res.structured_content)
             return json.loads(res.content[0].text)
 
+        # a top-level plan must say where its agents work; a fresh temp dir by default,
+        # since this demo writes a whole little app
         plan = await call("create_plan", title="Tiny CLI todo app",
-                          description="Write a small Python command-line todo app with tests and docs.")
+                          description="Write a small Python command-line todo app with tests and docs.",
+                          working_directory=workdir or tempfile.mkdtemp(prefix="clearbox-demo-"))
         print("plan", plan)
 
         async def node(title: str, desc: str, plan_id: int = plan) -> int:
@@ -62,5 +66,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8765/mcp")
     ap.add_argument("--start", action="store_true")
+    ap.add_argument("--dir", help="working directory for the plan (default: a fresh temp dir)")
     a = ap.parse_args()
-    asyncio.run(main(a.url, a.start))
+    asyncio.run(main(a.url, a.start, a.dir))

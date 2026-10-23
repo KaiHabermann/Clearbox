@@ -13,9 +13,14 @@ edits something.
 Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_rework.py [http://127.0.0.1:8765]
 """
-import asyncio, json, sys, time, urllib.error, urllib.request
+import asyncio, json, sys, tempfile, time, urllib.error, urllib.request
 
 from mcp.client.client import Client
+
+# Each top-level plan needs its own working directory: it is required, and two plans
+# must not run in the same folder at once.
+def wd():
+    return tempfile.mkdtemp(prefix="cb-test-")
 
 URL = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765").rstrip("/")
 MARKER = "MARKER-rework-brief-must-reach-the-prompt"
@@ -51,7 +56,7 @@ async def main():
             sc = r.structured_content
             return sc.get("result", sc) if sc is not None else json.loads(r.content[0].text)
 
-        pid = await call("create_plan", title="Rework test")
+        pid = await call("create_plan", title="Rework test", working_directory=wd())
         a = (await call("add_node", plan_id=pid, title="A", description="first step"))[1]
         b = (await call("add_node", plan_id=pid, title="B", description="second step"))[1]
         await call("add_edge", plan_id=pid, from_node_id=a, to_node_id=b)

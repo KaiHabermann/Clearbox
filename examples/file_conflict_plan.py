@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import tempfile
 import time
 
 from mcp.client.client import Client
@@ -37,6 +38,7 @@ async def main(a: argparse.Namespace) -> None:
         plan = await call(
             "create_plan", title="File conflict demo",
             description="Two nodes write shared.txt and must serialize; a third writes its own file freely.",
+            working_directory=getattr(a, "dir", None) or tempfile.mkdtemp(prefix="clearbox-conflict-"),
         )
         print("plan", plan)
 
@@ -86,4 +88,5 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8765/mcp")
     ap.add_argument("--start", action="store_true")
+    ap.add_argument("--dir", help="working directory for the plan (default: a fresh temp dir)")
     asyncio.run(main(ap.parse_args()))

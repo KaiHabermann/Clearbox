@@ -202,7 +202,9 @@ depends on it (from_node_id must finish before to_node_id starts). Execution wal
 from the roots to the leaves; independent nodes run in parallel.
 
 Building a plan:
-  1. create_plan(title, description) -> plan_id
+  1. create_plan(title, description, working_directory) -> plan_id
+     working_directory is required: the absolute path of the existing directory the plan's
+     agents work in (usually the repository). Subplans inherit it.
   2. add_node(plan_id, title, description) -> [plan_id, node_id]   (one call per piece of work)
   3. add_edge(plan_id, from_node_id, to_node_id)                   (dependencies)
   A node can itself be a small plan: create_plan(..., parent_plan_id, parent_node_id) attaches
@@ -367,9 +369,10 @@ def build_mcp(engine: Engine) -> MCPServer:
         Pass parent_plan_id and parent_node_id to make this plan the subplan of that node
         (the node then represents "do this whole small plan" instead of a single task).
 
-        working_directory (top-level plans only): absolute path of an existing directory the
-        plan's agents work in, e.g. a code repository. Defaults to <workdir>/plan-<id>.
-        Subplans always use the working directory of their top-level plan.
+        working_directory: REQUIRED for a top-level plan -- the absolute path of an existing
+        directory the plan's agents work in, e.g. a code repository. Say where the work happens
+        rather than letting agents edit files somewhere you did not choose. Subplans inherit it
+        from their top-level plan and must not pass it.
 
         max_parallel (top-level plans only): cap how many nodes of this plan's whole tree
         (including its subplans) run at once, regardless of the server's global concurrency
@@ -378,9 +381,14 @@ def build_mcp(engine: Engine) -> MCPServer:
         """
         if parent_plan_id is not None and max_parallel is not None:
             raise ToolError("max_parallel can only be set on top-level plans")
+        if parent_plan_id is None and working_directory is None:
+            raise ToolError(
+                "working_directory is required for a top-level plan: pass the absolute path of "
+                "the existing directory its agents should work in (e.g. the repository)")
         if working_directory is not None:
             if parent_plan_id is not None:
-                raise ToolError("working_directory can only be set on top-level plans")
+                raise ToolError("working_directory can only be set on top-level plans; a subplan "
+                                "uses its top-level plan's directory")
             try:
                 validate_working_directory(working_directory)
             except PlanError as e:

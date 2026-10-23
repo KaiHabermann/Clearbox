@@ -1,6 +1,6 @@
 [project]
 name = "clearbox"
-version = "0.2.1"
+version = "0.2.2"
 description = "Observable, reviewable agent work: DAG plans over MCP, executed node by node and watched live"
 readme = "README.md"
 requires-python = ">=3.10"
