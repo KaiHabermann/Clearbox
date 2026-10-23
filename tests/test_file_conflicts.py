@@ -300,7 +300,18 @@ async def main():
             rest("POST", f"/api/plans/{pid}/start", {"executor": "builtin"})
             v = wait_nodes([(sa, a1), (pid, k1), (pid, k3)], timeout=30)
             assert v[(sa, a1)]["status"] == "failed" and v[(pid, k1)]["status"] == "failed", v
-            assert node(sa, a2)["status"] == "ready"  # stranded: its subplan is no longer advanced
+            # (sub A, 2) may legitimately have been spawned before its container failed -- who
+            # wins the single 'slow' slot first is a race. What must never happen is the
+            # scheduler starting it *after* the failure, since _advance no longer descends into
+            # that subplan and _files_turn_pending already lets higher nodes past it. Assert that
+            # property rather than the snapshot, so the check does not depend on the race.
+            was = node(sa, a2)
+            time.sleep(3)
+            now = node(sa, a2)
+            if was["status"] == "ready":
+                assert now["status"] == "ready", now        # stranded: never spawned afterwards
+            else:
+                assert now["started_at"] == was["started_at"], now   # not restarted
             v = wait_nodes([(sb, b1)], timeout=20)
             assert v[(sb, b1)]["status"] == "done", v
             print("strand OK        (sub B, 1) ran although (sub A, 2) is stranded 'ready'")

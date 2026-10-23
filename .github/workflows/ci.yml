@@ -39,20 +39,32 @@ jobs:
       # The rest drive a real server. Mock agents only, so no API key and no token spend.
       - name: Start a mock server
         run: |
-          uv run clearbox --mock --port 8765 --db "$RUNNER_TEMP/ci.db" --workdir "$RUNNER_TEMP/ws" &
+          uv run clearbox --mock --port 8765 --db "$RUNNER_TEMP/ci.db" --workdir "$RUNNER_TEMP/ws" \
+            > "$RUNNER_TEMP/server.log" 2>&1 &
           for i in $(seq 1 60); do
             curl -sf http://127.0.0.1:8765/api/plans >/dev/null && exit 0
             sleep 1
           done
           echo "::error::server did not come up"; exit 1
 
+      # Runs every test even if an earlier one fails, so one run shows every problem instead of
+      # only the first, and names the failures in the step summary. A test that fails because the
+      # server itself broke leaves no trace in the test output, so the server log is dumped too.
       - name: End-to-end tests
         run: |
+          failed=""
           for t in test_flow test_agents_api test_file_conflicts test_mixed_run test_rework; do
             echo "::group::$t"
-            uv run python "tests/$t.py" http://127.0.0.1:8765
+            uv run python "tests/$t.py" http://127.0.0.1:8765 || failed="$failed $t"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::group::server log"
+            tail -n 100 "$RUNNER_TEMP/server.log" || echo "(no server log)"
+            echo "::endgroup::"
+            echo "::error::failing end-to-end tests:$failed"
+            exit 1
+          fi
 
   build:
     runs-on: ubuntu-latest
