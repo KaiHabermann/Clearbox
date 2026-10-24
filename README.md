@@ -265,20 +265,31 @@ There are two levels, deliberately kept apart so each stays inside a context it 
   reviewer is told which case applies, so it can treat a missing change in the declared scope as
   not made and stays cautious elsewhere. Agents are still asked to edit through the file tools: those
   edits show up in the transcript as reviewable steps, and they are the only ones captured outside
-  the declared scope. The reviewer is asked to run the test suite before its verdict, so the
-  automatic reviews get capability `run` (read, search, shell; no edits) whatever the profile
-  allows for normal runs, see [Capability](#capability-what-an-agent-may-do). On-demand reviews
-  triggered with `review_node` / `review_plan` currently still run with read-only tools.
+  the declared scope. The reviewer is asked to run the test suite before its verdict (with the
+  plan's `test_instructions`, if it has them), so reviews get capability `run` (read, search,
+  shell; no edits) whatever the profile allows for normal runs, see
+  [Capability](#capability-what-an-agent-may-do).
 * **Plan review** (`review_plan` / `POST /api/plans/{id}/review`): once every node in the tree is
-  done, one reviewer looks at the plan as a whole — every node's title, description, result and
-  step-review verdict — and asks what was missed, contradicted or left out across steps. This is
+  done, one reviewer looks at the plan as a whole — every node's title, status, description, result
+  and step review — and asks what was missed, contradicted or left out across steps. This is
   explicitly **not** a code review: it never reads diffs or source, only reads what the step
   reviews and results already say.
 
 Both levels run automatically once `set_plan_review_agent` names an agent (the plan review fires
 once, right after the last node completes), and both can also be triggered on demand with an
 optional one-off `agent=` override, whether or not the plan has one set — so a plan finished before
-reviewing existed can still be reviewed after the fact. `get_reviews(plan_id)` /
+reviewing existed can still be reviewed after the fact. An automatic and an on-demand review are
+the same session: same prompt, same tools, same transcript (marked as a review), same record; an
+on-demand one replaces a queued or running review of the same node or plan. Every reviewer ends
+its reply with
+
+    VERDICT: ok | concerns | error
+    SUMMARY: <one or two sentences>
+    FINDINGS:
+    <bullet list, or "none">
+
+Anything before the last `VERDICT:` line is dropped; a reply with no `VERDICT:` line at all is
+recorded as `error` with the whole reply as its summary. `get_reviews(plan_id)` /
 `GET /api/plans/{id}` read every verdict and finding back. The intended loop: read the plan-level
 review's oversights, then turn each one into a follow-up node (or plan) rather than editing by
 hand — reviews describe gaps, they don't fill them.

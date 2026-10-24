@@ -19,7 +19,7 @@ from starlette.routing import Route
 from . import bootstrap
 from .harness.registry import HarnessDefaults, HarnessRegistry
 from .engine import Bus, ConflictCache, Engine, EngineConfig
-from .mcp_tools import build_mcp, run_node_review, run_plan_review
+from .mcp_tools import build_mcp
 from .store import PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
@@ -512,7 +512,7 @@ def create_app(settings: Settings) -> FastAPI:
         plan's review agent; 400s with a clear message if neither is set.
         """
         try:
-            r = await run_node_review(engine, plan_id, node_id, body.agent if body else None)
+            r = await engine.review_now(plan_id, node_id, body.agent if body else None)
         except PlanError as e:
             raise _err(e) from e
         return {"review": review_view(r)}
@@ -525,7 +525,7 @@ def create_app(settings: Settings) -> FastAPI:
         source (that is the per-node review's job). body.agent as in review_node_now.
         """
         try:
-            r = await run_plan_review(engine, plan_id, body.agent if body else None)
+            r = await engine.review_now(plan_id, None, body.agent if body else None)
         except PlanError as e:
             raise _err(e) from e
         return {"review": review_view(r)}

@@ -32,9 +32,12 @@ jobs:
 
       - run: uv sync
 
-      # Needs no server and no network: the OpenAI-compatible harness against a scripted fake.
+      # Needs no server and no network: the OpenAI-compatible harness against a scripted fake,
+      # and the reviewer reply parser.
       - name: Harness tests
-        run: uv run python tests/test_openai_harness.py
+        run: |
+          uv run python tests/test_openai_harness.py
+          uv run python tests/test_review_format.py
 
       # The rest drive a real server. Mock agents only, so no API key and no token spend.
       - name: Start a mock server

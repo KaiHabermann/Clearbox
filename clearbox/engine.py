@@ -49,13 +49,13 @@ import asyncio
 import difflib
 import logging
 import os
-import re
 import secrets
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import reviews
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
 from .harness.tools import IGNORED_DIRS
@@ -193,62 +193,6 @@ create_plan, add_node, add_edge, remove_edge, remove_node, update_node and get_p
 list_agents and report_progress for your own node. Every sub-node runs on your own agent; you
 cannot pick another one, start or stop plans, or touch any other plan.
 """.strip()
-
-RUN_TESTS_NOTE = """
-Run the test suite before you give a verdict. It is the part of a review that finds what reading
-cannot: a plan that changes behaviour without updating the tests asserting the old behaviour is
-exactly the failure this catches.
-
-{tests}
-
-Report every failure as a finding, with the assertion text. A failing test makes the verdict
-`concerns` at best, even when the change itself looks right. Do NOT fix the test or the code --
-you are reviewing, and someone else decides what to change. If the suite cannot be run at all,
-say so in your summary instead of quietly skipping it.
-""".strip()
-
-VERDICT_FORMAT = """
-End your final message with a line of exactly the form:
-VERDICT: ok | concerns | error
-then a short summary paragraph, a blank line, and concrete findings as a bullet list (or none).
-""".strip()
-
-REVIEW_SYSTEM_APPEND = """
-You are reviewing one already-finished step of a larger plan; you did not do the step and you
-must not touch it. Judge only whether the diff below does what the node was asked to do --
-correctness, obvious bugs, leftovers. Diff coverage depends on the path. For the node's
-declared file scope (listed in the prompt when it has one) the diff is complete: every change to
-those paths is shown however it was made, so a change missing there really was not made. Outside
-that scope the diff is best-effort, file-tool writes only: anything written via bash or another
-shell-out is not shown, so the absence of a change there is not evidence of anything. Other nodes handle other work; do not comment on scope beyond this node. You have
-read-only tools and a shell for extra context and for running the tests -- do not modify anything.
-
-Other nodes of this plan may still be working in the same tree while you review, so a test
-failure is not automatically this node's fault. Say which failures you can tie to this change
-and which you cannot.
-""".strip() + "\n\n" + RUN_TESTS_NOTE + "\n\n" + VERDICT_FORMAT
-
-PLAN_REVIEW_SYSTEM_APPEND = """
-You are reviewing a finished plan as a whole, not any one step, and the plan is already
-complete. You are not shown diffs or source code and should not need to open any file -- this is
-an intent-level review, not a code review. You see the plan's own title and description (what it
-set out to do) and, for every node of its tree, that node's title, description, result summary
-and step-review verdict (if it has one).
-
-Ask: what did the plan set out to do, and is anything missing, duplicated, or contradicted? Did
-one step report something that undermines another step's assumption? Was anything the plan
-description called for never actually done, even if every individual step reports success? Do
-not re-judge individual steps' code or re-open scope decisions already settled by the plan; you
-have read-only tools and a shell for extra context and for running the tests, and must not
-modify anything.
-
-The suite is the one place this review does touch the code, and it is where whole-plan damage
-shows up: a plan can change behaviour step by step, with every step correct on its own, and
-leave a test asserting the behaviour it just replaced. Nobody sees that from the results alone.
-""".strip() + "\n\n" + RUN_TESTS_NOTE + "\n\n" + VERDICT_FORMAT
-
-_VERDICT_RE = re.compile(r"VERDICT:\s*(ok|concerns|error)", re.IGNORECASE)
-
 
 def is_user_node(node: dict[str, Any]) -> bool:
     """Whether a node row is the user's own job (``kind='user'``; NULL means 'agent')."""
@@ -930,86 +874,9 @@ class Engine:
             profile = self._review_profile(plan_id)
             if profile is None:
                 continue  # review agent was removed while queued
-            task = asyncio.create_task(self._run_review(plan_id, node_id, profile))
-            self._review_tasks[(plan_id, node_id)] = task
+            self._start_review(plan_id, node_id, profile)
             changed = True
         return changed
-
-    def _review_prompt(self, plan_id: int, node_id: int) -> str:
-        node = self.store.get_node(plan_id, node_id)
-        parts = [
-            f"Node: {node['title']}",
-            f"Task description:\n{node['description'] or '(no further description)'}",
-            f"Result summary the node reported:\n{(node['result'] or '').strip() or '(none)'}",
-        ]
-        files = self.store.node_files(plan_id, node_id)
-        if files:
-            parts.append(
-                "Declared file scope (diff coverage is complete for these paths; a directory "
-                "covers everything below it):\n" + "\n".join(f"  - {f['path']}" for f in files)
-            )
-        parts.append(
-            "Unified diffs captured for this node (complete for the declared scope; elsewhere "
-            "file-tool writes only, and files written there via bash are not shown):"
-            if files else
-            "Unified diffs captured for this node (file-tool writes only; a node may have "
-            "written other files via bash that are not shown here):"
-        )
-        for d in self.store.node_diffs(plan_id, node_id):
-            parts.append(f"--- {d['path']} ---\n{d['diff']}")
-        return "\n\n".join(parts)
-
-    def _parse_review(self, text: str) -> tuple[str, str, str | None]:
-        """A reviewer's final message -> (verdict, summary, findings or None)."""
-        m = _VERDICT_RE.search(text)
-        verdict = m.group(1).lower() if m else "concerns"
-        rest = (text[:m.start()] + text[m.end():] if m else text).strip()
-        summary, _, findings = rest.partition("\n\n")
-        return verdict, summary.strip(), (findings.strip() or None)
-
-    async def _run_review(self, plan_id: int, node_id: int, profile: dict[str, Any]) -> None:
-        key = (plan_id, node_id)
-        try:
-            harness = self.harnesses.review_harness_for(profile)
-            job = AgentJob(
-                plan_id=plan_id,
-                node_id=node_id,
-                prompt=self._review_prompt(plan_id, node_id),
-                system_append=REVIEW_SYSTEM_APPEND.format(tests=self.tests_note(plan_id)),
-                cwd=self.plan_workdir(plan_id),
-                profile=profile,
-                node_title=self.store.get_node(plan_id, node_id)["title"],
-            )
-            self._emit(plan_id, node_id, "system",
-                       {"text": f"review: {self.harnesses.label(profile)}", "review": True})
-            result: dict[str, Any] | None = None
-            async with aclosing(harness.run(job)) as stream:
-                async for kind, data in stream:
-                    if kind == "usage":
-                        continue  # a review's tokens are the node's own cost, counted below only
-                    if kind == "result":
-                        result = data
-                    self._emit(plan_id, node_id, kind, {**data, "review": True})
-                    if result is not None:
-                        break
-            if result is None or result.get("is_error"):
-                errs = (result or {}).get("errors") or [(result or {}).get("text") or "review failed"]
-                self.store.set_review(plan_id, node_id, "error", summary="; ".join(map(str, errs)),
-                                      agent_name=self.harnesses.agent_name(profile))
-            else:
-                verdict, summary, findings = self._parse_review(result.get("text", ""))
-                self.store.set_review(plan_id, node_id, verdict, summary=summary, findings=findings,
-                                      agent_name=self.harnesses.agent_name(profile),
-                                      tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 -- a review must never fail the node it reviews
-            log.exception("review for node %s failed", key)
-            self.store.set_review(plan_id, node_id, "error", summary=f"{type(e).__name__}: {e}")
-        finally:
-            self._review_tasks.pop(key, None)
-            self.notify_plan(plan_id)
-            self.kick()
 
     # -------------------------------------------------------------- plan review
     def _maybe_queue_plan_review(self, plan_id: int) -> bool:
@@ -1039,16 +906,6 @@ class Engine:
             task.cancel()
         self.store.clear_review(plan_id, None)
 
-    def request_plan_review(self, plan_id: int) -> None:
-        """Queue the whole-plan review on demand, bypassing the once-per-completion guard: the
-        REST/MCP trigger calls this so a finished plan can be re-reviewed after fixes without
-        re-running any node. ``plan_id`` may be any node of the tree; the review is always keyed
-        to its root."""
-        root_id = self.store.root_of(plan_id)["id"]
-        self._cancel_plan_review(root_id)
-        self._plan_review_queue.append(root_id)
-        self.kick()
-
     def _spawn_plan_reviews(self) -> bool:
         """Start queued whole-plan reviews up to the free share of ``max_concurrency``."""
         changed = False
@@ -1057,75 +914,53 @@ class Engine:
             profile = self._review_profile(plan_id)
             if profile is None:
                 continue  # review agent was removed while queued
-            task = asyncio.create_task(self._run_plan_review(plan_id, profile))
-            self._plan_review_tasks[plan_id] = task
+            self._start_review(plan_id, None, profile)
             changed = True
         return changed
 
-    def _plan_review_prompt(self, plan_id: int) -> str:
-        plan = self.store.get_plan(plan_id)
-        parts = [
-            f"Plan: {plan['title']}",
-            f"Description:\n{plan['description'] or '(no further description)'}",
-            "Every node of the plan tree (including nested subplans), each with its own "
-            "description, result summary and step-review verdict if it has one:",
-        ]
-        for pid in sorted(self.store.descendant_plans(plan_id)):
-            for n in self.store.nodes(pid):
-                review = self.store.review(pid, n["node_id"])
-                verdict = review["verdict"] if review else "(not reviewed)"
-                parts.append(
-                    f"--- [{pid}:{n['node_id']}] {n['title']} ---\n"
-                    f"Description: {n['description'] or '(none)'}\n"
-                    f"Result: {(n['result'] or '').strip() or '(none)'}\n"
-                    f"Step review verdict: {verdict}"
-                )
-        return "\n\n".join(parts)
+    def _start_review(self, plan_id: int, node_id: int | None, profile: dict[str, Any]) -> asyncio.Task:
+        """Run ``reviews.run_review`` as a tracked task, so ``_cancel_review`` /
+        ``_cancel_plan_review`` drop it when what it reviews runs again; node_id=None is the
+        whole-plan review."""
+        tasks, key = ((self._plan_review_tasks, plan_id) if node_id is None
+                      else (self._review_tasks, (plan_id, node_id)))
+        task = asyncio.create_task(reviews.run_review(self, plan_id, node_id, profile))
+        tasks[key] = task
 
-    async def _run_plan_review(self, plan_id: int, profile: dict[str, Any]) -> None:
-        # Plan-level events have no real node: 0 is never a valid node_id (they start at 1),
-        # so it is a safe sentinel for streaming this session like a node's own.
-        try:
-            harness = self.harnesses.review_harness_for(profile)
-            job = AgentJob(
-                plan_id=plan_id,
-                node_id=0,
-                prompt=self._plan_review_prompt(plan_id),
-                system_append=PLAN_REVIEW_SYSTEM_APPEND.format(tests=self.tests_note(plan_id)),
-                cwd=self.plan_workdir(plan_id),
-                profile=profile,
-                node_title=self.store.get_plan(plan_id)["title"],
-            )
-            self._emit(plan_id, 0, "system",
-                       {"text": f"plan review: {self.harnesses.label(profile)}", "review": True})
-            result: dict[str, Any] | None = None
-            async with aclosing(harness.run(job)) as stream:
-                async for kind, data in stream:
-                    if kind == "usage":
-                        continue
-                    if kind == "result":
-                        result = data
-                    self._emit(plan_id, 0, kind, {**data, "review": True})
-                    if result is not None:
-                        break
-            if result is None or result.get("is_error"):
-                errs = (result or {}).get("errors") or [(result or {}).get("text") or "review failed"]
-                self.store.set_review(plan_id, None, "error", summary="; ".join(map(str, errs)),
-                                      agent_name=self.harnesses.agent_name(profile))
-            else:
-                verdict, summary, findings = self._parse_review(result.get("text", ""))
-                self.store.set_review(plan_id, None, verdict, summary=summary, findings=findings,
-                                      agent_name=self.harnesses.agent_name(profile),
-                                      tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 -- a review must never fail the plan it reviews
-            log.exception("plan review for plan %s failed", plan_id)
-            self.store.set_review(plan_id, None, "error", summary=f"{type(e).__name__}: {e}")
-        finally:
-            self._plan_review_tasks.pop(plan_id, None)
-            self.notify_plan(plan_id)
+        def done(t: asyncio.Task) -> None:
+            if tasks.get(key) is t:
+                del tasks[key]
             self.kick()
+        task.add_done_callback(done)
+        return task
+
+    async def review_now(self, plan_id: int, node_id: int | None,
+                         agent: int | str | None = None) -> dict[str, Any] | None:
+        """Review a node (or, node_id=None, the plan as a whole) right now and return the new
+        review row: the on-demand trigger behind MCP review_node / review_plan and REST. Same
+        session as an automatic review, on ``agent`` for this run only, else the plan's review
+        agent (inherited like ``_review_profile``). Replaces a queued or running review of the
+        same thing. Does not wait for a slot of ``max_concurrency``: someone asked for it now."""
+        if node_id is None:
+            self.store.get_plan(plan_id)
+        else:
+            self.store.get_node(plan_id, node_id)
+        profile = self.store.resolve_profile_ref(agent) if agent is not None else self._review_profile(plan_id)
+        if profile is None:
+            raise PlanError(
+                f"plan {plan_id} has no review agent set; pass agent=<name|id> to review it this once, "
+                "or set_plan_review_agent to enable automatic reviewing"
+            )
+        if node_id is None:
+            self._cancel_plan_review(plan_id)
+        else:
+            self._cancel_review(plan_id, node_id)
+        task = self._start_review(plan_id, node_id, profile)
+        await asyncio.wait({task})
+        if task.cancelled():
+            what = f"plan {plan_id}" if node_id is None else f"node ({plan_id}, {node_id})"
+            raise PlanError(f"review of {what} was cancelled: it is running again, or the server is stopping")
+        return self.store.review(plan_id, node_id)
 
     def _fail_misconfigured(self, plan_id: int, node_id: int, message: str) -> None:
         """A profile that cannot even build its harness fails the node, no retry loop."""

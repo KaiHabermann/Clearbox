@@ -5,10 +5,11 @@ a rework brief, the brief reaches the agent's prompt (the thing a silent
 regression would break invisibly), the node completes again, and the guard rails
 hold -- no rework of a running node, and no rework with nothing to act on.
 
-Mock agents write no files, so they produce no diff and therefore no step review.
-The review-driven variant of rework (brief taken from the review findings instead
-of from explicit instructions) is not covered here; it needs an agent that really
-edits something.
+Mock agents write no files, so the review-driven part gets its diff from the test
+itself: the node declares a file and the test writes it while the (slowed-down)
+mock runs. That node is then reviewed automatically and on demand, both must leave
+the same review shape in get_reviews (one review implementation, two triggers), and
+a rework without instructions must carry the review into the prompt.
 
 Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_rework.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
@@ -94,4 +95,83 @@ async def main():
             rest(f"/api/plans/{pid}", "DELETE")
 
 
+REVIEW_KEYS = {"plan_id", "node_id", "verdict", "summary", "findings", "agent_name", "tokens_in", "tokens_out"}
+
+
+def same_shape(auto, manual, what):
+    """An automatic and an on-demand review of the same thing must look alike."""
+    assert auto and manual, (what, auto, manual)
+    assert REVIEW_KEYS <= set(auto) and set(auto) == set(manual), (what, sorted(auto), sorted(manual))
+    for k in ("plan_id", "node_id", "verdict", "summary", "findings", "agent_name"):
+        assert auto[k] == manual[k], (what, k, auto[k], manual[k])
+    # the mock reviewer answers without a VERDICT line: recorded as error, whole reply as summary
+    assert auto["verdict"] == "error" and auto["summary"] and auto["findings"] is None, (what, auto)
+
+
+async def reviews():
+    tag = str(int(time.time() * 1000))[-8:]
+    # speed 1: the mock takes seconds, long enough for the test to write the declared file
+    _, slow = rest("/api/agents", "POST", {"name": f"rw-slow-{tag}", "harness": "mock", "params": {"speed": 1}})
+    _, rev = rest("/api/agents", "POST", {"name": f"rw-rev-{tag}", "harness": "mock", "params": {"speed": 20}})
+    work = wd()
+    async with Client(URL + "/mcp") as c:
+        async def call(name, /, **a):
+            r = await c.call_tool(name, a)
+            if r.is_error:
+                raise RuntimeError(r.content[0].text)
+            sc = r.structured_content
+            return sc.get("result", sc) if sc is not None else json.loads(r.content[0].text)
+
+        pid = await call("create_plan", title="Review test", working_directory=work)
+        a = (await call("add_node", plan_id=pid, title="Write out", description="write out.txt",
+                        files=["out.txt"], agent=slow["name"]))[1]
+        await call("set_plan_review_agent", plan_id=pid, agent=rev["name"])
+        try:
+            await call("start_plan", plan_id=pid)
+            end = time.time() + 30
+            while rest(f"/api/plans/{pid}")[1]["nodes"][0]["status"] != "running":
+                assert time.time() < end, "node never started"
+                time.sleep(0.05)
+            with open(os.path.join(work, "out.txt"), "w") as f:  # snapshot is taken: this is a diff
+                f.write("hello\n")
+            wait_for(pid, "done")
+
+            end = time.time() + 30
+            while True:
+                got = await call("get_reviews", plan_id=pid)
+                if got["node_reviews"] and got["plan_review"]:
+                    break
+                assert time.time() < end, f"automatic reviews never arrived: {got}"
+                time.sleep(0.2)
+            auto_node, auto_plan = got["node_reviews"][0], got["plan_review"]
+            print("automatic reviews:", auto_node["verdict"], "/", auto_plan["verdict"])
+
+            manual = await call("review_node", plan_id=pid, node_id=a)  # falls back to the plan's reviewer
+            same_shape(auto_node, manual, "node review")
+            code, body = rest(f"/api/plans/{pid}/review", "POST", {"agent": rev["name"]})
+            assert code == 200, (code, body)
+            got = await call("get_reviews", plan_id=pid)
+            same_shape(auto_node, got["node_reviews"][0], "node review via get_reviews")
+            same_shape(auto_plan, got["plan_review"], "plan review")
+            print("on-demand reviews match the automatic ones: yes")
+
+            # both review sessions stream into the transcript, marked as reviews
+            _, nd = rest(f"/api/plans/{pid}/nodes/{a}")
+            assert any(e["data"].get("review") for e in nd["events"]), "review left no transcript"
+
+            # rework with no instructions: the brief is the review's
+            code, body = rest(f"/api/plans/{pid}/nodes/{a}/rework", "POST", {})
+            assert code == 200, (code, body)
+            _, ctx = rest(f"/api/plans/{pid}/nodes/{a}/context")
+            assert "REWORK" in ctx["context"] and auto_node["summary"] in ctx["context"], ctx["context"][-400:]
+            print("review findings reached the rework prompt: yes")
+            await call("stop_plan", plan_id=pid)
+            print("reviews OK")
+        finally:
+            rest(f"/api/plans/{pid}", "DELETE")
+            for p in (slow, rev):
+                rest(f"/api/agents/{p['id']}", "DELETE")
+
+
 asyncio.run(main())
+asyncio.run(reviews())
