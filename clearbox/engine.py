@@ -50,6 +50,7 @@ import difflib
 import logging
 import os
 import re
+import secrets
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -184,6 +185,16 @@ add_node / add_edge on the returned plan id. Those sub-nodes are executed by oth
 you finish, so in that case do only the groundwork yourself and describe the breakdown.
 """.strip()
 
+# Built-in workers only: their clearbox tools come from the scoped agent endpoint, not /mcp
+# (see mcp_tools.build_mcp). External agents use /mcp and get EXPAND_HINT alone.
+EXPAND_SCOPE_NOTE = """
+Your clearbox tools reach only that subplan and the plans nested inside it: create_plan, add_node,
+add_edge, remove_edge, remove_node, update_node, set_node_kind, set_node_files,
+set_node_results_from and get_plan, plus list_agents and report_progress for your own node. Every
+sub-node runs on your own agent; you cannot pick another one, start or stop plans, or touch any
+other plan.
+""".strip()
+
 RUN_TESTS_NOTE = """
 Run the test suite before you give a verdict. It is the part of a review that finds what reading
 cannot: a plan that changes behaviour without updating the tests asserting the old behaviour is
@@ -271,7 +282,9 @@ class Bus:
 class EngineConfig:
     workdir: str = "workspace"
     max_concurrency: int = 3
-    expose_mcp_to_agents: bool = True
+    # base url of the scoped agent MCP endpoint (".../mcp-agent"); each built-in run gets
+    # "<agent_mcp_url>/<token>". None = built-in agents get no clearbox tools (--no-agent-mcp).
+    agent_mcp_url: str | None = None
     server_port: int = 8765   # the port this server listens on; agents are told to keep clear of it
 
 
@@ -292,6 +305,9 @@ class Engine:
         self._task_profiles: dict[tuple[int, int], int | None] = {}
         # root plan id each running builtin task belongs to, for the per-plan max_parallel cap
         self._task_roots: dict[tuple[int, int], int] = {}
+        # token -> (plan_id, node_id, profile id) of the built-in run it was minted for; that
+        # run's agent reaches the scoped MCP endpoint with it. Revoked when the run ends.
+        self._agent_tokens: dict[str, tuple[int, int, int | None]] = {}
         # round-robin cursor into started_root_plans(): which root gets first pick of a free
         # slot next tick, so the oldest plan does not always take every slot (see _spawn_round_robin)
         self._rr_index = 0
@@ -1201,10 +1217,14 @@ class Engine:
     async def _run_builtin(self, plan_id: int, node_id: int, profile: dict[str, Any] | None,
                            harness: Harness) -> None:
         key = (plan_id, node_id)
+        token = None
         try:
             system_append = worker_system_append(profile, self.tests_note(plan_id))
-            if self.config.expose_mcp_to_agents:
-                system_append += "\n\n" + EXPAND_HINT.format(plan_id=plan_id, node_id=node_id)
+            if self.config.agent_mcp_url:
+                token = secrets.token_urlsafe(24)
+                self._agent_tokens[token] = (plan_id, node_id, profile["id"] if profile else None)
+                system_append += ("\n\n" + EXPAND_HINT.format(plan_id=plan_id, node_id=node_id)
+                                  + "\n" + EXPAND_SCOPE_NOTE)
             job = AgentJob(
                 plan_id=plan_id,
                 node_id=node_id,
@@ -1213,6 +1233,7 @@ class Engine:
                 cwd=self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_node(plan_id, node_id)["title"],
+                mcp_url=f"{self.config.agent_mcp_url}/{token}" if token else None,
             )
             result: dict[str, Any] | None = None
             # aclosing + the break below: the "result" event finishes the node, so we never wait
@@ -1248,10 +1269,16 @@ class Engine:
             self._emit(plan_id, node_id, "error", {"text": f"{type(e).__name__}: {e}"})
             self._finish(plan_id, node_id, ok=False, text=f"{type(e).__name__}: {e}")
         finally:
+            self._agent_tokens.pop(token, None)
             self._tasks.pop(key, None)
             self._task_profiles.pop(key, None)
             self._task_roots.pop(key, None)
             self.kick()
+
+    def agent_run(self, token: str) -> tuple[int, int, int | None] | None:
+        """(plan_id, node_id, profile id) of the running built-in node a scoped-endpoint token
+        was minted for, or None once that run has ended (or for a token never minted)."""
+        return self._agent_tokens.get(token)
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
         self._record_diffs(plan_id, node_id)

@@ -46,14 +46,12 @@ class ClaudeSdkHarness:
         permission_mode: str = "acceptEdits",
         model: str | None = None,
         max_turns: int | None = None,
-        mcp_url: str | None = None,
         allowed_tools: list[str] | None = None,
         profile: dict[str, Any] | None = None,
     ):
         self.permission_mode = permission_mode
         self.model = model
         self.max_turns = max_turns
-        self.mcp_url = mcp_url
         self.allowed_tools = allowed_tools or []
         self.system_append = ""
         self.profile = profile
@@ -84,8 +82,8 @@ class ClaudeSdkHarness:
 
         mcp_servers: dict[str, Any] = {}
         allowed = list(self.allowed_tools)
-        if self.mcp_url:
-            mcp_servers["clearbox"] = {"type": "http", "url": self.mcp_url}
+        if job.mcp_url:
+            mcp_servers["clearbox"] = {"type": "http", "url": job.mcp_url}
             allowed.append("mcp__clearbox")
 
         system_append = job.system_append

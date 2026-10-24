@@ -1,4 +1,4 @@
-"""FastAPI app: REST + Server-Sent Events for the UI, MCP at /mcp."""
+"""FastAPI app: REST + Server-Sent Events for the UI, MCP at /mcp (and /mcp-agent/<token> for workers)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.routing import Route
 
 from . import bootstrap
 from .harness.registry import HarnessDefaults, HarnessRegistry
@@ -47,6 +48,11 @@ class Settings:
     def mcp_url(self) -> str:
         host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
         return f"http://{host}:{self.port}/mcp"
+
+    @property
+    def agent_mcp_url(self) -> str:
+        """Base of the scoped endpoint built-in worker agents get; the engine appends a run's token."""
+        return self.mcp_url + "-agent"
 
 
 class StartBody(BaseModel):
@@ -172,6 +178,21 @@ class FileScope:
     reviews: dict[tuple[int, int], dict[str, Any]]
 
 
+class AgentTokenGate:
+    """ASGI wrapper for /mcp-agent/{token}: a token that names no running built-in node (never
+    minted, or its run has ended) gets a 404 before any MCP traffic. The tools check it again,
+    since a run can end between two calls of one session."""
+
+    def __init__(self, engine: Engine, app: Any):
+        self.engine, self.app = engine, app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if self.engine.agent_run(scope["path_params"]["token"]) is None:
+            await JSONResponse({"detail": "unknown or expired agent token"}, status_code=404)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 def review_view(r: dict[str, Any] | None) -> dict[str, Any] | None:
     """A review row as the UI/REST sees it: verdict, summary, findings, agent, when. None if unreviewed."""
     if r is None:
@@ -199,7 +220,6 @@ def create_app(settings: Settings) -> FastAPI:
         permission_mode=settings.permission_mode,
         model=settings.model,
         max_turns=settings.max_turns,
-        mcp_url=settings.mcp_url if settings.expose_mcp_to_agents else None,
         mock_speed=settings.mock_speed,
         default_profile=default["id"],
     ))
@@ -211,13 +231,19 @@ def create_app(settings: Settings) -> FastAPI:
         EngineConfig(
             workdir=settings.workdir,
             max_concurrency=settings.max_concurrency,
-            expose_mcp_to_agents=settings.expose_mcp_to_agents,
+            agent_mcp_url=settings.agent_mcp_url if settings.expose_mcp_to_agents else None,
             server_port=settings.port,
         ),
     )
-    mcp = build_mcp(engine)
+    mcp, agent_mcp = build_mcp(engine)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        host=settings.host,
+    )
+    agent_mcp_app = agent_mcp.streamable_http_app(
+        streamable_http_path="/mcp-agent/{token}",
         stateless_http=True,
         json_response=True,
         host=settings.host,
@@ -225,7 +251,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with mcp.session_manager.run():
+        async with mcp.session_manager.run(), agent_mcp.session_manager.run():
             await engine.start()
             try:
                 yield
@@ -239,6 +265,8 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp
+    (agent_route,) = agent_mcp_app.routes
+    app.router.routes.append(Route(agent_route.path, endpoint=AgentTokenGate(engine, agent_route.endpoint)))
 
     def _err(e: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(e))

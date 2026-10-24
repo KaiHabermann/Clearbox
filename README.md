@@ -119,10 +119,11 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
   node done, see [User-job nodes](#user-job-nodes-a-step-a-person-does).
 * **Subplans**: a node with a subplan skips the agent; when it is reached its subplan runs, and the
   node is done once the whole subplan is done (its result summarises the subplan's final nodes).
-  Built-in agents also get the MCP tools, so an agent can decide mid-run that its node is too big
+  Built-in agents also get MCP tools, so an agent can decide mid-run that its node is too big
   and *expand* it into a subplan (`create_plan(parent_plan_id=…, parent_node_id=…)`); the node then
   finishes after that subplan (disable with `--no-agent-mcp`). `openai` agents get the same tools
-  through a built-in MCP client, prefixed `vc_` (`vc_create_plan`, …).
+  through a built-in MCP client, prefixed `vc_` (`vc_create_plan`, …). These are a restricted set
+  on their own endpoint, see [Worker agents' MCP tools](#worker-agents-mcp-tools).
 * All agents of one plan tree share a working directory: `<workdir>/plan-<root id>`
   (default `./workspace/plan-N`).
 * A failed node blocks its dependents. Use **Retry** in the UI. **Stop** cancels running built-in
@@ -363,6 +364,30 @@ $env:OPENAI_API_KEY = "sk-…"; uv run clearbox --agent-profile openai   # every
 | `max_parallel` | Max nodes running on this profile at once, across all plans (on top of `--max-concurrency`). Useful for a local GPU. | no limit |
 | `description` | Free text for humans. | `""` |
 
+### Worker agents' MCP tools
+
+A built-in worker never sees the `/mcp` endpoint your own session uses. When the engine starts a
+built-in node it mints a random token for that run and hands the agent
+`http://127.0.0.1:<port>/mcp-agent/<token>` instead; the token names the node and is revoked the
+moment the run ends (finished, failed or stopped), after which the endpoint answers 404, as it
+does for a token it never minted. That endpoint serves only what expanding a node needs:
+`create_plan`, `add_node`, `add_edge`, `remove_edge`, `remove_node`, `update_node`,
+`set_node_kind`, `set_node_files`, `set_node_results_from` and `get_plan`, plus read-only
+`list_agents` and `report_progress` for the agent's own node. Every plan argument must be inside
+the node's own subtree: `create_plan` attaches a subplan to the agent's own node or to a node of a
+subplan below it, and the other tools work only on those subplans. There is no `start_plan` /
+`stop_plan`, no agent-profile admin, no review, rework or working-directory tool, no
+`claim_next_node` / `complete_node` / `fail_node`, and no way to pick an agent: `add_node` takes no
+`agent` and there is no `set_node_agent`. Instead a subplan a worker creates gets **the creating
+node's resolved agent profile as its plan default**, so expanding a node never runs the sub-work on
+a more capable agent than the node itself had (see [Which agent runs a node](#which-agent-runs-a-node)).
+Reviewers get no clearbox tools at all; external agents claiming over `/mcp` are trusted like you.
+
+This closes the tool layer, not the machine: an agent with capability `run` or `full` has a shell
+and can reach `/mcp` on localhost directly. The scoping protects `read` and `edit` agents, and
+stops a prompt injection from steering an agent through its own clearbox tools; it is no sandbox
+for a shell-capable agent.
+
 ### Capability: what an agent may do
 
 A profile's `capability` is one setting that means the same thing on every harness; the registry
@@ -423,6 +448,10 @@ the CLI-configured harness (`claude`, or `mock` with `--mock`) — exactly what 
 agent configuration did before profiles existed. The choice is made each time a node starts, so
 editing a profile or an assignment affects the next node to start, not running ones.
 
+A subplan that a **worker agent** creates by expanding its node starts with that node's resolved
+profile as its plan default, so its nodes run on the same agent as the node that made them unless
+you change it (see [Worker agents' MCP tools](#worker-agents-mcp-tools)).
+
 In the UI the node drawer shows the resolved agent and where it came from (*set on this node*,
 *plan default*, *inherited from plan N*, *server default*) and can override it; the topbar sets the
 plan's default for the plan and its subplans. Graph nodes get a coloured chip only when their agent
@@ -456,7 +485,7 @@ placeholder key when none is configured, since they rarely check it.
 | `glob(pattern)` | Find files, e.g. `**/*.py`, newest first. | ✓ |
 | `grep(pattern, path, glob, max_results=100)` | Regex search over file contents → `path:line: text`. | ✓ |
 | `bash(command, timeout_ms=120000)` | Run a shell command (`cmd.exe` on Windows, `/bin/sh` elsewhere), max 600 000 ms; kills the process tree on timeout. | |
-| `vc_*` | The clearbox MCP tools (`vc_create_plan`, `vc_add_node`, …) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
+| `vc_*` | The worker's scoped clearbox MCP tools (`vc_create_plan`, `vc_add_node`, …, see [Worker agents' MCP tools](#worker-agents-mcp-tools)) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
 
 Walks skip `.git`, `node_modules`, `__pycache__` and virtualenvs; results are truncated like the
 Claude harness's.
@@ -610,8 +639,8 @@ clearbox/
   engine.py       scheduler, node lifecycle, subplans, external-agent protocol
   bootstrap.py    built-in profiles, server default, startup banner and validation
   mcp_bridge.py   MCP client that hands the clearbox tools to non-Claude harnesses (vc_*)
-  mcp_tools.py    MCP tool definitions
-  app.py          FastAPI: REST, SSE live stream, MCP mounted at /mcp
+  mcp_tools.py    MCP tool definitions, and the scoped subset worker agents get
+  app.py          FastAPI: REST, SSE live stream, MCP mounted at /mcp and the workers' /mcp-agent/<token>
   agents.py       backwards-compatible aliases; the implementations moved to harness/
   harness/
     base.py          the event contract every harness implements (AgentJob, Harness, HarnessError)
@@ -628,6 +657,7 @@ examples/mixed_plan.py      builds a plan that mixes a cheap and a strong agent
 tests/test_flow.py          end-to-end test (run against a server started with --mock)
 tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rules
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
+tests/test_agent_scope.py   the workers' scoped MCP endpoint: subtree rule, inherited agent, token lifetime
 tests/test_openai_harness.py  the agent loop against tests/fake_openai.py (no network, no DB)
 ```
 

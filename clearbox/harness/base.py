@@ -28,6 +28,9 @@ class AgentJob:
     # or None when the server-wide CLI defaults apply.
     profile: dict[str, Any] | None = None
     node_title: str = ""
+    # The clearbox MCP endpoint this run may use: the engine's per-run scoped url
+    # (".../mcp-agent/<token>") for a worker, None for reviews and probes (no clearbox tools).
+    mcp_url: str | None = None
 
 
 class HarnessError(RuntimeError):

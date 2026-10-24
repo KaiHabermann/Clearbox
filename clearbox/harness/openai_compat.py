@@ -280,10 +280,10 @@ class _RunState:
 class OpenAiHarness:
     """Runs an agent loop against an OpenAI-compatible chat-completions endpoint."""
 
-    def __init__(self, profile: dict[str, Any] | None = None, mcp_url: str | None = None):
-        """``mcp_url`` is the clearbox MCP endpoint when the server exposes it to
-        agents (``expose_mcp_to_agents``); the profile's ``tools.mcp`` can still
-        switch the bridge off (or on, if a url is given)."""
+    def __init__(self, profile: dict[str, Any] | None = None):
+        """The clearbox MCP endpoint comes per run, as ``job.mcp_url`` (None when the
+        server runs with ``--no-agent-mcp``, and for reviews); the profile's ``tools.mcp``
+        can still switch the bridge off."""
         profile = profile or {}
         self.profile_name = profile.get("name") or "openai"
         self.params: dict[str, Any] = _as_json(profile.get("params"), {}) or {}
@@ -304,10 +304,9 @@ class OpenAiHarness:
         self._api_key = self._resolve_key(profile)
         self.max_turns = int(self.params.get("max_turns") or DEFAULT_MAX_TURNS)
         self.stream = self.params.get("stream", True) is not False
-        self.mcp_url = mcp_url
         from ..mcp_bridge import mcp_enabled  # lazy: mcp_bridge imports the harness package
 
-        self.use_mcp = bool(mcp_url) and mcp_enabled(self.tools_config, default=True)
+        self.use_mcp = mcp_enabled(self.tools_config, default=True)
 
     # ------------------------------------------------------------------ setup
 
@@ -519,13 +518,13 @@ class OpenAiHarness:
         toolbox = Toolbox(root=job.cwd, config=self.tools_config)
         bridge = None
         specs = toolbox.specs()
-        if self.use_mcp:
+        if self.use_mcp and job.mcp_url:
             from ..mcp_bridge import McpToolBridge
 
-            bridge = McpToolBridge(self.mcp_url)  # type: ignore[arg-type]
+            bridge = McpToolBridge(job.mcp_url)
             vc_specs = await bridge.specs()
             if not vc_specs:
-                yield "error", {"text": f"clearbox MCP tools unavailable at {self.mcp_url}; continuing without them"}
+                yield "error", {"text": "clearbox MCP tools unavailable; continuing without them"}
             specs = specs + vc_specs
         tools = [tool_param(s) for s in specs]
         messages: list[dict[str, Any]] = [

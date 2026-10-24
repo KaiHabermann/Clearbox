@@ -53,7 +53,7 @@ jobs:
       - name: End-to-end tests
         run: |
           failed=""
-          for t in test_flow test_agents_api test_file_conflicts test_mixed_run test_rework; do
+          for t in test_flow test_agents_api test_file_conflicts test_mixed_run test_rework test_agent_scope; do
             echo "::group::$t"
             uv run python "tests/$t.py" http://127.0.0.1:8765 || failed="$failed $t"
             echo "::endgroup::"

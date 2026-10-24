@@ -69,12 +69,11 @@ async def _round_trip(registry: HarnessRegistry, profile: dict[str, Any], timeou
     if kind == "mock":
         return "OK"
     if kind == "openai":
-        harness = OpenAiHarness(profile=profile, mcp_url=None)  # validates model / url / key first
+        harness = OpenAiHarness(profile=profile)  # validates model / url / key first
         return await harness.ping(PROMPT, timeout)
     if kind == "claude-sdk":
         d = registry.defaults
         harness = ClaudeSdkHarness(permission_mode="default", model=d.model, profile=profile)
-        harness.mcp_url = None
         harness.allowed_tools = []
         harness.max_turns = 1
         with tempfile.TemporaryDirectory(prefix="vc-probe-") as cwd:

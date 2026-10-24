@@ -20,7 +20,9 @@ class MockHarness:
 
     async def run(self, job: AgentJob) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         title = job.prompt.split("Your node:", 1)[-1].splitlines()[0].strip() if "Your node:" in job.prompt else "node"
-        yield "system", {"text": "mock session started", "session_id": f"mock-{job.plan_id}-{job.node_id}", "cwd": job.cwd}
+        # mcp_url (the run's scoped endpoint) is in the transcript so tests can call it as the agent would
+        yield "system", {"text": "mock session started", "session_id": f"mock-{job.plan_id}-{job.node_id}", "cwd": job.cwd,
+                         "mcp_url": job.mcp_url}
         await self._sleep(0.5, 1.5)
         yield "thinking", {"text": f"Let me figure out how to approach {title}."}
         await self._sleep(0.5, 1.5)

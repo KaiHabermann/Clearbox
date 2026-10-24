@@ -105,7 +105,6 @@ class HarnessDefaults:
     permission_mode: str = "acceptEdits"
     model: str | None = None
     max_turns: int | None = None
-    mcp_url: str | None = None           # None when expose_mcp_to_agents is off
     mock_speed: float = 1.0
     default_profile: int | str | None = None  # id or name of the server-wide default profile
 
@@ -205,8 +204,7 @@ class HarnessRegistry:
             else:
                 mode, tools = claude_access(DEFAULT_CAPABILITY, d.permission_mode)
                 self._implicit = ClaudeSdkHarness(
-                    permission_mode=mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
-                    allowed_tools=tools,
+                    permission_mode=mode, model=d.model, max_turns=d.max_turns, allowed_tools=tools,
                 )
         return self._implicit
 
@@ -230,13 +228,13 @@ class HarnessRegistry:
         if kind == "claude-sdk":
             mode, tools = claude_access(capability, d.permission_mode)
             return ClaudeSdkHarness(  # the profile's own permission_mode / tools win inside, when set
-                permission_mode=mode, model=d.model, max_turns=d.max_turns, mcp_url=d.mcp_url,
+                permission_mode=mode, model=d.model, max_turns=d.max_turns,
                 allowed_tools=tools, profile=profile,
             )
         if kind == "openai":
             if profile.get("capability"):
                 profile = {**profile, "tools": openai_tools(capability, _as_json(profile.get("tools"), {}))}
-            return OpenAiHarness(profile=profile, mcp_url=d.mcp_url)
+            return OpenAiHarness(profile=profile)
         if kind == "mock":
             params = _as_json(profile.get("params"), {}) or {}
             return MockHarness(speed=float(params.get("speed") or d.mock_speed))
@@ -260,11 +258,11 @@ class HarnessRegistry:
             mode, tools = claude_access(capability, d.permission_mode)
             return ClaudeSdkHarness(
                 permission_mode=mode, model=profile.get("model") or d.model, max_turns=d.max_turns,
-                mcp_url=None, allowed_tools=tools,
+                allowed_tools=tools,
             )
         if kind == "openai":
             return OpenAiHarness(
-                profile={**profile, "tools": openai_tools(capability)}, mcp_url=None)
+                profile={**profile, "tools": openai_tools(capability)})
         if kind == "mock":
             params = _as_json(profile.get("params"), {}) or {}
             return MockHarness(speed=float(params.get("speed") or d.mock_speed))

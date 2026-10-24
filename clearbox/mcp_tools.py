@@ -6,12 +6,12 @@ import re
 from contextlib import aclosing
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .engine import ConflictCache, Engine
 from .harness import AgentJob, HarnessError
-from .store import PlanError, public_profile, validate_working_directory
+from .store import PlanError, Store, public_profile, validate_working_directory
 
 # --------------------------------------------------------------------- reviews
 # Shared by REST (app.py) and the MCP tools below: both are on-demand triggers for the
@@ -251,7 +251,32 @@ Reviews (optional, advisory only -- never blocks a node or edits a file):
 """.strip()
 
 
-def build_mcp(engine: Engine) -> MCPServer:
+AGENT_INSTRUCTIONS = """
+Clearbox tools for an agent working on one node of a plan. They only reach the subplan of your own
+node and plans nested inside it: create_plan(title, parent_plan_id, parent_node_id) expands your
+node (pass your own plan and node id), then add_node / add_edge / update_node / ... build it and
+get_plan reads it back. Edges point from a prerequisite to the node that depends on it and pass no
+results. Every sub-node runs on your own agent, after your session ends.
+""".strip()
+
+
+def _in_subtree(store: Store, plan_id: int, node: tuple[int, int]) -> bool:
+    """Whether ``plan_id`` is the subplan of ``node`` or nested anywhere below it: the one rule
+    deciding which plans a worker agent's scoped tools may touch. Unknown plans are outside."""
+    try:
+        p = store.get_plan(plan_id)
+        while p["parent_plan_id"] is not None:
+            if (p["parent_plan_id"], p["parent_node_id"]) == node:
+                return True
+            p = store.get_plan(p["parent_plan_id"])
+    except PlanError:
+        pass
+    return False
+
+
+def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
+    """The planning server the user's own session reaches at /mcp, and the scoped server built-in
+    worker agents reach at /mcp-agent/<token> (a checked subset of the same tools)."""
     mcp = MCPServer("clearbox", instructions=INSTRUCTIONS)
     store = engine.store
 
@@ -992,4 +1017,112 @@ def build_mcp(engine: Engine) -> MCPServer:
             raise ToolError(str(e)) from e
         return "ok"
 
-    return mcp
+    # ------------------------------------------------------- worker agents
+    # The scoped server a built-in worker reaches at /mcp-agent/<token> instead of /mcp. The
+    # token names the node it runs (engine.agent_run); each tool below checks its plan against
+    # that node's subtree (_in_subtree) and then calls the planning tool of the same name.
+    agent_mcp = MCPServer("clearbox", instructions=AGENT_INSTRUCTIONS)
+
+    def _caller(ctx: Context) -> tuple[int, int, int | None]:
+        run = engine.agent_run(ctx.request_context.request.path_params["token"])
+        if run is None:
+            raise ToolError("this agent token is unknown or its run has ended")
+        return run
+
+    def _scoped(ctx: Context, plan_id: int) -> None:
+        own_plan, own_node, _ = _caller(ctx)
+        if not _in_subtree(store, plan_id, (own_plan, own_node)):
+            raise ToolError(f"plan {plan_id} is not inside the subplan of your node ({own_plan}, {own_node}); "
+                            "you can only build below your own node")
+
+    @agent_mcp.tool(name="create_plan")
+    def agent_create_plan(ctx: Context, title: str, parent_plan_id: int, parent_node_id: int,
+                          description: str = "") -> int:
+        """Expand a node into a subplan and return the new plan's id.
+
+        parent_plan_id / parent_node_id: your own node, or a node of a subplan you created. The
+        subplan runs on your own agent (its plan default), inherits the working directory and test
+        instructions, and starts by itself once your session ends; add_node / add_edge on it next.
+        """
+        plan_id, node_id, profile_id = _caller(ctx)
+        if (parent_plan_id, parent_node_id) != (plan_id, node_id):
+            _scoped(ctx, parent_plan_id)
+        pid = create_plan(title, description, parent_plan_id, parent_node_id)
+        if profile_id is not None:
+            # never let expanding a node run the sub-work on a more capable agent than the node had
+            try:
+                store.set_plan_profile(pid, profile_id)
+            except PlanError as e:
+                raise ToolError(str(e)) from e
+            engine.notify_plan(pid)
+        return pid
+
+    @agent_mcp.tool(name="add_node")
+    def agent_add_node(ctx: Context, plan_id: int, title: str, description: str = "",
+                       files: list[str] | None = None, results_from: list[int] | None = None,
+                       kind: str | None = None) -> tuple[int, int]:
+        """Add a node (one piece of work) to a subplan of yours. Returns (plan_id, node_id).
+
+        The description should be a self-contained instruction for the agent doing the work; the
+        node runs on your own agent. files (optional): the paths it will CREATE or MODIFY, relative
+        to the working directory; nodes that could run in parallel and share a file run one after
+        the other. results_from (optional): node ids of this plan whose result text it receives --
+        an edge passes nothing -- each one a node it depends on. kind="user" makes it a person's job.
+        """
+        _scoped(ctx, plan_id)
+        return add_node(plan_id, title, description, None, files, results_from, kind)
+
+    @agent_mcp.tool(name="add_edge", description=add_edge.__doc__)
+    def agent_add_edge(ctx: Context, plan_id: int, from_node_id: int, to_node_id: int) -> str:
+        _scoped(ctx, plan_id)
+        return add_edge(plan_id, from_node_id, to_node_id)
+
+    @agent_mcp.tool(name="remove_edge", description=remove_edge.__doc__)
+    def agent_remove_edge(ctx: Context, plan_id: int, from_node_id: int, to_node_id: int) -> str:
+        _scoped(ctx, plan_id)
+        return remove_edge(plan_id, from_node_id, to_node_id)
+
+    @agent_mcp.tool(name="remove_node", description=remove_node.__doc__)
+    def agent_remove_node(ctx: Context, plan_id: int, node_id: int) -> str:
+        _scoped(ctx, plan_id)
+        return remove_node(plan_id, node_id)
+
+    @agent_mcp.tool(name="update_node", description=update_node.__doc__)
+    def agent_update_node(ctx: Context, plan_id: int, node_id: int, title: str | None = None,
+                          description: str | None = None, files: list[str] | None = None,
+                          results_from: list[int] | None = None) -> str:
+        _scoped(ctx, plan_id)
+        return update_node(plan_id, node_id, title, description, files, results_from)
+
+    @agent_mcp.tool(name="set_node_kind", description=set_node_kind.__doc__)
+    def agent_set_node_kind(ctx: Context, plan_id: int, node_id: int, kind: str) -> str:
+        _scoped(ctx, plan_id)
+        return set_node_kind(plan_id, node_id, kind)
+
+    @agent_mcp.tool(name="set_node_files", description=set_node_files.__doc__)
+    def agent_set_node_files(ctx: Context, plan_id: int, node_id: int, files: list[str] | None) -> list[str]:
+        _scoped(ctx, plan_id)
+        return set_node_files(plan_id, node_id, files)
+
+    @agent_mcp.tool(name="set_node_results_from", description=set_node_results_from.__doc__)
+    def agent_set_node_results_from(ctx: Context, plan_id: int, node_id: int,
+                                    node_ids: list[int] | None) -> list[int]:
+        _scoped(ctx, plan_id)
+        return set_node_results_from(plan_id, node_id, node_ids)
+
+    @agent_mcp.tool(name="get_plan", description=get_plan.__doc__)
+    def agent_get_plan(ctx: Context, plan_id: int) -> dict[str, Any]:
+        _scoped(ctx, plan_id)
+        return get_plan(plan_id)
+
+    agent_mcp.add_tool(list_agents)
+
+    @agent_mcp.tool(name="report_progress")
+    def agent_report_progress(ctx: Context, message: str, kind: str = "text") -> str:
+        """Append a progress message to your own node's live transcript (shown in the UI). Your
+        messages and tool calls are already recorded there; use this only to narrate long-running
+        work. kind is one of: text, thinking, tool_use, tool_result, log."""
+        plan_id, node_id, _ = _caller(ctx)
+        return report_progress(plan_id, node_id, message, kind)
+
+    return mcp, agent_mcp
