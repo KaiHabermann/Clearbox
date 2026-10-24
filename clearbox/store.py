@@ -171,7 +171,7 @@ NODE_KINDS = ("agent", "user")
 CAPABILITIES = ("read", "run", "edit", "full")
 
 # agent_profiles.test_level: how much a worker agent is told to test. Prompt text
-# lives in the engine; NULL means 'standard'.
+# lives in prompts.py; NULL means 'standard'.
 TEST_LEVELS = ("none", "light", "standard", "thorough")
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps

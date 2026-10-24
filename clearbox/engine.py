@@ -46,7 +46,6 @@ The rework finishes through ``_finish`` like any run, so it is re-reviewed.
 from __future__ import annotations
 
 import asyncio
-import difflib
 import logging
 import os
 import secrets
@@ -56,9 +55,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import reviews
+from .diffs import Snapshots, file_tool_path
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
-from .harness.tools import IGNORED_DIRS
+from .prompts import EXPAND_HINT, EXPAND_SCOPE_NOTE, build_context, tests_note, worker_system_append
 from .store import PlanError, Store, validate_working_directory
 
 log = logging.getLogger("clearbox")
@@ -71,128 +71,6 @@ class ConflictCache:
     parents: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
     reach: dict[int, dict[int, set[int]]] = field(default_factory=dict)
 
-SYSTEM_APPEND = """
-You are one worker inside Clearbox, a service that executes a plan (a DAG of work items)
-node by node. You are responsible for exactly ONE node. Stay within its scope: other nodes are
-handled by other agents, before or after you. Results of earlier nodes are given to you only
-when your node asked for them.
-
-Trust your instructions. The design was settled when the plan was written, so implement what the
-node asks instead of reconsidering it. Do not re-open decisions the node already made, and do not
-widen the scope. If part of the node is genuinely wrong or impossible, do the sensible thing and
-say so plainly in your summary.
-
-Do not explore the codebase. Your node names the files it concerns: open those, plus whatever
-they directly force you to look at, and nothing else. A scoped change does not need a mental model
-of the whole project, and building one is the most common way these sessions burn their budget.
-No repository-wide searches, no reading files "for background", no re-deriving what the node
-already tells you. If you catch yourself grepping around to see how everything fits together,
-stop -- that understanding went into the plan, and the node is the part of it you need.
-
-Change files with the file tools. Every edit goes through Edit / MultiEdit / Write. Do not modify
-files from the shell: no output redirection, no `sed -i`, no `python - <<EOF` that rewrites a
-file, no scripts that patch source. Clearbox diffs your node by snapshotting its declared files
-before you start and by watching your file-tool calls, so a shell edit to a file your node did
-not declare is invisible -- it never reaches the reviewer and nobody can see what you did
-afterwards. An edit that is awkward to express as an edit is still an edit.
-
-Fix what your own change makes wrong. Staying in scope means not taking on new work; it does not
-mean leaving a comment, docstring or prompt string that your change just made false. If it sits
-in a file your node already edits, correct it and mention it in your summary. Do not defer it to
-another node on the assumption that someone else owns it -- that is how a plan ends up shipping
-statements it has already contradicted.
-
-Keep it simple. Write the smallest change that does the job and matches the surrounding code.
-No speculative abstraction, no extra configuration, no defensive scaffolding for problems nobody
-has reported.
-""".strip()
-
-SUMMARY_NOTE = """
-When you are done, end with a concise summary of what you did and what you produced (files,
-decisions, findings). That final message is handed to the nodes that depend on yours.
-""".strip()
-
-# One paragraph per agent_profiles.test_level (store.TEST_LEVELS), placed between SYSTEM_APPEND
-# and SUMMARY_NOTE for worker agents. Keep the wording in step with the Agents panel's help text.
-TEST_LEVEL_NOTES = {
-    "none": """
-Testing: none. Do not spend effort on tests; the node says what to verify, if anything does.
-""".strip(),
-    "light": """
-Testing: light. A quick sanity check that your change works -- one short script or a couple of
-cases. Do not build test suites or fixtures.
-""".strip(),
-    "standard": """
-Testing: standard. Run the existing tests that cover what you touched, and fix what you broke.
-Add a test only when you added behaviour nothing covers. Do not build new harnesses.
-
-{tests}
-""".strip(),
-    "thorough": """
-Testing: thorough. Run the full suite and add tests for the behaviour you added. A change is not
-done while a test you can run is failing.
-
-{tests}
-""".strip(),
-}
-DEFAULT_TEST_LEVEL = "standard"
-
-
-# How to run the tests, shared by the worker test levels and the reviewers. The plan's own
-# test_instructions go in verbatim; without them the agent finds out from the repository.
-TESTS_GIVEN = """
-How this project's tests are run, as the plan states it:
-
-{test_instructions}
-""".strip()
-
-TESTS_UNKNOWN = """
-Work out how this project's tests are run from the repository itself: its README, CLAUDE.md /
-AGENTS.md, CI configuration and the test files. Use what you find there; do not invent a test
-harness of your own.
-""".strip()
-
-SERVER_GUARD = """
-If you start a server to test against, pick a free high port and temp paths. Never use port
-{server_port} -- that is the Clearbox server running this plan -- or the project's real data, and
-stop the server when you are done.
-""".strip()
-
-
-def tests_note(test_instructions: str | None, server_port: int) -> str:
-    """The how-to-test paragraph(s) for one plan: its ``test_instructions`` (or the pointer to
-    the repository when it has none), then the guard keeping agents off ``server_port``."""
-    if test_instructions:
-        howto = TESTS_GIVEN.format(test_instructions=test_instructions.strip())
-    else:
-        howto = TESTS_UNKNOWN
-    return howto + "\n\n" + SERVER_GUARD.format(server_port=server_port)
-
-
-def worker_system_append(profile: dict[str, Any] | None, tests: str) -> str:
-    """The worker prompt: SYSTEM_APPEND, the test-level paragraph for ``profile`` (NULL/absent =
-    standard), then SUMMARY_NOTE. ``tests`` is the plan's tests_note, which the standard and
-    thorough levels include."""
-    level = (profile or {}).get("test_level") or DEFAULT_TEST_LEVEL
-    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL]).format(tests=tests)
-    return "\n\n".join((SYSTEM_APPEND, note, SUMMARY_NOTE))
-
-
-EXPAND_HINT = """
-If your node turns out to be too large for one session, you may break it down: call the
-clearbox MCP tool submit_plan with parent_plan_id={plan_id}, parent_node_id={node_id} and the
-sub-nodes and edges, all in one call. Those sub-nodes are executed by other agents after you
-finish, so in that case do only the groundwork yourself and describe the breakdown.
-""".strip()
-
-# Built-in workers only: their clearbox tools come from the scoped agent endpoint, not /mcp
-# (see mcp_tools.build_mcp). External agents use /mcp and get EXPAND_HINT alone.
-EXPAND_SCOPE_NOTE = """
-Your clearbox tools reach only that subplan and the plans nested inside it: submit_plan,
-create_plan, add_node, add_edge, remove_edge, remove_node, update_node and get_plan, plus
-list_agents and report_progress for your own node. Every sub-node runs on your own agent; you
-cannot pick another one, start or stop plans, or touch any other plan.
-""".strip()
 
 def is_user_node(node: dict[str, Any]) -> bool:
     """Whether a node row is the user's own job (``kind='user'``; NULL means 'agent')."""
@@ -254,14 +132,9 @@ class Engine:
         # round-robin cursor into started_root_plans(): which root gets first pick of a free
         # slot next tick, so the oldest plan does not always take every slot (see _spawn_round_robin)
         self._rr_index = 0
-        # (plan_id, node_id) -> {normalised full path: (display path, text-before-or-None)},
-        # taken for the declared files at _spawn and from tool_use events while the node runs;
-        # diffed against the current text when it finishes. _snapshot_dirs holds the declared
-        # directories (full path -> display path) rescanned at finish for added files.
-        # In memory only, like _tasks: a restart loses in-flight diffs the same way it re-queues
-        # the node.
-        self._snapshots: dict[tuple[int, int], dict[str, tuple[str, str | None]]] = {}
-        self._snapshot_dirs: dict[tuple[int, int], dict[str, str]] = {}
+        # before-texts of the files each run may change, taken at _spawn and from tool_use
+        # events; diffed by _record_diffs when the node finishes (see diffs.py)
+        self._snapshots = Snapshots()
         # review tasks run alongside node tasks but are tracked separately so a node's
         # (plan_id, node_id) task-dict slot is never mistaken for "node still running";
         # queued review requests wait here until a slot of the shared max_concurrency is free.
@@ -306,8 +179,8 @@ class Engine:
 
     # ------------------------------------------------------------------ helpers
     def _emit(self, plan_id: int, node_id: int, kind: str, data: dict[str, Any]) -> None:
-        if kind == "tool_use":
-            self._snapshot_file_tool(plan_id, node_id, data)
+        if kind == "tool_use" and (path := file_tool_path(data)):
+            self._snapshots.take((plan_id, node_id), self.plan_workdir(plan_id), path)
         if kind == "usage":
             self._add_usage(plan_id, node_id, data)
             return  # a running total, not something to show in the transcript
@@ -720,110 +593,6 @@ class Engine:
                 "other nodes) to this node, or request results from nodes it already depends on."
             )
 
-    # -------------------------------------------------------------- node diffs
-    # Two sources, unioned: the node's declared files are snapshotted at _spawn, before the agent
-    # does anything, so any change to them shows up however it was made (file tool, bash, sed);
-    # file-tool writes (Write, Edit, MultiEdit, NotebookEdit) are snapshotted as they happen, so
-    # nodes without declared files, and writes outside the declared scope, still get diffs. A
-    # shell-out write outside the declared scope stays invisible -- catching it would mean
-    # snapshotting the whole tree before every node.
-    FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
-    # one declared directory snapshots at most this many files; past it the directory is only
-    # diffed for the files already taken, and not rescanned for added ones (they would all look new)
-    MAX_DIR_SNAPSHOT_FILES = 2000
-
-    def _full_path(self, plan_id: int, path: str) -> str:
-        full = path if os.path.isabs(path) else os.path.join(self.plan_workdir(plan_id), path)
-        return os.path.normcase(os.path.abspath(full))
-
-    def _snapshot(self, plan_id: int, node_id: int, path: str) -> None:
-        """Take a file's before-text, unless this run already has it (the first snapshot wins)."""
-        snaps = self._snapshots.setdefault((plan_id, node_id), {})
-        full = self._full_path(plan_id, path)
-        if full not in snaps:
-            snaps[full] = (path, self._read_text(plan_id, path))
-
-    def _walk_dir(self, full_dir: str, display: str) -> tuple[list[str], bool]:
-        """Display paths of the files below a directory (skipping IGNORED_DIRS), and whether
-        the walk hit MAX_DIR_SNAPSHOT_FILES."""
-        out: list[str] = []
-        for d, dirs, names in os.walk(full_dir):
-            dirs[:] = sorted(x for x in dirs if x not in IGNORED_DIRS)
-            rel = os.path.relpath(d, full_dir)
-            for name in sorted(names):
-                if len(out) >= self.MAX_DIR_SNAPSHOT_FILES:
-                    return out, True
-                sub = name if rel == "." else os.path.join(rel, name)
-                out.append(os.path.join(display, sub).replace("\\", "/"))
-        return out, False
-
-    def _snapshot_declared(self, plan_id: int, node_id: int) -> None:
-        """Baseline every declared path before the run starts. A missing file snapshots as None
-        (a creation); a directory snapshots each file below it and is rescanned at finish."""
-        key = (plan_id, node_id)
-        self._snapshots[key] = {}
-        self._snapshot_dirs[key] = {}
-        for f in self.store.node_files(plan_id, node_id):
-            path = f["path"]
-            full = self._full_path(plan_id, path)
-            if not os.path.isdir(full):
-                self._snapshot(plan_id, node_id, path)
-                continue
-            files, capped = self._walk_dir(full, path.rstrip("/\\"))
-            for p in files:
-                self._snapshot(plan_id, node_id, p)
-            if capped:
-                log.warning("node %s: declared directory %s has over %d files; added files there "
-                            "will not be diffed", key, path, self.MAX_DIR_SNAPSHOT_FILES)
-            else:
-                self._snapshot_dirs[key][full] = path.rstrip("/\\")
-
-    def _snapshot_file_tool(self, plan_id: int, node_id: int, data: dict[str, Any]) -> None:
-        if data.get("name") not in self.FILE_TOOLS:
-            return
-        inp = data.get("input")
-        path = inp.get("file_path") if isinstance(inp, dict) else None
-        if path:
-            self._snapshot(plan_id, node_id, path)
-
-    def _read_text(self, plan_id: int, path: str) -> str | None:
-        """The current text of a file the node may have written, or None if it can't be read as text."""
-        full = path if os.path.isabs(path) else os.path.join(self.plan_workdir(plan_id), path)
-        try:
-            with open(full, "r", encoding="utf-8") as f:
-                return f.read()
-        except (OSError, UnicodeDecodeError):
-            return None
-
-    def _record_diffs(self, plan_id: int, node_id: int) -> None:
-        """Diff every snapshotted file against its current text and store the changed ones:
-        modified, created (before None), deleted (gone now), and files added inside a declared
-        directory."""
-        key = (plan_id, node_id)
-        snaps = self._snapshots.pop(key, None) or {}
-        for full_dir, display in self._snapshot_dirs.pop(key, {}).items():
-            for p in self._walk_dir(full_dir, display)[0]:
-                full = self._full_path(plan_id, p)
-                if full not in snaps:
-                    snaps[full] = (p, None)
-        diffs = []
-        for full, (path, before) in snaps.items():
-            after = self._read_text(plan_id, path)
-            if after is None:
-                if before is None or os.path.exists(full):
-                    continue  # never text, or no longer readable as text: nothing to show
-                after = ""  # existed, now gone: a deletion
-            if after == before:
-                continue
-            diff = "".join(difflib.unified_diff(
-                (before or "").splitlines(keepends=True), after.splitlines(keepends=True),
-                fromfile=path, tofile=path,
-            ))
-            if diff:
-                diffs.append((path, diff))
-        if diffs:
-            self.store.set_node_diffs(plan_id, node_id, diffs)
-
     # --------------------------------------------------------------- node review
     def _review_profile(self, plan_id: int) -> dict[str, Any] | None:
         """The agent profile that reviews this plan's steps: its own, else inherited from an
@@ -979,57 +748,7 @@ class Engine:
 
     # ------------------------------------------------------------------ context
     def build_context(self, plan_id: int, node_id: int) -> str:
-        node = self.store.get_node(plan_id, node_id)
-        plan = self.store.get_plan(plan_id)
-        chain = self.store.ancestors(plan_id)
-        parts = []
-        if chain:
-            root = chain[0]
-            parts.append(f"Overall goal (plan {root['plan_id']}): {root['title']}\n{root['description']}".strip())
-            parts.append("This work is nested inside:")
-            for c in chain:
-                parts.append(f"  - plan {c['plan_id']} node {c['node_id']}: {c['node_title']} — {c['node_description']}")
-            parts.append(f"Current subplan (plan {plan_id}): {plan['title']}\n{plan['description']}".strip())
-        else:
-            parts.append(f"Overall goal (plan {plan_id}): {plan['title']}\n{plan['description']}".strip())
-
-        others = [n for n in self.store.nodes(plan_id) if n["node_id"] != node_id]
-        if others:
-            parts.append("Other nodes in this plan (for orientation only, not your job):")
-            for n in others:
-                parts.append(f"  - [{n['node_id']}] {n['title']} ({n['status']})")
-
-        wanted = self.store.node_results_from(plan_id, node_id)
-        if wanted:
-            parts.append("Finished results of earlier nodes, requested by this node. Build on them; "
-                         "this work is done, do not redo or re-verify it:")
-            for w in wanted:
-                wn = self.store.get_node(plan_id, w)
-                if wn["status"] == "done":
-                    body = (wn["result"] or "(no result recorded)").strip()
-                else:
-                    body = f"(not done yet: status {wn['status']}, no result to build on)"
-                parts.append(f"--- [{w}] {wn['title']} ---\n{body}")
-
-        parts.append(f"Your node: {node['title']}\n(plan_id={plan_id}, node_id={node_id})")
-        parts.append(f"Task description:\n{node['description'] or '(no further description)'}")
-
-        files = self.store.node_files(plan_id, node_id)
-        if files:
-            parts.append(
-                "Your file scope. You may create or modify ONLY these paths (relative to the working "
-                "directory; a directory covers everything below it):\n"
-                + "\n".join(f"  - {f['path']}" for f in files)
-                + "\nYou may read any file. Every other file is owned by other nodes; do not write it."
-            )
-
-        if node["rework_brief"]:
-            parts.append(
-                "REWORK. This node already ran and its work is in the working tree. Do not redo the "
-                "step from scratch. Address exactly what is raised below, change only what that "
-                "needs, and summarise what you changed:\n" + node["rework_brief"]
-            )
-        return "\n\n".join(parts)
+        return build_context(self.store, plan_id, node_id)
 
     # ------------------------------------------------------------ builtin runs
     def _spawn(self, plan_id: int, node_id: int, profile: dict[str, Any] | None, harness: Harness) -> None:
@@ -1038,7 +757,8 @@ class Engine:
                                tokens_in=None, tokens_out=None)
         self.store.clear_node_diffs(plan_id, node_id)
         self._cancel_review(plan_id, node_id)
-        self._snapshot_declared(plan_id, node_id)
+        self._snapshots.take_declared((plan_id, node_id), self.plan_workdir(plan_id),
+                                      [f["path"] for f in self.store.node_files(plan_id, node_id)])
         self._set_status(plan_id, node_id, "running", agent_kind="builtin",
                          agent_name=self.harnesses.agent_name(profile))
         self._emit(plan_id, node_id, "system", {"text": self.harnesses.label(profile),
@@ -1118,6 +838,15 @@ class Engine:
         """The live scoped-endpoint token of a running built-in node, or None. For tests only
         (app.py serves it under --mock): nothing else may hand a token out."""
         return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
+
+    def _record_diffs(self, plan_id: int, node_id: int) -> None:
+        """Store the diffs of the run that just ended, if anything was snapshotted for it."""
+        key = (plan_id, node_id)
+        if key not in self._snapshots:
+            return
+        diffs = self._snapshots.finish(key, self.plan_workdir(plan_id))
+        if diffs:
+            self.store.set_node_diffs(plan_id, node_id, diffs)
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
         self._record_diffs(plan_id, node_id)
@@ -1204,8 +933,7 @@ class Engine:
         task = self._tasks.get((plan_id, node_id))
         if task is not None:
             await self._cancel(plan_id, node_id, task)
-        self._snapshots.pop((plan_id, node_id), None)
-        self._snapshot_dirs.pop((plan_id, node_id), None)
+        self._snapshots.discard((plan_id, node_id))
         n = self.store.get_node(plan_id, node_id)
         if n["status"] in ("running", "ready"):
             self._emit(plan_id, node_id, "system", {"text": "stopped by user"})

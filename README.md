@@ -657,11 +657,13 @@ Only do that on a network you trust.
 clearbox/
   store.py        SQLite schema + DAG operations (ids, cycle check) + agent profiles
   engine.py       scheduler, node lifecycle, subplans, external-agent protocol
+  prompts.py      what a worker agent is told: system prompt, test levels, the per-node context
+  diffs.py        before-snapshots of a node's files and the diffs taken from them when it finishes
+  reviews.py      step and plan reviews: reviewer prompts, reply parser, the review session
   bootstrap.py    built-in profiles, server default, startup banner and validation
   mcp_bridge.py   MCP client that hands the clearbox tools to non-Claude harnesses (vc_*)
   mcp_tools.py    MCP tool definitions, and the scoped subset worker agents get
   app.py          FastAPI: REST, SSE live stream, MCP mounted at /mcp and the workers' /mcp-agent/<token>
-  agents.py       backwards-compatible aliases; the implementations moved to harness/
   harness/
     base.py          the event contract every harness implements (AgentJob, Harness, HarnessError)
     claude_sdk.py    Claude Agent SDK harness
@@ -674,6 +676,7 @@ clearbox/
   static/         UI (plain HTML/CSS/JS, no build step)
 examples/demo_plan.py       builds a demo plan through MCP
 examples/mixed_plan.py      builds a plan that mixes a cheap and a strong agent
+tests/unit/                 in-process unit tests of the scheduler and store: `uv run pytest`
 tests/test_flow.py          end-to-end test (run against a server started with --mock)
 tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rules
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
@@ -722,7 +725,7 @@ it once on PyPI under *Publishing* with: owner `KaiHabermann`, repository `Clear
 `release.yml`, environment `pypi`. Before the first release the project does not exist on PyPI
 yet — add it as a *pending publisher* on your account instead, with the same four values.
 
-`.github/workflows/ci.yml` runs the same build plus the mock-agent test suite on every push and
-pull request, and installs the built wheel into a clean environment to catch a packaging mistake
-that an editable install would hide. Action versions are pinned exactly and kept current by
-Dependabot.
+`.github/workflows/ci.yml` runs the same build plus the unit tests (`uv run pytest`) and the
+mock-agent test suite on every push and pull request, and installs the built wheel into a clean
+environment to catch a packaging mistake that an editable install would hide. Action versions
+are pinned exactly and kept current by Dependabot.

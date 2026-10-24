@@ -48,3 +48,13 @@ packages = ["clearbox"]                 # includes clearbox/static/*, which the 
 [tool.hatch.build.targets.sdist]
 # Ship the source needed to build and verify the package; leave the working material out.
 include = ["clearbox", "tests", "examples", "README.md", "LICENSE", "pyproject.toml"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# Only the in-process unit tests. tests/test_*.py are scripts that drive a live server (see
+# AGENTS.md) and connect at import time, so pytest must never collect them.
+testpaths = ["tests/unit"]

@@ -39,6 +39,10 @@ jobs:
           uv run python tests/test_openai_harness.py
           uv run python tests/test_review_format.py
 
+      # The scheduler rules in-process (tests/unit): no server, a few seconds.
+      - name: Unit tests
+        run: uv run pytest
+
       # The rest drive a real server. Mock agents only, so no API key and no token spend.
       - name: Start a mock server
         run: |

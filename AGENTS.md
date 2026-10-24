@@ -1,7 +1,10 @@
 # Notes for agents working on Clearbox
 
-Tests are plain scripts in `tests/`; each file's docstring carries its exact run command. Most of
-them need a mock server of their own:
+`uv run pytest` runs the fast in-process unit tests in `tests/unit/` (the scheduler and the
+store, no server); it collects nothing else.
+
+The other tests are plain scripts in `tests/`; each file's docstring carries its exact run
+command. Most of them need a mock server of their own:
 
     uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>
     uv run python tests/<name>.py http://127.0.0.1:<free port>

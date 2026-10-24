@@ -3,7 +3,7 @@
 A built-in Claude agent reaches the service's scoped agent endpoint
 (``/mcp-agent/<token>``, see ``mcp_tools.build_mcp``) through the Claude Agent
 SDK; that is how a node "expands" itself into a subplan (see EXPAND_HINT in
-engine.py). An OpenAI-compatible model has no MCP client, so this module is one:
+prompts.py). An OpenAI-compatible model has no MCP client, so this module is one:
 it lists the endpoint's tools, turns each into a ``ToolSpec`` (the same
 provider-neutral shape ``harness/tools.py`` uses for the local toolbox) and
 forwards calls over streamable HTTP. The endpoint decides what an agent may
