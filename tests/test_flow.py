@@ -1,8 +1,8 @@
 """End-to-end test against a running server started with --mock (fast).
 
 Also covers the file-scoping surface: `files`, `conflicts` and `blocked_by` in
-get_plan and the REST node view, update_node / set_node_files / PUT .../files.
-Scheduling with files is proven in test_file_conflicts.py.
+get_plan and the REST node view, update_node / PUT .../files, and submit_plan's
+all-or-nothing plan creation. Scheduling with files is proven in test_file_conflicts.py.
 
 Run:  uv run clearbox --mock --mock-speed 20      (one shell)
       uv run python tests/test_flow.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
@@ -21,7 +21,7 @@ URL = sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('
 
 async def main():
     async with Client(URL + "/mcp") as c:
-        async def call(name, /, **a):  # positional-only: create_agent has its own `name`
+        async def call(name, /, **a):
             r = await c.call_tool(name, a)
             if r.is_error:
                 raise RuntimeError(r.content[0].text)
@@ -37,7 +37,7 @@ async def main():
         await call("add_edge", plan_id=p, from_node_id=a, to_node_id=b)
         await call("add_edge", plan_id=p, from_node_id=b, to_node_id=cc)
         # an edge only orders work; B must ask for A's result to be given it
-        await call("set_node_results_from", plan_id=p, node_id=b, node_ids=[a])
+        await call("update_node", plan_id=p, node_id=b, results_from=[a])
         try:
             await call("add_edge", plan_id=p, from_node_id=cc, to_node_id=a); print("FAIL no cycle error")
         except RuntimeError as e:
@@ -107,8 +107,19 @@ async def main():
         server_default = next(x["name"] for x in await call("list_agents") if x["default"])
         tag = str(time.time_ns())[-8:]
         fast, strong = f"flow-fast-{tag}", f"flow-strong-{tag}"
-        await call("create_agent", name=fast, harness="mock", params={"speed": 20}, max_parallel=1)
-        await call("create_agent", name=strong, harness="mock")
+        def rest(method, path, body=None):
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(URL + path, data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        # profiles are admin work: REST/UI only, not MCP
+        fast_id = rest("POST", "/api/agents", dict(name=fast, harness="mock", params={"speed": 20}, max_parallel=1))[1]["id"]
+        strong_id = rest("POST", "/api/agents", dict(name=strong, harness="mock"))[1]["id"]
         r = await call("create_plan", title="Agent resolution", working_directory=wd())
         r1 = (await call("add_node", plan_id=r, title="plain"))[1]
         r2 = (await call("add_node", plan_id=r, title="override"))[1]
@@ -121,7 +132,7 @@ async def main():
         assert view(rs, rs2) == ("node", fast)
 
         await call("set_plan_agent", plan_id=r, agent=strong)
-        await call("set_node_agent", plan_id=r, node_id=r2, agent=fast)
+        await call("update_node", plan_id=r, node_id=r2, agent=fast)
         assert view(r, r1) == ("plan", strong)
         assert view(r, r2) == ("node", fast)
         assert view(rs, rs1) == ("inherited", strong)
@@ -133,32 +144,28 @@ async def main():
         await call("set_plan_agent", plan_id=rs, agent=None)
         assert view(rs, rs1) == ("inherited", strong)
         try:
-            await call("set_node_agent", plan_id=r, node_id=r1, agent=f"no-such-{tag}"); print("FAIL unknown agent accepted")
+            await call("update_node", plan_id=r, node_id=r1, title="renamed", agent=f"no-such-{tag}")
+            print("FAIL unknown agent accepted")
         except RuntimeError as e:
             assert "unknown agent profile" in str(e), e
+        assert (await call("get_plan", plan_id=r))["nodes"][0]["title"] == "plain"  # nothing changed
+        await call("update_node", plan_id=rs, node_id=rs2, agent="")  # "" clears the override
+        assert view(rs, rs2) == ("inherited", strong)
+        await call("update_node", plan_id=rs, node_id=rs2, agent=fast)
 
-        # delete_agent clears every reference; nodes fall back along the chain
-        await call("delete_agent", agent=fast)
+        # deleting a profile clears every reference; nodes fall back along the chain
+        assert rest("DELETE", f"/api/agents/{fast_id}")[0] == 200
         assert view(r, r2) == ("plan", strong) and view(rs, rs2) == ("inherited", strong)
         st = await call("get_plan", plan_id=r)
         assert all(n["agent_override"] is None for n in st["nodes"]), st["nodes"]
         assert (await call("get_plan", plan_id=rs))["nodes"][1]["agent_override"] is None
-        await call("delete_agent", agent=strong)
+        assert rest("DELETE", f"/api/agents/{strong_id}")[0] == 200
         assert (await call("get_plan", plan_id=r))["default_agent"] is None
         assert view(r, r1) == view(r, r2) == view(rs, rs1) == ("server-default", server_default)
         assert not {fast, strong} & {x["name"] for x in await call("list_agents")}
         print("agent resolution OK")
 
         # --- file scoping surface: files / conflicts / blocked_by over MCP and REST
-        def rest(method, path, body=None):
-            data = json.dumps(body).encode() if body is not None else None
-            req = urllib.request.Request(URL + path, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(req) as resp:
-                    return resp.status, json.loads(resp.read())
-            except urllib.error.HTTPError as e:
-                return e.code, json.loads(e.read())
 
         # --- test_instructions: set on the top-level plan, inherited by subplans
         t = await call("create_plan", title="Test instructions", working_directory=wd(),
@@ -221,7 +228,10 @@ async def main():
         assert refs(rest("GET", f"/api/plans/{f}/nodes/{f4}")[1]["node"]) == []
         code, v = rest("PUT", f"/api/plans/{f}/nodes/{f3}/files", {"files": ["shared.txt", "SHARED.TXT"]})
         assert code == 200 and v["files"] == ["shared.txt"] and refs(v) == [(f, f1), (f, f4)], (code, v)
-        assert await call("set_node_files", plan_id=f, node_id=f3, files=["Shared.txt"]) == ["Shared.txt"]
+        await call("update_node", plan_id=f, node_id=f3, files=["Shared.txt"], kind="user")
+        v = rest("GET", f"/api/plans/{f}/nodes/{f3}")[1]["node"]
+        assert (v["files"], v["kind"]) == (["Shared.txt"], "user"), v
+        await call("update_node", plan_id=f, node_id=f3, kind="agent")
         code, v = rest("PUT", f"/api/plans/{f}/nodes/{f3}/files", {"files": ["../x"]})
         assert code == 400 and "escapes" in v["detail"], (code, v)
 
@@ -236,11 +246,61 @@ async def main():
         code, v = rest("PUT", f"/api/plans/{f}/nodes/{f1}/files", {"files": []})
         assert code == 400 and "running" in v["detail"], (code, v)
         try:
-            await call("set_node_files", plan_id=f, node_id=f1, files=None); print("FAIL running node changed")
+            await call("update_node", plan_id=f, node_id=f1, files=[]); print("FAIL running node changed")
         except RuntimeError as e:
             assert "running" in str(e), e
         await call("stop_plan", plan_id=f)
         rest("DELETE", f"/api/plans/{f}")
         print("file scoping surface OK")
+
+        # --- submit_plan: a whole plan (and a subplan) in one call, all or nothing
+        got = await call("submit_plan", title="Submitted", working_directory=wd(), test_instructions="pytest",
+                         nodes=[{"key": "spec", "title": "Spec", "description": "write it", "files": ["SPEC.md"]},
+                                {"key": "impl", "title": "Impl", "files": ["src/"]},
+                                {"key": "docs", "title": "Docs", "results_from": ["spec", "impl"]},
+                                {"key": "push", "title": "Push", "kind": "user"}],
+                         edges=[["spec", "impl"], ["impl", "docs"], ["docs", "push"]])
+        sp_id, k = got["plan_id"], got["nodes"]
+        st = await call("get_plan", plan_id=sp_id)
+        byid = {n["node_id"]: n for n in st["nodes"]}
+        assert [byid[k[x]]["title"] for x in ("spec", "impl", "docs", "push")] == ["Spec", "Impl", "Docs", "Push"]
+        assert sorted(st["edges"]) == sorted([[k["spec"], k["impl"]], [k["impl"], k["docs"]], [k["docs"], k["push"]]])
+        assert byid[k["spec"]]["files"] == ["SPEC.md"] and byid[k["push"]]["kind"] == "user"
+        assert byid[k["docs"]]["results_from"] == sorted([k["spec"], k["impl"]]), byid[k["docs"]]
+        assert st["test_instructions"] == "pytest"
+        sub = await call("submit_plan", title="Impl, broken down", parent_plan_id=sp_id, parent_node_id=k["impl"],
+                         nodes=[{"key": "a", "title": "half one", "files": ["src/a.py"]},
+                                {"key": "b", "title": "half two", "results_from": ["a"]}],
+                         edges=[["a", "b"]])
+        sv = await call("get_plan", plan_id=sub["plan_id"])
+        assert sv["parent"] == [sp_id, k["impl"]] and sv["test_instructions"] == "pytest", sv
+        assert sv["nodes"][1]["results_from"] == [sub["nodes"]["a"]], sv["nodes"]
+        assert (await call("get_plan", plan_id=sp_id))["nodes"][1]["subplan_id"] == sub["plan_id"]
+
+        before = {x["plan_id"] for x in await call("list_plans")}
+        try:
+            await call("submit_plan", title="Broken", working_directory=wd(),
+                       nodes=[{"key": "a", "title": "A"}, {"key": "b", "title": "B", "results_from": ["c"]},
+                              {"key": "c", "title": "C", "results_from": ["a"]}, {"key": "a", "title": "A again"},
+                              {"key": "d", "title": "D", "files": ["../out"]}],
+                       edges=[["a", "b"], ["b", "a"], ["a", "nope"]])
+            print("FAIL broken plan accepted")
+        except RuntimeError as e:
+            msg = str(e)
+            for want in ("nothing was created", "duplicate node key 'a'", "unknown node key 'nope'",
+                         "would create a cycle", "results_from names ['c']", "escapes"):
+                assert want in msg, (want, msg)
+        assert {x["plan_id"] for x in await call("list_plans")} == before  # no plan left behind
+        try:
+            await call("submit_plan", title="Broken sub", parent_plan_id=sp_id, parent_node_id=k["docs"],
+                       working_directory=wd(), nodes=[{"key": "a", "title": "A", "agent": f"no-such-{tag}"}],
+                       edges=[["a", "a"]])
+            print("FAIL broken subplan accepted")
+        except RuntimeError as e:
+            for want in ("top-level", "unknown agent profile", "self-loops"):
+                assert want in str(e), (want, str(e))
+        assert (await call("get_plan", plan_id=sp_id))["nodes"][2]["subplan_id"] is None
+        rest("DELETE", f"/api/plans/{sp_id}")
+        print("submit_plan OK")
 
 asyncio.run(main())

@@ -180,19 +180,18 @@ def worker_system_append(profile: dict[str, Any] | None, tests: str) -> str:
 
 EXPAND_HINT = """
 If your node turns out to be too large for one session, you may break it down: call the
-clearbox MCP tool create_plan with parent_plan_id={plan_id} and parent_node_id={node_id}, then
-add_node / add_edge on the returned plan id. Those sub-nodes are executed by other agents after
-you finish, so in that case do only the groundwork yourself and describe the breakdown.
+clearbox MCP tool submit_plan with parent_plan_id={plan_id}, parent_node_id={node_id} and the
+sub-nodes and edges, all in one call. Those sub-nodes are executed by other agents after you
+finish, so in that case do only the groundwork yourself and describe the breakdown.
 """.strip()
 
 # Built-in workers only: their clearbox tools come from the scoped agent endpoint, not /mcp
 # (see mcp_tools.build_mcp). External agents use /mcp and get EXPAND_HINT alone.
 EXPAND_SCOPE_NOTE = """
-Your clearbox tools reach only that subplan and the plans nested inside it: create_plan, add_node,
-add_edge, remove_edge, remove_node, update_node, set_node_kind, set_node_files,
-set_node_results_from and get_plan, plus list_agents and report_progress for your own node. Every
-sub-node runs on your own agent; you cannot pick another one, start or stop plans, or touch any
-other plan.
+Your clearbox tools reach only that subplan and the plans nested inside it: submit_plan,
+create_plan, add_node, add_edge, remove_edge, remove_node, update_node and get_plan, plus
+list_agents and report_progress for your own node. Every sub-node runs on your own agent; you
+cannot pick another one, start or stop plans, or touch any other plan.
 """.strip()
 
 RUN_TESTS_NOTE = """
@@ -1279,6 +1278,11 @@ class Engine:
         """(plan_id, node_id, profile id) of the running built-in node a scoped-endpoint token
         was minted for, or None once that run has ended (or for a token never minted)."""
         return self._agent_tokens.get(token)
+
+    def agent_token(self, plan_id: int, node_id: int) -> str | None:
+        """The live scoped-endpoint token of a running built-in node, or None. For tests only
+        (app.py serves it under --mock): nothing else may hand a token out."""
+        return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
         self._record_diffs(plan_id, node_id)

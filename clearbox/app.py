@@ -637,6 +637,14 @@ def create_app(settings: Settings) -> FastAPI:
         await engine.stop_node(plan_id, node_id)
         return {"ok": "stopped"}
 
+    if settings.agent == "mock":
+        # --mock only, for tests/test_agent_scope.py: the scoped endpoint a running node's agent
+        # was handed, so a test can call it as that agent would. A real server never hands it out.
+        @app.get("/api/debug/plans/{plan_id}/nodes/{node_id}/agent-mcp-url")
+        async def agent_mcp_url(plan_id: int, node_id: int) -> dict[str, str | None]:
+            token = engine.agent_token(plan_id, node_id)
+            return {"url": f"{settings.agent_mcp_url}/{token}" if token else None}
+
     # ------------------------------------------------------------ agents
     @app.get("/api/agents")
     async def list_agents() -> list[dict[str, Any]]:
@@ -685,7 +693,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/agents/{agent_id}/test")
     async def test_agent(agent_id: int) -> dict[str, Any]:
-        """Connection test; the same implementation as the MCP test_agent tool (HarnessRegistry.test)."""
+        """Connection test (HarnessRegistry.test)."""
         try:
             return await harnesses.test(agent_id)
         except PlanError as e:

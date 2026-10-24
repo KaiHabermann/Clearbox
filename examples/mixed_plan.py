@@ -13,9 +13,14 @@ The plan reviews a repository (default: this one) without changing it:
     Inventory tests ─┘
        (cheap)              (strong)                 (strong)
 
-Agents are assigned the three ways a model would do it: set_plan_agent makes the cheap agent the
-plan default (the two inventory nodes inherit it), add_node(..., agent=...) pins the assessment to
-the strong agent, and set_node_agent moves the review node onto it afterwards.
+It builds the plan node by node (add_node / add_edge), the way a model corrects or extends a plan;
+examples/demo_plan.py shows the usual one-call submit_plan. Agents are assigned the three ways a
+model would do it: set_plan_agent makes the cheap agent the plan default (the two inventory nodes
+inherit it), add_node(..., agent=...) pins the assessment to the strong agent, and
+update_node(..., agent=...) moves the review node onto it afterwards.
+
+Agent profiles are setup work, so they are not MCP tools: the missing ones are created, and the
+cheap one tested, over REST (/api/agents), as the web UI's Agents panel does.
 
 Agents that do not exist yet are created and printed:
 - cheap:  an 'openai' profile copied from the first configured openai agent (endpoint, model, key
@@ -32,6 +37,7 @@ import argparse
 import asyncio
 import json
 import os
+import urllib.request
 from pathlib import Path
 
 from mcp.client.client import Client
@@ -52,6 +58,13 @@ async def main(a: argparse.Namespace) -> None:
                 return res.structured_content.get("result", res.structured_content)
             return json.loads(res.content[0].text)
 
+        def rest(method: str, path: str, body: dict | None = None):
+            req = urllib.request.Request(a.url.rsplit("/mcp", 1)[0] + path, method=method,
+                                         data=json.dumps(body).encode() if body is not None else None,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as r:
+                return json.loads(r.read())
+
         agents = {p["name"]: p for p in await call("list_agents")}
         openai_agents = [p for p in agents.values() if p["harness"] == "openai"]
         template = agents.get("openai") if (agents.get("openai") or {}).get("harness") == "openai" else None
@@ -63,7 +76,7 @@ async def main(a: argparse.Namespace) -> None:
                 p = agents[name]
                 print(f"using agent {name!r} ({p['harness']}" + (f" / {p['model']}" if p.get("model") else "") + ")")
                 return name
-            p = await call("create_agent", name=name, **spec)
+            p = rest("POST", "/api/agents", {"name": name, **spec})
             agents[name] = p
             print(f"created agent {name!r} ({p['harness']}" + (f" / {p['model']}" if p.get("model") else "")
                   + (f" @ {p['base_url']}" if p.get("base_url") else "") + ")")
@@ -95,8 +108,8 @@ async def main(a: argparse.Namespace) -> None:
             })
 
         if not use_mock and agents[cheap]["harness"] == "openai":
-            check = await call("test_agent", agent=cheap)
-            print(f"test_agent {cheap}: {'ok' if check['ok'] else 'FAILED'} - {check['detail']}")
+            check = rest("POST", f"/api/agents/{agents[cheap]['id']}/test")
+            print(f"test {cheap}: {'ok' if check['ok'] else 'FAILED'} - {check['detail']}")
             if not check["ok"]:
                 print(f"  (nodes on {cheap!r} will fail until that is fixed; edit it in the Agents panel or rerun with --mock)")
 
@@ -133,7 +146,7 @@ async def main(a: argparse.Namespace) -> None:
             "Check the architecture assessment from your prerequisite against the actual code: for every "
             "claim, open the cited files and mark it confirmed, wrong or unverifiable, with a one-line reason. "
             "End with the suggestions you would actually prioritise. " + READ_ONLY))
-        print(await call("set_node_agent", plan_id=plan, node_id=review, agent=strong))
+        print(await call("update_node", plan_id=plan, node_id=review, agent=strong))
 
         for x, y in [(files, assess), (tests, assess), (assess, review)]:
             await call("add_edge", plan_id=plan, from_node_id=x, to_node_id=y)

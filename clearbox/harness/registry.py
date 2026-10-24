@@ -177,8 +177,8 @@ class HarnessRegistry:
         return out
 
     async def test(self, ref: int | str) -> dict[str, Any]:
-        """Liveness check of a profile (id or name): the ONE implementation behind both
-        ``POST /api/agents/{id}/test`` and the MCP ``test_agent`` tool.
+        """Liveness check of a profile (id or name): the implementation behind
+        ``POST /api/agents/{id}/test``.
 
         Raises ``PlanError`` for an unknown profile; otherwise never raises and returns
         ``{ok, detail, agent, models_sample, ...}`` (see ``openai_check``). 'openai'

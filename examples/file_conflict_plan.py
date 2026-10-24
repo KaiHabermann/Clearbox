@@ -36,27 +36,23 @@ async def main(a: argparse.Namespace) -> None:
                 return res.structured_content.get("result", res.structured_content)
             return json.loads(res.content[0].text)
 
-        plan = await call(
-            "create_plan", title="File conflict demo",
+        got = await call(
+            "submit_plan", title="File conflict demo",
             description="Two nodes write shared.txt and must serialize; a third writes its own file freely.",
             working_directory=getattr(a, "dir", None) or tempfile.mkdtemp(prefix="clearbox-conflict-"),
+            nodes=[
+                {"key": "a", "title": "writer-a", "description": "Append a line to shared.txt.",
+                 "files": ["shared.txt"]},
+                {"key": "b", "title": "writer-b", "description": "Append a different line to shared.txt.",
+                 "files": ["shared.txt"]},
+                {"key": "c", "title": "writer-c", "description": "Write its own file, unrelated to the other two.",
+                 "files": ["only-c.txt"]},
+            ],
         )
+        plan = got["plan_id"]
         print("plan", plan)
-
-        writer_a = await call(
-            "add_node", plan_id=plan, title="writer-a",
-            description="Append a line to shared.txt.", files=["shared.txt"],
-        )
-        writer_b = await call(
-            "add_node", plan_id=plan, title="writer-b",
-            description="Append a different line to shared.txt.", files=["shared.txt"],
-        )
-        writer_c = await call(
-            "add_node", plan_id=plan, title="writer-c",
-            description="Write its own file, unrelated to the other two.", files=["only-c.txt"],
-        )
-        for p, n in (writer_a, writer_b, writer_c):
-            print(f"  node ({p}, {n})")
+        for key, n in got["nodes"].items():
+            print(f"  node ({plan}, {n}) writer-{key}")
 
         view = await call("get_plan", plan_id=plan)
         for node in view["nodes"]:

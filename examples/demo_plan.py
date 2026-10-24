@@ -26,37 +26,50 @@ async def main(url: str, start: bool, workdir: str | None = None) -> None:
                 return res.structured_content.get("result", res.structured_content)
             return json.loads(res.content[0].text)
 
-        # a top-level plan must say where its agents work; a fresh temp dir by default,
-        # since this demo writes a whole little app
-        plan = await call("create_plan", title="Tiny CLI todo app",
-                          description="Write a small Python command-line todo app with tests and docs.",
-                          working_directory=workdir or tempfile.mkdtemp(prefix="clearbox-demo-"))
+        # The whole plan in one call: nodes carry your own keys, edges and results_from use them.
+        # A top-level plan must say where its agents work; a fresh temp dir by default, since this
+        # demo writes a whole little app.
+        got = await call(
+            "submit_plan", title="Tiny CLI todo app",
+            description="Write a small Python command-line todo app with tests and docs.",
+            working_directory=workdir or tempfile.mkdtemp(prefix="clearbox-demo-"),
+            nodes=[
+                {"key": "spec", "title": "Write spec", "files": ["SPEC.md"],
+                 "description": "Write SPEC.md describing commands add/list/done/remove and a JSON storage file."},
+                {"key": "core", "title": "Implement core", "files": ["todo.py"],
+                 "description": "Implement todo.py according to SPEC.md (storage + commands)."},
+                {"key": "cli", "title": "Implement CLI", "files": ["todo.py"],
+                 "description": "Add an argparse CLI entry point to todo.py."},
+                {"key": "tests", "title": "Write tests",
+                 "description": "Write pytest tests covering the commands in SPEC.md."},
+                {"key": "docs", "title": "Write README", "files": ["README.md"],
+                 "description": "Write README.md with install and usage instructions."},
+                {"key": "review", "title": "Final review", "results_from": ["core", "cli", "tests", "docs"],
+                 "description": "Run the tests, fix failures and summarise the state of the project."},
+            ],
+            edges=[["spec", "core"], ["spec", "tests"], ["spec", "docs"], ["core", "cli"],
+                   ["cli", "review"], ["tests", "review"], ["docs", "review"]],
+        )
+        plan, ids = got["plan_id"], got["nodes"]
         print("plan", plan)
+        for key, n in ids.items():
+            print(f"  node ({plan}, {n}) {key}")
 
-        async def node(title: str, desc: str, plan_id: int = plan) -> int:
-            p, n = await call("add_node", plan_id=plan_id, title=title, description=desc)
-            print(f"  node ({p}, {n}) {title}")
-            return n
-
-        spec = await node("Write spec", "Write SPEC.md describing commands add/list/done/remove and a JSON storage file.")
-        core = await node("Implement core", "Implement todo.py according to SPEC.md (storage + commands).")
-        cli = await node("Implement CLI", "Add an argparse CLI entry point to todo.py.")
-        tests = await node("Write tests", "Write pytest tests covering the commands in SPEC.md.")
-        docs = await node("Write README", "Write README.md with install and usage instructions.")
-        review = await node("Final review", "Run the tests, fix failures and summarise the state of the project.")
-
-        for a, b in [(spec, core), (spec, tests), (spec, docs), (core, cli), (cli, review), (tests, review), (docs, review)]:
-            await call("add_edge", plan_id=plan, from_node_id=a, to_node_id=b)
-
-        # 'Write tests' is itself a small plan
-        sub = await call("create_plan", title="Test suite", description="Tests for the todo app",
-                         parent_plan_id=plan, parent_node_id=tests)
-        print("subplan", sub, "attached to node", tests)
-        fx = await node("Fixtures", "Create conftest.py with a temporary storage fixture.", sub)
-        t1 = await node("Command tests", "Test add/list/done/remove.", sub)
-        t2 = await node("Edge-case tests", "Test empty storage, unknown ids, corrupted JSON.", sub)
-        for b in (t1, t2):
-            await call("add_edge", plan_id=sub, from_node_id=fx, to_node_id=b)
+        # 'Write tests' is itself a small plan: the same call with a parent node
+        sub = await call(
+            "submit_plan", title="Test suite", description="Tests for the todo app",
+            parent_plan_id=plan, parent_node_id=ids["tests"],
+            nodes=[
+                {"key": "fx", "title": "Fixtures", "files": ["tests/conftest.py"],
+                 "description": "Create conftest.py with a temporary storage fixture."},
+                {"key": "cmd", "title": "Command tests", "files": ["tests/test_commands.py"],
+                 "description": "Test add/list/done/remove."},
+                {"key": "edge", "title": "Edge-case tests", "files": ["tests/test_edge_cases.py"],
+                 "description": "Test empty storage, unknown ids, corrupted JSON."},
+            ],
+            edges=[["fx", "cmd"], ["fx", "edge"]],
+        )
+        print("subplan", sub["plan_id"], "attached to node", ids["tests"])
 
         if start:
             print(await call("start_plan", plan_id=plan, executor="builtin"))

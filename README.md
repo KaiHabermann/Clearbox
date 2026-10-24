@@ -8,7 +8,7 @@ sessions attached to the nodes, and shows everything live in the browser: which 
 worked on right now, and — on click — the agent's session in that node as it happens.
 
 ```
- model ──MCP──►  create_plan / add_node / add_edge / start_plan
+ model ──MCP──►  submit_plan (plan + nodes + edges) / start_plan
                          │
                  ┌───────▼────────┐  SQLite (plans, nodes, edges, agent profiles, transcripts)
                  │    Clearbox    │──► built-in agent per ready node, chosen by its agent profile:
@@ -77,23 +77,16 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 
 | Tool | What it does |
 | --- | --- |
-| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
+| `submit_plan(title, working_directory=None, description="", test_instructions=None, nodes=[…], edges=[…], parent_plan_id=None, parent_node_id=None, max_parallel=None)` | **The way to build a plan**: the plan, all its nodes and all its edges in one call → `{"plan_id": …, "nodes": {key: node_id}}`. `nodes` are `{key, title, description, files, results_from, kind, agent}` objects, where `key` is your own label; `edges` are `[from_key, to_key]` pairs and `results_from` names keys too. All or nothing: every problem (duplicate or unknown keys, cycles, a `results_from` the node does not depend on, a path outside the working directory, an unknown agent or kind, the working-directory and subplan rules) is reported in one error, and then nothing has been created. Plan fields as for `create_plan`; with a parent it becomes the **subplan** of that node. |
+| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New empty plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
 | `update_plan(plan_id, max_parallel=None, test_instructions=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions. Same as `PATCH /api/plans/{plan_id}`. |
-| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier nodes whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
+| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | Extend or correct a plan one node at a time → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier node ids whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
 | `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
-| `remove_edge`, `remove_node` | Corrections while building. |
-| `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None)` | Change only what you pass; `files` / `results_from` omitted keeps the current value, `[]` clears it. |
-| `set_node_files(plan_id, node_id, files)` | Replace a node's declared files on their own, without touching title/description; `[]` or `null` clears them. Only before the node has run. |
-| `set_node_results_from(plan_id, node_id, node_ids)` | Replace the earlier nodes whose result text the node receives; `[]` or `null` clears them. Each must be a node it already depends on through edges. Only before the node has run. |
-| `set_node_kind(plan_id, node_id, kind)` | Make a node the user's job (`"user"`) or an agent's (`"agent"`), see [User-job nodes](#user-job-nodes-a-step-a-person-does). Only before the node has run. |
+| `remove_edge`, `remove_node` | Corrections. |
+| `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None, kind=None, agent=None)` | Change only what you pass, all or nothing. `files` / `results_from` omitted keeps the current value, `[]` clears it; they and `kind` change only before the node has run. `agent=""` clears the node's own agent so it inherits again; a new agent applies the next time the node starts. |
 | `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `working_directory`, `test_instructions` (the top-level plan's, for a subplan too), `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
-| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. |
-| `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="", capability=None, test_level=None)` | New agent profile. `capability` (`read` \| `run` \| `edit` \| `full`) and `test_level` (`none` \| `light` \| `standard` \| `thorough`) are explained under [Capability](#capability-what-an-agent-may-do) and [Test levels](#test-levels-how-much-a-worker-agent-tests); `permission_mode` and `tools` are raw escape hatches. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
-| `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field (for `capability` / `test_level`: back to the default), `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
-| `delete_agent(agent)` | Delete a profile; nodes and plans that used it inherit again. |
-| `set_node_agent(plan_id, node_id, agent)` | Per-node override; `null` clears it. Applies the next time the node starts. |
+| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. Creating, editing, deleting and testing profiles is setup work, done in the web UI's Agents panel or over REST (`/api/agents`), not over MCP. |
 | `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
-| `test_agent(agent)` | Liveness check: for `openai` lists the endpoint's models (falls back to a tiny completion) → `{ok, detail, reachable, model_listed, models_sample, credential}`. |
 | `start_plan(plan_id, executor="builtin" \| "external")`, `stop_plan(plan_id)` | Run / pause a top-level plan. |
 | `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node, with the same prompt a built-in agent would get. |
 | `report_progress(plan_id, node_id, message, kind="text")` | Append to the node's live transcript. |
@@ -120,9 +113,9 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 * **Subplans**: a node with a subplan skips the agent; when it is reached its subplan runs, and the
   node is done once the whole subplan is done (its result summarises the subplan's final nodes).
   Built-in agents also get MCP tools, so an agent can decide mid-run that its node is too big
-  and *expand* it into a subplan (`create_plan(parent_plan_id=…, parent_node_id=…)`); the node then
+  and *expand* it into a subplan (`submit_plan(parent_plan_id=…, parent_node_id=…, nodes=…)`); the node then
   finishes after that subplan (disable with `--no-agent-mcp`). `openai` agents get the same tools
-  through a built-in MCP client, prefixed `vc_` (`vc_create_plan`, …). These are a restricted set
+  through a built-in MCP client, prefixed `vc_` (`vc_submit_plan`, …). These are a restricted set
   on their own endpoint, see [Worker agents' MCP tools](#worker-agents-mcp-tools).
 * All agents of one plan tree share a working directory: `<workdir>/plan-<root id>`
   (default `./workspace/plan-N`).
@@ -134,7 +127,7 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 ### User-job nodes: a step a person does
 
 Some steps of a plan are not an agent's to do: push a branch, open a merge request, deploy, approve
-something. Mark such a node with `kind="user"` (`add_node(..., kind="user")`, `set_node_kind`, or the
+something. Mark such a node with `kind="user"` (on a `submit_plan` node, `add_node`, `update_node`, or the
 **Done by** select in the node drawer; changeable while the node is pending or ready). Nothing else
 about the node changes: it has edges, it can declare `files` and request `results_from`, and it
 blocks its dependents like any other node.
@@ -224,9 +217,10 @@ work to build on, not to redo.
 
 `results_from` only *passes*; it never orders. A node may only request nodes of its own plan that it
 already depends on, directly or through other nodes — anything else might not have a result yet when
-it runs, and is rejected with a message saying which edge is missing. `add_node` accepts the list
-before the edges exist (you add those next), so the check runs when the edges are known:
-`set_node_results_from`, `update_node` and `start_plan` reject it. Like `files`, it can only change
+it runs, and is rejected with a message saying which edge is missing. `submit_plan` checks it
+against the edges of the same call; `add_node` accepts the list before the edges exist (you add
+those next), so then the check runs when the edges are known: `update_node` and `start_plan`
+reject it. Like `files`, it can only change
 while the node is `pending` or `ready`.
 
 The useful pattern: implementation nodes request nothing and start with a short prompt; a final docs or
@@ -234,11 +228,12 @@ summary node depends on all of them and requests every result, writing from them
 rediscovering the work:
 
 ```
-store   = add_node(p, "Store: add the column", …, files=["clearbox/store.py"])
-engine  = add_node(p, "Engine: use it", …, files=["clearbox/engine.py"])
-docs    = add_node(p, "Docs", "Document the change in README.md …", files=["README.md"],
-                   results_from=[store[1], engine[1]])
-add_edge(p, store[1], engine[1]); add_edge(p, engine[1], docs[1])   # docs depends on store via engine
+submit_plan(title, working_directory, nodes=[
+    {"key": "store",  "title": "Store: add the column", …, "files": ["clearbox/store.py"]},
+    {"key": "engine", "title": "Engine: use it", …, "files": ["clearbox/engine.py"]},
+    {"key": "docs",   "title": "Docs", "description": "Document the change in README.md …",
+     "files": ["README.md"], "results_from": ["store", "engine"]},
+], edges=[["store", "engine"], ["engine", "docs"]])   # docs depends on store via engine
 ```
 
 REST: `PUT /api/plans/{plan_id}/nodes/{node_id}/results-from` (body `{"node_ids": [...]}`), and
@@ -338,7 +333,8 @@ overwritten): `claude`, `mock`, and — only if `--openai-base-url`, `OPENAI_BAS
 `OPENAI_API_KEY` is set — `openai`. The `claude` profile stores no model / permission mode / max
 turns, so `--model`, `--permission-mode` and `--max-turns` keep applying to it; a value set on the
 profile overrides the flag. Manage profiles in the UI (**Agents** in the sidebar, with a **Test
-connection** button), over MCP (`create_agent` …) or over REST (`/api/agents`).
+connection** button) or over REST (`/api/agents`). MCP only lists them (`list_agents`), so a
+planning model can pick one; setting them up is not in its context.
 
 ```powershell
 uv run clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
@@ -371,17 +367,18 @@ built-in node it mints a random token for that run and hands the agent
 `http://127.0.0.1:<port>/mcp-agent/<token>` instead; the token names the node and is revoked the
 moment the run ends (finished, failed or stopped), after which the endpoint answers 404, as it
 does for a token it never minted. That endpoint serves only what expanding a node needs:
-`create_plan`, `add_node`, `add_edge`, `remove_edge`, `remove_node`, `update_node`,
-`set_node_kind`, `set_node_files`, `set_node_results_from` and `get_plan`, plus read-only
-`list_agents` and `report_progress` for the agent's own node. Every plan argument must be inside
-the node's own subtree: `create_plan` attaches a subplan to the agent's own node or to a node of a
-subplan below it, and the other tools work only on those subplans. There is no `start_plan` /
-`stop_plan`, no agent-profile admin, no review, rework or working-directory tool, no
-`claim_next_node` / `complete_node` / `fail_node`, and no way to pick an agent: `add_node` takes no
-`agent` and there is no `set_node_agent`. Instead a subplan a worker creates gets **the creating
-node's resolved agent profile as its plan default**, so expanding a node never runs the sub-work on
-a more capable agent than the node itself had (see [Which agent runs a node](#which-agent-runs-a-node)).
-Reviewers get no clearbox tools at all; external agents claiming over `/mcp` are trusted like you.
+`submit_plan`, `create_plan`, `add_node`, `add_edge`, `remove_edge`, `remove_node`, `update_node`
+and `get_plan`, plus read-only `list_agents` and `report_progress` for the agent's own node. Every
+plan argument must be inside the node's own subtree: `submit_plan` / `create_plan` attach a subplan
+to the agent's own node or to a node of a subplan below it, and the other tools work only on those
+subplans. There is no `start_plan` / `stop_plan`, no agent-profile admin, no review, rework or
+working-directory tool, no `claim_next_node` / `complete_node` / `fail_node`, and no way to pick an
+agent: `submit_plan`, `add_node` and `update_node` refuse an `agent` argument with an error.
+Instead a subplan a worker creates gets **the creating node's resolved agent profile as its plan
+default**, so expanding a node never runs the sub-work on a more capable agent than the node itself
+had (see [Which agent runs a node](#which-agent-runs-a-node)). Reviewers get no clearbox tools at
+all; external agents claiming over `/mcp` are trusted like you. The token never appears in a
+transcript; only a `--mock` server hands it out, on a debug route the tests use.
 
 This closes the tool layer, not the machine: an agent with capability `run` or `full` has a shell
 and can reach `/mcp` on localhost directly. The scoping protects `read` and `edit` agents, and
@@ -432,9 +429,9 @@ Every worker prompt ends with a testing paragraph chosen by the profile's `test_
 **`standard` is the default**, for new profiles and for every existing one (`null`), and for
 external agents claiming through `claim_next_node`. `standard` and `thorough` also say how the
 project's tests are run: the plan's `test_instructions` verbatim when it has them (set them on
-`create_plan`, `update_plan` or the 🧪 pill in the UI's topbar), otherwise an instruction to work
-it out from the repository itself (README, CLAUDE.md / AGENTS.md, CI config, the test files)
-rather than invent a harness. Either way the agent is told that any server it starts for testing
+`submit_plan`, `create_plan`, `update_plan` or the 🧪 pill in the UI's topbar), otherwise an
+instruction to work it out from the repository itself (README, CLAUDE.md / AGENTS.md, CI config,
+the test files) rather than invent a harness. Either way the agent is told that any server it starts for testing
 gets a free port, never the port of the Clearbox server running the plan. The level is for worker
 agents only: reviewers keep their own prompt and **always run the suite** before giving a verdict,
 whatever the profile's level — which is why they need capability `run`. They get the same
@@ -463,8 +460,8 @@ Put api keys in environment variables of the Clearbox process and reference them
 `api_key_env`; the value is read when a node starts and lives only in the HTTP client. A literal
 key can be typed into the Agents panel (or sent as `api_key` to `POST`/`PATCH /api/agents`) for
 convenience: it is stored in the database but **never returned** by REST, the stream, MCP or the
-logs — they only show `has_api_key`. `""` clears it; leaving the field out keeps it. MCP's
-`create_agent`/`update_agent` do not accept a key at all. Error texts from endpoints are scrubbed of
+logs — they only show `has_api_key`. `""` clears it; leaving the field out keeps it. MCP has no
+tool that creates or edits a profile, so a key never passes through a model's context. Error texts from endpoints are scrubbed of
 the key before they reach a transcript. Endpoints on localhost or a private network get a
 placeholder key when none is configured, since they rarely check it.
 
@@ -485,7 +482,7 @@ placeholder key when none is configured, since they rarely check it.
 | `glob(pattern)` | Find files, e.g. `**/*.py`, newest first. | ✓ |
 | `grep(pattern, path, glob, max_results=100)` | Regex search over file contents → `path:line: text`. | ✓ |
 | `bash(command, timeout_ms=120000)` | Run a shell command (`cmd.exe` on Windows, `/bin/sh` elsewhere), max 600 000 ms; kills the process tree on timeout. | |
-| `vc_*` | The worker's scoped clearbox MCP tools (`vc_create_plan`, `vc_add_node`, …, see [Worker agents' MCP tools](#worker-agents-mcp-tools)) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
+| `vc_*` | The worker's scoped clearbox MCP tools (`vc_submit_plan`, `vc_add_node`, …, see [Worker agents' MCP tools](#worker-agents-mcp-tools)) so the agent can expand its node into a subplan; off with `tools.mcp=false` or `--no-agent-mcp`. | |
 
 Walks skip `.git`, `node_modules`, `__pycache__` and virtualenvs; results are truncated like the
 Claude harness's.
@@ -509,7 +506,7 @@ Common pitfalls (the transcript error says which one hit):
 * **Small local models often loop** — re-reading the same file, repeating a call. Cap them with
   `params.max_turns` (e.g. 15–25), keep their nodes mechanical, and set `max_parallel: 1` if they
   share one GPU.
-* Unsure? **Test connection** in the Agents panel (or `test_agent`) checks reachability, the key and
+* Unsure? **Test connection** in the Agents panel (or `POST /api/agents/{id}/test`) checks reachability, the key and
   whether the model name is listed, without spending tokens.
 
 ### Walkthrough: a mixed-harness plan
@@ -528,10 +525,11 @@ It creates the agents it needs if missing and prints them: `cheap` (an `openai` 
 configured `openai` profile with preset `readonly`, `max_turns` 20, `max_parallel` 1) and `strong`
 (`claude-sdk` with raw permission mode `default` — note that with no `capability` set this is
 `full`, every tool pre-approved; set `capability="read"` on it for a genuinely read-only
-reviewer), then runs `test_agent` on
-`cheap`. It assigns them the three ways: `set_plan_agent` makes `cheap` the plan default (the
-inventory nodes inherit it), `add_node(..., agent="strong")` pins the assessment, and
-`set_node_agent` moves the review node. `--cheap NAME` / `--strong NAME` use profiles you already
+reviewer) over REST, then tests
+`cheap` (`POST /api/agents/{id}/test`). It builds the plan node by node, the incremental way, and
+assigns the agents the three ways: `set_plan_agent` makes `cheap` the plan default (the inventory
+nodes inherit it), `add_node(..., agent="strong")` pins the assessment, and
+`update_node(..., agent="strong")` moves the review node. `--cheap NAME` / `--strong NAME` use profiles you already
 have; `--repo PATH` reviews another directory. With no `openai` profile configured (e.g. against
 `uv run clearbox --mock`) or with `--mock` it creates `mock-cheap` / `mock-strong` instead, so
 the whole flow can be watched for free.
@@ -618,7 +616,7 @@ and every later plan can use it. Two things worth knowing when a plan builds Cle
 `--model`, `--permission-mode` and `--max-turns` configure the `claude` profile's empty fields (and
 any `claude-sdk` profile that leaves them empty). The three `--openai-*` flags only **bootstrap**
 the `openai` profile the first time: once it exists they are ignored with a warning, because the
-profile is the source of truth — edit it in the Agents panel or with `update_agent`. An
+profile is the source of truth — edit it in the Agents panel or with `PATCH /api/agents/{id}`. An
 `--agent-profile` naming a profile that does not exist stops the server with a message listing the
 ones that do.
 
@@ -649,7 +647,7 @@ clearbox/
     mock.py          fake harness
     tools.py         sandboxed toolset for harnesses that bring none (read_file … bash)
     registry.py      picks the harness for a node; per-profile caches and limits
-    openai_check.py  /models check behind test_agent
+    openai_check.py  /models check behind POST /api/agents/{id}/test
     probe.py         tiny completion round trip when there is no /models listing
   static/         UI (plain HTML/CSS/JS, no build step)
 examples/demo_plan.py       builds a demo plan through MCP

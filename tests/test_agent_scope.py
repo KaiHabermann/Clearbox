@@ -2,10 +2,10 @@
 
 A built-in worker gets /mcp-agent/<token> instead of /mcp: the token names the node it
 runs and is revoked when the run ends. This drives that endpoint the way an agent would
-(the mock harness puts the run's url in its first transcript event; a very slow mock
-profile keeps the run alive meanwhile) and checks that it can expand its own node and
-build below it, sees no agent-admin or execution tools, cannot reach any other plan or
-node, pins its subplan to its own agent, and loses access once the run ends.
+(a --mock server serves a running node's url on a debug route; a very slow mock profile
+keeps the run alive meanwhile) and checks that it can expand its own node and build below
+it, sees no agent-admin or execution tools, cannot reach any other plan or node, pins its
+subplan to its own agent, and loses access once the run ends.
 
 Run:  uv run clearbox --mock      (one shell)
       uv run python tests/test_agent_scope.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
@@ -18,9 +18,8 @@ from clearbox.mcp_bridge import McpToolBridge
 
 URL = (sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}").rstrip("/")
 
-AGENT_TOOLS = {"create_plan", "add_node", "add_edge", "remove_edge", "remove_node", "update_node",
-               "set_node_kind", "set_node_files", "set_node_results_from", "get_plan", "list_agents",
-               "report_progress"}
+AGENT_TOOLS = {"submit_plan", "create_plan", "add_node", "add_edge", "remove_edge", "remove_node",
+               "update_node", "get_plan", "list_agents", "report_progress"}
 
 
 def wd():
@@ -57,13 +56,13 @@ async def refused(call, name, /, **a):
 
 
 def scoped_url(plan_id, node_id, timeout=30):
-    """The run's scoped endpoint, from the mock agent's first transcript event."""
+    """The run's scoped endpoint, from the --mock-only debug route (never from the transcript)."""
     end = time.time() + timeout
     while time.time() < end:
-        _, d = rest(f"/api/plans/{plan_id}/nodes/{node_id}")
-        for ev in d["events"]:
-            if ev["data"].get("mcp_url"):
-                return ev["data"]["mcp_url"]
+        code, d = rest(f"/api/debug/plans/{plan_id}/nodes/{node_id}/agent-mcp-url")
+        assert code == 200, (code, d)
+        if d["url"]:
+            return d["url"]
         time.sleep(0.2)
     raise AssertionError(f"node ({plan_id}, {node_id}) never started with an agent endpoint")
 
@@ -73,7 +72,9 @@ async def main():
     async with Client(URL + "/mcp") as c:
         call = caller(c)
         # mock speed 0.02: the run sits in its first sleep for 25-75 s, long enough for the test
-        await call("create_agent", name=slow, harness="mock", params={"speed": 0.02}, capability="read")
+        code, prof = rest("/api/agents", "POST", dict(name=slow, harness="mock", params={"speed": 0.02},
+                                                      capability="read"))
+        assert code == 200, (code, prof)
         pid = await call("create_plan", title="Scope test", working_directory=wd())
         a = (await call("add_node", plan_id=pid, title="A", description="the worker", agent=slow))[1]
         b = (await call("add_node", plan_id=pid, title="B", description="a sibling"))[1]
@@ -97,7 +98,7 @@ async def main():
                 s2 = (await wcall("add_node", plan_id=sub, title="A2", description="second half", files=["x.txt"]))[1]
                 await wcall("add_edge", plan_id=sub, from_node_id=s1, to_node_id=s2)
                 await wcall("update_node", plan_id=sub, node_id=s2, description="second half, revised")
-                await wcall("set_node_results_from", plan_id=sub, node_id=s2, node_ids=[s1])
+                await wcall("update_node", plan_id=sub, node_id=s2, results_from=[s1], kind="agent")
                 s3 = (await wcall("add_node", plan_id=sub, title="tmp", description="removed again"))[1]
                 await wcall("remove_node", plan_id=sub, node_id=s3)
                 nested = await wcall("create_plan", title="A1, broken down", parent_plan_id=sub, parent_node_id=s1)
@@ -124,12 +125,27 @@ async def main():
                     assert all(n["agent"]["name"] == slow for n in v["nodes"]), v["nodes"]
                 assert (await call("get_plan", plan_id=sub))["default_agent"] == slow
                 print("subplan agent: inherited", slow)
-                # an `agent` argument is not part of the scoped add_node and is dropped
-                x = (await wcall("add_node", plan_id=sub, title="X", agent="mock"))[1]
-                xn = next(n for n in (await call("get_plan", plan_id=sub))["nodes"] if n["node_id"] == x)
-                assert xn["agent_override"] is None and xn["agent"]["name"] == slow, xn
-                await wcall("remove_node", plan_id=sub, node_id=x)
+                # an `agent` argument is refused outright, not dropped
+                for name, args in [("add_node", dict(plan_id=sub, title="X", agent="mock")),
+                                   ("update_node", dict(plan_id=sub, node_id=s1, agent="mock")),
+                                   ("submit_plan", dict(title="X", parent_plan_id=sub, parent_node_id=s2,
+                                                        nodes=[{"key": "x", "title": "X", "agent": "mock"}]))]:
+                    assert "agent is not accepted" in await refused(wcall, name, **args), name
+                assert [n["title"] for n in (await call("get_plan", plan_id=sub))["nodes"]] == ["A1", "A2"]
+                assert (await call("get_plan", plan_id=sub))["nodes"][0]["agent_override"] is None
                 await refused(wcall, "set_node_agent", plan_id=sub, node_id=s1, agent="mock")
+
+                # submit_plan: a whole nested subplan in one call, on the creating node's agent
+                got = await wcall("submit_plan", title="A2, broken down", parent_plan_id=sub, parent_node_id=s2,
+                                  nodes=[{"key": "p", "title": "A2a", "files": ["y.txt"]},
+                                         {"key": "q", "title": "A2b", "results_from": ["p"]}],
+                                  edges=[["p", "q"]])
+                v = await call("get_plan", plan_id=got["plan_id"])
+                assert v["parent"] == [sub, s2] and v["default_agent"] == slow, v
+                assert v["edges"] == [[got["nodes"]["p"], got["nodes"]["q"]]], v["edges"]
+                assert all(n["agent"]["name"] == slow for n in v["nodes"]), v["nodes"]
+                assert v["nodes"][1]["results_from"] == [got["nodes"]["p"]], v["nodes"]
+                print("scoped submit_plan: subplan", got["plan_id"], "on", slow)
 
                 # nothing outside its own subtree, and no admin or execution tools
                 for name, args in [
@@ -142,6 +158,9 @@ async def main():
                     ("get_plan", dict(plan_id=other)),
                     ("create_plan", dict(title="X", parent_plan_id=pid, parent_node_id=b)),
                     ("create_plan", dict(title="X", parent_plan_id=other, parent_node_id=o)),
+                    ("submit_plan", dict(title="X", parent_plan_id=pid, parent_node_id=b,
+                                         nodes=[{"key": "x", "title": "X"}])),
+                    ("submit_plan", dict(title="X", parent_plan_id=other, parent_node_id=o)),
                     ("create_agent", dict(name="escalated", harness="mock", capability="full")),
                     ("start_plan", dict(plan_id=other)),
                     ("set_plan_workdir", dict(plan_id=other, working_directory=wd())),
@@ -169,7 +188,7 @@ async def main():
             print("unknown token: 404")
         finally:
             await call("stop_plan", plan_id=pid)
-            await call("delete_agent", agent=slow)
+            rest(f"/api/agents/{prof['id']}", "DELETE")
     print("OK")
 
 

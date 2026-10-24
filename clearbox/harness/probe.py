@@ -1,7 +1,7 @@
 """Connection test for an agent profile ("does this agent answer at all?").
 
 A real (tiny) completion round trip. ``HarnessRegistry.test`` -- the shared
-implementation of ``POST /api/agents/{id}/test`` and the MCP ``test_agent`` tool --
+implementation of ``POST /api/agents/{id}/test`` (the Agents panel's Test connection) --
 uses it (via ``openai_check``) for endpoints without a ``/models`` listing.
 
 The probe is one tiny, tool-less round trip that asks the model to reply "OK":

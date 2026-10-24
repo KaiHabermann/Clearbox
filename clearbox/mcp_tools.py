@@ -8,6 +8,7 @@ from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel, ConfigDict, Field
 
 from .engine import ConflictCache, Engine
 from .harness import AgentJob, HarnessError
@@ -196,68 +197,56 @@ async def run_plan_review(engine: Engine, plan_id: int, agent: int | str | None 
     return store.review(plan_id, None)
 
 INSTRUCTIONS = """
-Clearbox lets you lay out a piece of work as a plan: a directed acyclic graph of nodes,
-where every node is one piece of work. Edges point from a prerequisite to the node that
-depends on it (from_node_id must finish before to_node_id starts). Execution walks the graph
-from the roots to the leaves; independent nodes run in parallel.
+Clearbox runs a plan: a DAG of nodes, each one piece of work done by one agent session. Edges
+point from a prerequisite to the node that depends on it; independent nodes run in parallel.
 
-Building a plan:
-  1. create_plan(title, description, working_directory) -> plan_id
-     working_directory is required: the absolute path of the existing directory the plan's
-     agents work in (usually the repository). Subplans inherit it.
-     Optionally pass test_instructions: how this project's tests are run. Worker and reviewer
-     agents get it verbatim; without it they work it out from the repository.
-  2. add_node(plan_id, title, description) -> [plan_id, node_id]   (one call per piece of work)
-  3. add_edge(plan_id, from_node_id, to_node_id)                   (dependencies)
-  A node can itself be a small plan: create_plan(..., parent_plan_id, parent_node_id) attaches
-  a subplan to that node; the node then completes when its whole subplan is done.
-  Write node descriptions so that an agent with no other context can do the work.
-  Files: independent nodes run in parallel, so give each node files=[...] listing the paths it
-  will CREATE or MODIFY (reads need no declaration). Two nodes that could run at the same time
-  and declare the same file then run one after the other, lowest node number first, instead of
-  clobbering each other; get_plan shows each node's `conflicts`.
-  Results: an edge only orders work, it passes NOTHING. Nodes start with no earlier results in
-  their prompt, so keep descriptions self-contained; when a node really needs an earlier node's
-  output, list it in results_from=[...] (it must be a node it already depends on via edges).
-  User nodes: add_node(..., kind="user") marks a step as the user's own job (push a branch, open
-  an MR, deploy, approve). No agent runs it: the plan stops there until the user marks it done,
-  then the nodes after it start. Write its description for a person, not for an agent.
-  4. start_plan(plan_id, executor="builtin") lets the service run an agent per node,
-     or executor="external" lets outside agents pick nodes up with claim_next_node.
+Build a plan in ONE call, then start it:
+  submit_plan(title, working_directory, nodes=[...], edges=[...]) -> {plan_id, nodes: {key: node_id}}
+    working_directory  absolute path of the existing directory the agents work in (the repository)
+    nodes  [{key, title, description, files, results_from, kind, agent}]; key is your own label
+    edges  [[from_key, to_key], ...]
+  It is all or nothing: every problem is reported at once and nothing is created.
+  start_plan(plan_id)
+Later changes: add_node / add_edge / update_node / remove_node / remove_edge.
 
-Choosing agents (optional; without it every node runs on the server's default agent):
-  An agent profile is a named harness + model: 'claude-sdk' (Claude Agent SDK), 'openai' (any
-  OpenAI-compatible endpoint: OpenAI, OpenRouter, vLLM, Ollama, LM Studio, ...) or 'mock'.
-  list_agents shows them, create_agent adds one, test_agent checks it answers. A plan may mix
-  them per node: cheap/local models for mechanical nodes, strong models for the hard ones.
-  add_node(..., agent="name") or set_node_agent picks a node's agent; set_plan_agent sets a
-  plan-wide default. Resolution: node's agent -> its plan's default -> each ancestor plan's
-  default -> the server default. get_plan shows the resolved agent of every node.
+Write each description so an agent with no other context can do the work. An edge passes
+NOTHING: a node that needs an earlier node's output names it in results_from (and must depend on
+it through edges). files: what the node will create or modify; parallel nodes sharing a file run
+one after the other. kind="user": a step the user does (push, deploy, approve); the plan waits
+for them. A node can become a subplan: submit_plan(..., parent_plan_id, parent_node_id).
 
-Working on nodes as an external agent:
-  claim_next_node -> do the work -> report_progress (optional, repeatedly) -> complete_node / fail_node
+agent: a profile from list_agents, per node (set_plan_agent for a plan-wide default); without
+one the server default runs. get_plan shows what every node resolves to.
 
-Reviews (optional, advisory only -- never blocks a node or edits a file):
-  set_plan_review_agent(plan_id, agent) names an agent that automatically reviews each step
-  against its own diff as it finishes, then the plan as a whole once every step is done. Any
-  plan can also be reviewed on demand with review_node / review_plan, whether or not it has a
-  review agent set -- diffs are captured for every node regardless, so a finished plan can be
-  reviewed after the fact by passing an agent to the trigger. get_reviews(plan_id) reads the
-  verdicts and findings back, most useful for turning the plan-level review's oversights into
-  new add_node/add_edge calls. To act on a step review: get_reviews -> decide ->
-  rework_node(plan_id, node_id) re-runs that step with the findings (or your own instructions)
-  -> get_reviews again for the new verdict. Rework is never automatic and never touches
-  dependent nodes.
+Optional: test_instructions (how the project's tests run; agents get it verbatim);
+start_plan(executor="external") + claim_next_node for outside agents; reviews
+(set_plan_review_agent, review_node, review_plan, get_reviews, rework_node) are advisory only.
 """.strip()
 
 
 AGENT_INSTRUCTIONS = """
 Clearbox tools for an agent working on one node of a plan. They only reach the subplan of your own
-node and plans nested inside it: create_plan(title, parent_plan_id, parent_node_id) expands your
-node (pass your own plan and node id), then add_node / add_edge / update_node / ... build it and
-get_plan reads it back. Edges point from a prerequisite to the node that depends on it and pass no
-results. Every sub-node runs on your own agent, after your session ends.
+node and plans nested inside it: submit_plan(title, parent_plan_id, parent_node_id, nodes, edges)
+expands your node in one call (pass your own plan and node id); add_node / add_edge / update_node /
+... adjust it and get_plan reads it back. Edges point from a prerequisite to the node that depends
+on it and pass no results. Every sub-node runs on your own agent, after your session ends.
 """.strip()
+
+
+class NodeSpec(BaseModel):
+    """One node of a submit_plan call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(description="your own label for this node, unique in the call; edges and results_from use it")
+    title: str
+    description: str = Field("", description="a self-contained instruction for whoever does the work")
+    files: list[str] | None = Field(None, description="paths, relative to the working directory, it will "
+                                                      "create or modify; a directory claims everything under it")
+    results_from: list[str] | None = Field(None, description="keys of nodes (it depends on via edges) whose "
+                                                             "result text it receives")
+    kind: str | None = Field(None, description='"agent" (default) or "user" (a step the user does)')
+    agent: str | int | None = Field(None, description="agent profile (name or id) that runs it; omit to inherit")
 
 
 def _in_subtree(store: Store, plan_id: int, node: tuple[int, int]) -> bool:
@@ -383,6 +372,139 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         }
 
     # ------------------------------------------------------------ building
+    def _check_plan_args(parent_plan_id: int | None, working_directory: str | None,
+                         max_parallel: int | None, test_instructions: str | None) -> None:
+        """The rules for a new plan's own settings, shared by create_plan and submit_plan."""
+        if parent_plan_id is not None and max_parallel is not None:
+            raise ToolError("max_parallel can only be set on top-level plans")
+        if parent_plan_id is not None and test_instructions:
+            raise ToolError("test_instructions can only be set on top-level plans; a subplan "
+                            "uses its top-level plan's")
+        if parent_plan_id is None and working_directory is None:
+            raise ToolError(
+                "working_directory is required for a top-level plan: pass the absolute path of "
+                "the existing directory its agents should work in (e.g. the repository)")
+        if working_directory is not None:
+            if parent_plan_id is not None:
+                raise ToolError("working_directory can only be set on top-level plans; a subplan "
+                                "uses its top-level plan's directory")
+            try:
+                validate_working_directory(working_directory)
+            except PlanError as e:
+                raise ToolError(str(e)) from e
+
+    def _submit(title: str, working_directory: str | None, description: str, test_instructions: str | None,
+                nodes: list[NodeSpec], edges: list[tuple[str, str]], parent_plan_id: int | None,
+                parent_node_id: int | None, max_parallel: int | None,
+                default_profile_id: int | None = None) -> dict[str, Any]:
+        """submit_plan for both endpoints. The checks that need nothing written run first; the rest
+        (subplan rules, files, kind, cycles, results_from) are the store's and engine's own, applied
+        by writing the plan inside one transaction that any error rolls back. Every error is
+        collected, so one call reports them all and leaves nothing behind."""
+        errors: list[str] = []
+
+        def check(label: str, fn: Any, *args: Any) -> Any:
+            try:
+                return fn(*args)
+            except (PlanError, ToolError) as e:
+                errors.append(f"{label}{e}")
+                return None
+
+        check("", _check_plan_args, parent_plan_id, working_directory, max_parallel, test_instructions)
+        keys = [n.key for n in nodes]
+        for k in sorted({k for k in keys if keys.count(k) > 1}):
+            errors.append(f"duplicate node key {k!r}")
+        known = set(keys)
+        for a, b in edges:
+            for k in (a, b):
+                if k not in known:
+                    errors.append(f"edge [{a!r}, {b!r}]: unknown node key {k!r}")
+        for n in nodes:
+            for k in n.results_from or ():
+                if k not in known:
+                    errors.append(f"node {n.key!r}: results_from names unknown node key {k!r}")
+        profiles = {n.key: check(f"node {n.key!r}: ", _profile_id, n.agent) for n in nodes}
+
+        ids: dict[str, int] = {}
+        try:
+            with store.transaction():
+                pid = check("", store.create_plan, title, description, parent_plan_id, parent_node_id,
+                            working_directory, max_parallel, (test_instructions or "").strip() or None)
+                if pid is not None:
+                    if default_profile_id is not None:
+                        store.set_plan_profile(pid, default_profile_id)
+                    for n in dict(zip(keys, nodes)).values():  # a duplicate key is already reported
+                        ref = check(f"node {n.key!r}: ", store.add_node, pid, n.title, n.description,
+                                    profiles[n.key], n.files, None, n.kind)
+                        if ref is not None:
+                            ids[n.key] = ref[1]
+                    for a, b in edges:
+                        if a in ids and b in ids:
+                            check(f"edge [{a!r}, {b!r}]: ", store.add_edge, pid, ids[a], ids[b])
+                    # results_from last: whether each is a dependency depends on every edge
+                    for n in nodes:
+                        if n.key not in ids or not n.results_from:
+                            continue
+                        wanted = [k for k in n.results_from if k in ids]
+                        bad = []
+                        for k in wanted:
+                            try:
+                                engine.check_results_from(pid, ids[n.key], [ids[k]])
+                            except PlanError:
+                                bad.append(k)
+                        if bad:
+                            errors.append(f"node {n.key!r}: results_from names {bad}, which it does not "
+                                          "depend on; add edges from them to it (directly or via other nodes)")
+                        store.set_node_results_from(pid, ids[n.key], [ids[k] for k in wanted])
+                if errors:
+                    raise ToolError("nothing was created:\n" + "\n".join(f"- {e}" for e in errors))
+        except PlanError as e:  # not one of the checks above: still nothing written
+            raise ToolError(str(e)) from e
+        if parent_plan_id is not None:
+            engine.notify_plan(parent_plan_id)
+        if any(n.files for n in nodes):
+            _notify_tree(pid)
+        else:
+            engine.notify_plan(pid)
+        engine.kick()
+        return {"plan_id": pid, "nodes": ids}
+
+    @mcp.tool()
+    def submit_plan(
+        title: str,
+        working_directory: str | None = None,
+        description: str = "",
+        test_instructions: str | None = None,
+        nodes: list[NodeSpec] | None = None,
+        edges: list[tuple[str, str]] | None = None,
+        parent_plan_id: int | None = None,
+        parent_node_id: int | None = None,
+        max_parallel: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a whole plan -- its nodes and edges -- in one call; the way to build a plan.
+        Returns {"plan_id": ..., "nodes": {key: node_id}}.
+
+        All or nothing: everything is checked first and every problem is reported in one error,
+        and then nothing at all has been created. start_plan runs it afterwards.
+
+        nodes: [{key, title, description, files, results_from, kind, agent}, ...]. key is your own
+        label, unique in this call. description: a self-contained instruction for whoever does
+        the work. files (optional): paths, relative to the working directory, that the node will
+        CREATE or MODIFY (reads need no declaration; a directory claims everything under it); nodes
+        that could run in parallel and share a file run one after the other, lowest number first.
+        results_from (optional): keys of earlier nodes whose result text it receives -- an edge
+        passes NOTHING -- each one a node it depends on through edges. kind (optional): "agent" or
+        "user", a step the user does themselves (push, deploy, approve); the plan waits there until
+        they mark it done. agent (optional): a profile from list_agents; omit to inherit.
+        edges: [[from_key, to_key], ...] -- from must finish before to starts; no cycles.
+
+        working_directory, test_instructions, max_parallel: as in create_plan (top-level plans
+        only; working_directory is required there). parent_plan_id + parent_node_id make this the
+        subplan of that node, which then completes when the whole subplan is done.
+        """
+        return _submit(title, working_directory, description, test_instructions, nodes or [],
+                       edges or [], parent_plan_id, parent_node_id, max_parallel)
+
     @mcp.tool()
     def create_plan(
         title: str,
@@ -393,7 +515,8 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         max_parallel: int | None = None,
         test_instructions: str | None = None,
     ) -> int:
-        """Create a new plan and return its integer id.
+        """Create an empty plan and return its integer id; submit_plan creates one with its nodes
+        and edges in a single call, and is the usual way.
 
         Pass parent_plan_id and parent_node_id to make this plan the subplan of that node
         (the node then represents "do this whole small plan" instead of a single task).
@@ -413,23 +536,7 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         verbatim; without it they work it out from the repository (README, CI config, ...).
         Subplans inherit it.
         """
-        if parent_plan_id is not None and max_parallel is not None:
-            raise ToolError("max_parallel can only be set on top-level plans")
-        if parent_plan_id is not None and test_instructions:
-            raise ToolError("test_instructions can only be set on top-level plans; a subplan "
-                            "uses its top-level plan's")
-        if parent_plan_id is None and working_directory is None:
-            raise ToolError(
-                "working_directory is required for a top-level plan: pass the absolute path of "
-                "the existing directory its agents should work in (e.g. the repository)")
-        if working_directory is not None:
-            if parent_plan_id is not None:
-                raise ToolError("working_directory can only be set on top-level plans; a subplan "
-                                "uses its top-level plan's directory")
-            try:
-                validate_working_directory(working_directory)
-            except PlanError as e:
-                raise ToolError(str(e)) from e
+        _check_plan_args(parent_plan_id, working_directory, max_parallel, test_instructions)
         try:
             pid = store.create_plan(title, description, parent_plan_id, parent_node_id, cwd=working_directory,
                                     max_parallel=max_parallel,
@@ -492,26 +599,11 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         results_from: list[int] | None = None,
         kind: str | None = None,
     ) -> tuple[int, int]:
-        """Add a node (one piece of work) to a plan. Returns (plan_id, node_id).
+        """Add one node to an existing plan, e.g. to extend or correct it. Returns (plan_id, node_id).
 
-        The description should be a self-contained instruction for the agent doing the work.
-        kind (optional): "agent" (default) or "user". A user node is the user's own job -- push a
-        branch, open an MR, deploy, approve something. No agent runs it: the plan stops there until
-        the user marks it done, then the nodes after it start as usual. Its description is the
-        instruction to the person, so write it for a human, not for an agent.
-        agent (optional): name (or id) of the agent profile that runs this node, e.g. a cheap local
-        model for a mechanical task and a strong one for a hard task; omit it to inherit the plan's.
-        files (optional): list the files this node will CREATE or MODIFY; reading is always allowed
-        and needs no declaration. Paths are relative to the plan's working directory, may name
-        files that do not exist yet, and a directory claims everything under it.
-        Example: files=["clearbox/store.py", "tests/"]. Two nodes that could otherwise run in
-        parallel and declare the same file run one after the other (lowest node number first)
-        instead of editing it at the same time. Nodes without files never wait for each other.
-        results_from (optional): node ids in this plan whose result text this node receives. An edge
-        only means "runs after" and passes NOTHING, so a node starts with no earlier results unless
-        it asks. Most nodes need none; a final documentation or summary node asks for every earlier
-        node. Each one must be a node this node depends on (directly or through other nodes): add
-        those edges too; start_plan refuses a request from a node that is not a dependency.
+        The fields are those of a submit_plan node, except that results_from takes node ids of this
+        plan; add the edges that make each one a dependency too (start_plan checks it). A new plan
+        is built in one submit_plan call instead.
         """
         profile_id = _profile_id(agent)
         try:
@@ -567,80 +659,39 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         description: str | None = None,
         files: list[str] | None = None,
         results_from: list[int] | None = None,
+        kind: str | None = None,
+        agent: str | int | None = None,
     ) -> str:
-        """Change the title, description, declared files and/or results_from of a node; only what you
-        pass changes.
+        """Change a node; only what you pass changes, and nothing does if any of it is rejected.
 
         files, results_from: omit (or pass null) to KEEP the current value; a list REPLACES it; []
-        clears it. Both can only change before the node has run. See add_node.
+        clears it. results_from takes node ids of this plan, each one a node it depends on through
+        edges. kind: "agent" or "user". These three can only change before the node has run.
+        agent: a profile name or id from list_agents; "" clears the node's own agent so it inherits
+        again. Applies the next time the node starts. See submit_plan / add_node for the fields.
         """
         try:
-            store.get_node(plan_id, node_id)
-            if results_from is not None:
-                _set_results_from(plan_id, node_id, results_from)
-            if files is not None:
-                store.set_node_files(plan_id, node_id, files)
+            with store.transaction():
+                store.get_node(plan_id, node_id)
+                if results_from is not None:
+                    engine.check_results_from(plan_id, node_id, results_from)
+                    store.set_node_results_from(plan_id, node_id, results_from)
+                if files is not None:
+                    store.set_node_files(plan_id, node_id, files)
+                if kind is not None:
+                    store.set_node_kind(plan_id, node_id, kind)
+                if agent is not None:
+                    store.set_node_profile(plan_id, node_id, _profile_id(agent))
+                fields = {k: v for k, v in (("title", title), ("description", description)) if v is not None}
+                store.update_node(plan_id, node_id, **fields)
         except PlanError as e:
             raise _files_error(plan_id, e) from e
-        fields = {k: v for k, v in (("title", title), ("description", description)) if v is not None}
-        store.update_node(plan_id, node_id, **fields)
         if files is not None:
             _notify_tree(plan_id)
-            engine.kick()  # a cleared or narrowed set may let a held-back node start
         else:
             engine.notify_plan(plan_id)
+        engine.kick()  # a narrowed file set or a node that became an agent's job may start now
         return "updated"
-
-    @mcp.tool()
-    def set_node_kind(plan_id: int, node_id: int, kind: str) -> str:
-        """Make a node the user's job (kind="user") or an agent's (kind="agent").
-
-        A user node is not run by any agent: the plan stops there until the user marks it done,
-        then the nodes after it start. Its description is the instruction to the person, so make
-        sure it reads that way. Only for nodes that have not run yet.
-        """
-        try:
-            store.set_node_kind(plan_id, node_id, kind)
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-        engine.notify_plan(plan_id)
-        engine.kick()  # a ready node that just became an agent's job can start now
-        return f"node {node_id} of plan {plan_id} is now a {kind} node"
-
-    @mcp.tool()
-    def set_node_files(plan_id: int, node_id: int, files: list[str] | None) -> list[str]:
-        """Replace the files a node will CREATE or MODIFY; returns the stored list. [] or null clears it.
-
-        Paths as for add_node: relative to the plan's working directory, a directory claims
-        everything under it, reads need no declaration. Only for nodes that have not run yet.
-        """
-        try:
-            stored = store.set_node_files(plan_id, node_id, files)
-        except PlanError as e:
-            raise _files_error(plan_id, e) from e
-        _notify_tree(plan_id)
-        engine.kick()  # a cleared or narrowed set may let a held-back node start
-        return [f["path"] for f in stored]
-
-    def _set_results_from(plan_id: int, node_id: int, ids: list[int] | None) -> list[int]:
-        engine.check_results_from(plan_id, node_id, ids)
-        return store.set_node_results_from(plan_id, node_id, ids)
-
-    @mcp.tool()
-    def set_node_results_from(plan_id: int, node_id: int, node_ids: list[int] | None) -> list[int]:
-        """Replace the earlier nodes whose result text this node receives; returns the stored ids.
-        [] or null clears it.
-
-        An edge only means "runs after" and passes nothing; ask for a result only when the node
-        needs that output, e.g. a final summary node asking for every earlier node. Each id must be
-        a node this node already depends on through edges. Only for nodes that have not run yet.
-        """
-        try:
-            stored = _set_results_from(plan_id, node_id, node_ids)
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-        engine.notify_plan(plan_id)
-        return stored
 
     @mcp.tool()
     def get_plan(plan_id: int) -> dict[str, Any]:
@@ -683,151 +734,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         """List the agent profiles nodes can run on.
 
         Each entry has name, harness, model, base_url, max_parallel, capability, test_level, ... and
-        `default: true` on the server-wide default profile (see create_agent for what capability and
-        test_level mean; null = the default). Secrets are never shown: `has_api_key` says whether a
-        key is available (from the api_key_env variable, or one stored through the web UI).
+        `default: true` on the server-wide default profile. capability is what the agent may do: read
+        (read and search only), run (also run commands), edit (also edit files, no commands) or full;
+        test_level how much a worker tests: none, light, standard or thorough (null = the default).
+        Profiles are set up in the web UI or over REST (/api/agents), not here. Secrets are never
+        shown: `has_api_key` says whether a key is available (from the api_key_env variable, or one
+        stored through the web UI).
         """
         return [_agent_view(p) for p in store.list_profiles()]
-
-    @mcp.tool()
-    def create_agent(
-        name: str,
-        harness: str,
-        model: str | None = None,
-        base_url: str | None = None,
-        api_key_env: str | None = None,
-        params: dict[str, Any] | None = None,
-        tools: dict[str, Any] | None = None,
-        permission_mode: str | None = None,
-        system_append: str | None = None,
-        max_parallel: int | None = None,
-        description: str = "",
-        capability: str | None = None,
-        test_level: str | None = None,
-    ) -> dict[str, Any]:
-        """Create an agent profile (a named harness + model) and return it.
-
-        name: unique and not purely numeric; nodes and plans refer to the profile by it.
-        harness: 'claude-sdk' (Claude Agent SDK; model e.g. "claude-opus-5-5", empty = server default),
-          'openai' (any OpenAI-compatible chat-completions endpoint) or 'mock' (fake agent for tests).
-        For 'openai': model is required; base_url is the endpoint root ending in /v1 (empty = the real
-          OpenAI API); api_key_env is the NAME of an environment variable of the Clearbox server
-          holding the key (local endpoints usually need none). Examples:
-            create_agent(name="gpt-mini", harness="openai", model="gpt-4o-mini",
-                         api_key_env="OPENAI_API_KEY")
-            create_agent(name="local-qwen", harness="openai", model="qwen2.5-coder:14b",
-                         base_url="http://localhost:11434/v1", max_parallel=1)   # Ollama
-            (LM Studio's default is base_url="http://localhost:1234/v1".)
-        A literal api key is deliberately NOT accepted here: secrets should not pass through a model's
-        context. Set the environment variable on the server, or enter the key in the web UI.
-        params: e.g. {"temperature": 0.2, "max_turns": 40, "timeout": 300}.
-        capability: what the agent may do, the same for every harness (null = full for workers,
-          run for reviewers):
-            read   read and search only; no edits, no commands
-            run    read, search and run commands; no edits        (the right default for reviewers)
-            edit   read, search and edit files; no commands
-            full   everything                                     (the right default for worker agents)
-        test_level: how much a worker agent is told to test (null = standard):
-            none      do not test; the node says what to verify, or nothing needs verifying
-            light     a quick sanity check that the change works -- one script or a couple of cases
-            standard  run the existing tests covering what you touched, and fix what you broke
-            thorough  run the full suite, and add tests for behaviour you added
-        permission_mode (claude-sdk only) and tools: {"preset": ..., "allow": [...], "deny": [...],
-          "mcp": true|false} (openai) are raw escape hatches; prefer capability.
-        system_append: extra system prompt text;
-        max_parallel: max nodes running on this profile at once, across all plans (null = no limit).
-        Run test_agent afterwards to check that the endpoint answers.
-        """
-        try:
-            pid = store.create_profile(
-                name=name, harness=harness, model=model, base_url=base_url, api_key_env=api_key_env,
-                params=params, tools=tools, permission_mode=permission_mode, system_append=system_append,
-                max_parallel=max_parallel, description=description, capability=capability,
-                test_level=test_level,
-            )
-            return _agent_view(store.get_profile(pid))
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-
-    @mcp.tool()
-    def update_agent(
-        agent: str | int,
-        name: str | None = None,
-        harness: str | None = None,
-        model: str | None = None,
-        base_url: str | None = None,
-        api_key_env: str | None = None,
-        params: dict[str, Any] | None = None,
-        tools: dict[str, Any] | None = None,
-        permission_mode: str | None = None,
-        system_append: str | None = None,
-        max_parallel: int | None = None,
-        description: str | None = None,
-        capability: str | None = None,
-        test_level: str | None = None,
-    ) -> dict[str, Any]:
-        """Change an agent profile (by name or id); only the fields you pass change. Returns it.
-
-        Pass "" to clear a text field (model, base_url, api_key_env, permission_mode, system_append,
-        capability, test_level -- back to the default) and 0 to remove the max_parallel limit;
-        params/tools replace the whole object. Applies to nodes that start afterwards. See
-        create_agent for the fields and the capability/test_level values; api keys are not accepted here.
-        """
-        profile = _profile_ref(agent)
-        fields: dict[str, Any] = {
-            k: v
-            for k, v in (("name", name), ("harness", harness), ("params", params), ("tools", tools),
-                         ("description", description))
-            if v is not None
-        }
-        for k, v in (("model", model), ("base_url", base_url), ("api_key_env", api_key_env),
-                     ("permission_mode", permission_mode), ("system_append", system_append),
-                     ("capability", capability), ("test_level", test_level)):
-            if v is not None:
-                fields[k] = v or None
-        if max_parallel is not None:
-            fields["max_parallel"] = max_parallel or None
-        try:
-            store.update_profile(profile["id"], **fields)
-            updated = _agent_view(store.get_profile(profile["id"]))
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-        engine.kick()  # a raised max_parallel may let waiting nodes start
-        return updated
-
-    @mcp.tool()
-    def delete_agent(agent: str | int) -> str:
-        """Delete an agent profile (by name or id).
-
-        Nodes and plans that used it lose that setting and inherit again (plan default -> server default).
-        """
-        profile = _profile_ref(agent)
-        # plans whose view changes: those with a node or a plan default on this profile
-        affected = {r["plan_id"] for r in store._q(
-            "SELECT plan_id FROM nodes WHERE agent_profile_id=? "
-            "UNION SELECT id FROM plans WHERE default_agent_profile_id=?", (profile["id"], profile["id"]))}
-        try:
-            store.delete_profile(profile["id"])
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-        for pid in affected:
-            engine.notify_plan(pid)
-        engine.kick()
-        return f"agent profile {profile['name']!r} deleted"
-
-    @mcp.tool()
-    def set_node_agent(plan_id: int, node_id: int, agent: str | int | None) -> str:
-        """Choose the agent profile (name or id) that runs one node; null clears the override so the
-        node inherits its plan's default again. Applies the next time the node starts."""
-        profile_id = _profile_id(agent)
-        try:
-            store.set_node_profile(plan_id, node_id, profile_id)
-        except PlanError as e:
-            raise ToolError(str(e)) from e
-        engine.notify_plan(plan_id)
-        if profile_id is None:
-            return f"node {node_id} of plan {plan_id} now inherits its agent ({_resolved_agent(plan_id, node_id)['name']})"
-        return f"node {node_id} of plan {plan_id} runs on agent {_profile_name(profile_id)!r}"
 
     @mcp.tool()
     def set_plan_agent(plan_id: int, agent: str | int | None) -> str:
@@ -848,20 +762,6 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         if profile_id is None:
             return f"plan {plan_id} no longer has a default agent"
         return f"plan {plan_id} (and its subplans) default to agent {_profile_name(profile_id)!r}"
-
-    @mcp.tool()
-    async def test_agent(agent: str | int) -> dict[str, Any]:
-        """Quick liveness check of an agent profile (by name or id). Never raises.
-
-        For 'openai' profiles it lists the endpoint's models (~10s timeout; endpoints without
-        /models get a tiny completion instead) and returns {ok, detail, reachable, model_listed,
-        models_sample, credential}; credential says where the key comes from ("env:OPENAI_API_KEY",
-        "literal", "none"), never the key itself. 'claude-sdk' and 'mock' need no check.
-        """
-        try:
-            return await registry.test(agent)  # shared with POST /api/agents/{id}/test
-        except PlanError as e:
-            return {"ok": False, "detail": f"{e}; list_agents shows the configured agent profiles", "models_sample": []}
 
     # ------------------------------------------------------------ reviews
     @mcp.tool()
@@ -1035,18 +935,50 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
             raise ToolError(f"plan {plan_id} is not inside the subplan of your node ({own_plan}, {own_node}); "
                             "you can only build below your own node")
 
-    @agent_mcp.tool(name="create_plan")
-    def agent_create_plan(ctx: Context, title: str, parent_plan_id: int, parent_node_id: int,
-                          description: str = "") -> int:
-        """Expand a node into a subplan and return the new plan's id.
+    def _no_agent(agent: str | int | None) -> None:
+        if agent is not None:
+            raise ToolError("agent is not accepted here: every node you add runs on your own agent, and "
+                            "a worker cannot choose another one. Leave agent out.")
 
-        parent_plan_id / parent_node_id: your own node, or a node of a subplan you created. The
-        subplan runs on your own agent (its plan default), inherits the working directory and test
-        instructions, and starts by itself once your session ends; add_node / add_edge on it next.
-        """
+    def _expanding(ctx: Context, parent_plan_id: int, parent_node_id: int) -> int | None:
+        """Check that a new subplan goes below the caller's own node; the caller's profile id."""
         plan_id, node_id, profile_id = _caller(ctx)
         if (parent_plan_id, parent_node_id) != (plan_id, node_id):
             _scoped(ctx, parent_plan_id)
+        return profile_id
+
+    @agent_mcp.tool(name="submit_plan")
+    def agent_submit_plan(ctx: Context, title: str, parent_plan_id: int, parent_node_id: int,
+                          description: str = "", nodes: list[NodeSpec] | None = None,
+                          edges: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+        """Expand a node into a whole subplan -- its nodes and edges -- in one call. Returns
+        {"plan_id": ..., "nodes": {key: node_id}}. All or nothing: every problem is reported in one
+        error, and then nothing has been created.
+
+        parent_plan_id / parent_node_id: your own node, or a node of a subplan you created. The
+        subplan runs on your own agent, inherits the working directory and test instructions, and
+        starts by itself once your session ends.
+        nodes: [{key, title, description, files, results_from, kind}, ...]; key is your own label.
+        description: a self-contained instruction for the agent doing the work. files (optional):
+        paths, relative to the working directory, it will CREATE or MODIFY; nodes that could run in
+        parallel and share a file run one after the other. results_from (optional): keys of nodes it
+        depends on whose result text it receives -- an edge passes nothing. kind="user" makes it a
+        person's job. agent is not accepted: every node runs on your own agent.
+        edges: [[from_key, to_key], ...] -- from must finish before to starts.
+        """
+        profile_id = _expanding(ctx, parent_plan_id, parent_node_id)
+        for n in nodes or ():
+            _no_agent(n.agent)
+        # never let expanding a node run the sub-work on a more capable agent than the node had
+        return _submit(title, None, description, None, nodes or [], edges or [], parent_plan_id,
+                       parent_node_id, None, default_profile_id=profile_id)
+
+    @agent_mcp.tool(name="create_plan")
+    def agent_create_plan(ctx: Context, title: str, parent_plan_id: int, parent_node_id: int,
+                          description: str = "") -> int:
+        """Expand a node into an empty subplan and return its id; submit_plan does it with the
+        nodes and edges in one call. As for submit_plan, the subplan runs on your own agent."""
+        profile_id = _expanding(ctx, parent_plan_id, parent_node_id)
         pid = create_plan(title, description, parent_plan_id, parent_node_id)
         if profile_id is not None:
             # never let expanding a node run the sub-work on a more capable agent than the node had
@@ -1060,16 +992,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
     @agent_mcp.tool(name="add_node")
     def agent_add_node(ctx: Context, plan_id: int, title: str, description: str = "",
                        files: list[str] | None = None, results_from: list[int] | None = None,
-                       kind: str | None = None) -> tuple[int, int]:
+                       kind: str | None = None, agent: str | int | None = None) -> tuple[int, int]:
         """Add a node (one piece of work) to a subplan of yours. Returns (plan_id, node_id).
 
-        The description should be a self-contained instruction for the agent doing the work; the
-        node runs on your own agent. files (optional): the paths it will CREATE or MODIFY, relative
-        to the working directory; nodes that could run in parallel and share a file run one after
-        the other. results_from (optional): node ids of this plan whose result text it receives --
-        an edge passes nothing -- each one a node it depends on. kind="user" makes it a person's job.
+        The fields are those of a submit_plan node, except that results_from takes node ids of this
+        plan. agent is not accepted: the node runs on your own agent.
         """
         _scoped(ctx, plan_id)
+        _no_agent(agent)
         return add_node(plan_id, title, description, None, files, results_from, kind)
 
     @agent_mcp.tool(name="add_edge", description=add_edge.__doc__)
@@ -1087,28 +1017,22 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         _scoped(ctx, plan_id)
         return remove_node(plan_id, node_id)
 
-    @agent_mcp.tool(name="update_node", description=update_node.__doc__)
+    @agent_mcp.tool(name="update_node")
     def agent_update_node(ctx: Context, plan_id: int, node_id: int, title: str | None = None,
                           description: str | None = None, files: list[str] | None = None,
-                          results_from: list[int] | None = None) -> str:
-        _scoped(ctx, plan_id)
-        return update_node(plan_id, node_id, title, description, files, results_from)
+                          results_from: list[int] | None = None, kind: str | None = None,
+                          agent: str | int | None = None) -> str:
+        """Change a node of a subplan of yours; only what you pass changes, and nothing does if any
+        of it is rejected.
 
-    @agent_mcp.tool(name="set_node_kind", description=set_node_kind.__doc__)
-    def agent_set_node_kind(ctx: Context, plan_id: int, node_id: int, kind: str) -> str:
+        files, results_from: omit (or pass null) to KEEP the current value; a list REPLACES it; []
+        clears it. results_from takes node ids of this plan, each one a node it depends on through
+        edges. kind: "agent" or "user". These three can only change before the node has run.
+        agent is not accepted: the node runs on your own agent.
+        """
         _scoped(ctx, plan_id)
-        return set_node_kind(plan_id, node_id, kind)
-
-    @agent_mcp.tool(name="set_node_files", description=set_node_files.__doc__)
-    def agent_set_node_files(ctx: Context, plan_id: int, node_id: int, files: list[str] | None) -> list[str]:
-        _scoped(ctx, plan_id)
-        return set_node_files(plan_id, node_id, files)
-
-    @agent_mcp.tool(name="set_node_results_from", description=set_node_results_from.__doc__)
-    def agent_set_node_results_from(ctx: Context, plan_id: int, node_id: int,
-                                    node_ids: list[int] | None) -> list[int]:
-        _scoped(ctx, plan_id)
-        return set_node_results_from(plan_id, node_id, node_ids)
+        _no_agent(agent)
+        return update_node(plan_id, node_id, title, description, files, results_from, kind)
 
     @agent_mcp.tool(name="get_plan", description=get_plan.__doc__)
     def agent_get_plan(ctx: Context, plan_id: int) -> dict[str, Any]:

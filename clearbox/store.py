@@ -25,7 +25,8 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plans (
@@ -353,6 +354,25 @@ class Store:
     def _exec(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._db.execute(sql, args)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run a block of store calls all or nothing: any exception rolls every write in it back.
+
+        Holds the lock throughout, so no other thread sees (or interleaves with) the block's
+        writes. A nested block joins the outer one.
+        """
+        with self._lock:
+            if self._db.in_transaction:
+                yield
+                return
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            self._db.execute("COMMIT")
 
     # -------------------------------------------------------------------- plans
     def create_plan(
