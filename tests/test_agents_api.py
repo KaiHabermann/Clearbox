@@ -5,9 +5,9 @@ assignment with the resolved `agent.source` / delete, the "agents" SSE message,
 and -- explicitly -- that no response body ever contains `api_key` or the secret.
 
 Run:  uv run clearbox --mock      (one shell)
-      uv run python tests/test_agents_api.py [http://127.0.0.1:8765]
+      uv run python tests/test_agents_api.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
 """
-import asyncio, json, sys, tempfile, threading, time, uuid
+import asyncio, json, os, sys, tempfile, threading, time, uuid
 import urllib.error
 import urllib.request
 from mcp.client.client import Client
@@ -17,7 +17,7 @@ from mcp.client.client import Client
 def wd():
     return tempfile.mkdtemp(prefix="cb-test-")
 
-URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
+URL = sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}"
 SECRET = "sk-test-" + uuid.uuid4().hex
 bodies: list[str] = []  # every REST response body, scanned for leaks at the end
 

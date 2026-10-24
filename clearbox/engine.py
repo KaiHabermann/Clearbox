@@ -126,7 +126,7 @@ Testing: standard. Run the existing tests that cover what you touched, and fix w
 Add a test only when you added behaviour nothing covers. Do not build new harnesses. Each test
 file's docstring in tests/ carries the exact commands to run it; most need a mock server of
 their own (`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`).
-Pick a high random port and temp paths; never use port 8765 or the project's own database, and
+Pick a high random port and temp paths; never use port {server_port} or the project's own database, and
 stop the server when you are done.
 """.strip(),
     "thorough": """
@@ -134,18 +134,19 @@ Testing: thorough. Run the full suite and add tests for the behaviour you added.
 done while a test you can run is failing. Each test file's docstring in tests/ carries the exact
 commands to run it; most need a mock server of their own
 (`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`). Pick a high
-random port and temp paths; never use port 8765 or the project's own database, and stop the
+random port and temp paths; never use port {server_port} or the project's own database, and stop the
 server when you are done.
 """.strip(),
 }
 DEFAULT_TEST_LEVEL = "standard"
 
 
-def worker_system_append(profile: dict[str, Any] | None) -> str:
+def worker_system_append(profile: dict[str, Any] | None, server_port: int) -> str:
     """The worker prompt: SYSTEM_APPEND, the test-level paragraph for ``profile`` (NULL/absent =
-    standard), then SUMMARY_NOTE."""
+    standard), then SUMMARY_NOTE. ``server_port`` is the port this server listens on, which the
+    test notes tell the agent to keep clear of."""
     level = (profile or {}).get("test_level") or DEFAULT_TEST_LEVEL
-    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL])
+    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL]).format(server_port=server_port)
     return "\n\n".join((SYSTEM_APPEND, note, SUMMARY_NOTE))
 
 
@@ -164,7 +165,7 @@ exactly the failure this catches. Most tests need a mock server of their own:
   uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>
   uv run python tests/<name>.py http://127.0.0.1:<free port>
 
-Pick a high random port and temp paths; never use port 8765 or the project's own database, and
+Pick a high random port and temp paths; never use port {server_port} or the project's own database, and
 stop the server when you are done. `tests/test_openai_harness.py` needs no server. Each test
 file's docstring says how to run it if it differs.
 
@@ -249,6 +250,7 @@ class EngineConfig:
     workdir: str = "workspace"
     max_concurrency: int = 3
     expose_mcp_to_agents: bool = True
+    server_port: int = 8765   # the port this server listens on; agents are told to keep clear of it
 
 
 @dataclass
@@ -928,7 +930,7 @@ class Engine:
                 plan_id=plan_id,
                 node_id=node_id,
                 prompt=self._review_prompt(plan_id, node_id),
-                system_append=REVIEW_SYSTEM_APPEND,
+                system_append=REVIEW_SYSTEM_APPEND.format(server_port=self.config.server_port),
                 cwd=self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_node(plan_id, node_id)["title"],
@@ -1044,7 +1046,7 @@ class Engine:
                 plan_id=plan_id,
                 node_id=0,
                 prompt=self._plan_review_prompt(plan_id),
-                system_append=PLAN_REVIEW_SYSTEM_APPEND,
+                system_append=PLAN_REVIEW_SYSTEM_APPEND.format(server_port=self.config.server_port),
                 cwd=self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_plan(plan_id)["title"],
@@ -1170,7 +1172,7 @@ class Engine:
                            harness: Harness) -> None:
         key = (plan_id, node_id)
         try:
-            system_append = worker_system_append(profile)
+            system_append = worker_system_append(profile, self.config.server_port)
             if self.config.expose_mcp_to_agents:
                 system_append += "\n\n" + EXPAND_HINT.format(plan_id=plan_id, node_id=node_id)
             job = AgentJob(
@@ -1461,7 +1463,7 @@ class Engine:
                             "title": n["title"],
                             "description": n["description"],
                             "workdir": self.plan_workdir(pid),
-                            "instructions": worker_system_append(None) + "\n\n" + hint
+                            "instructions": worker_system_append(None, self.config.server_port) + "\n\n" + hint
                             + "\n\nReport progress with report_progress, and finish with complete_node "
                               "(or fail_node).",
                             "context": self.build_context(pid, n["node_id"]),

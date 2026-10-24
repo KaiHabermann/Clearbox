@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import tempfile
 
 from mcp.client.client import Client
@@ -59,12 +60,12 @@ async def main(url: str, start: bool, workdir: str | None = None) -> None:
 
         if start:
             print(await call("start_plan", plan_id=plan, executor="builtin"))
-        print("open http://127.0.0.1:8765/ to watch")
+        print(f"open {url.removesuffix('/mcp')}/ to watch")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://127.0.0.1:8765/mcp")
+    ap.add_argument("--url", default=f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}/mcp")
     ap.add_argument("--start", action="store_true")
     ap.add_argument("--dir", help="working directory for the plan (default: a fresh temp dir)")
     a = ap.parse_args()

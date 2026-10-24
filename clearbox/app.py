@@ -209,6 +209,7 @@ def create_app(settings: Settings) -> FastAPI:
             workdir=settings.workdir,
             max_concurrency=settings.max_concurrency,
             expose_mcp_to_agents=settings.expose_mcp_to_agents,
+            server_port=settings.port,
         ),
     )
     mcp = build_mcp(engine)

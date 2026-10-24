@@ -5,9 +5,9 @@ get_plan and the REST node view, update_node / set_node_files / PUT .../files.
 Scheduling with files is proven in test_file_conflicts.py.
 
 Run:  uv run clearbox --mock --mock-speed 20      (one shell)
-      uv run python tests/test_flow.py [http://127.0.0.1:8765]
+      uv run python tests/test_flow.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
 """
-import asyncio, json, sys, tempfile, time
+import asyncio, json, os, sys, tempfile, time
 import urllib.error
 import urllib.request
 from mcp.client.client import Client
@@ -17,7 +17,7 @@ from mcp.client.client import Client
 def wd():
     return tempfile.mkdtemp(prefix="cb-test-")
 
-URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765"
+URL = sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}"
 
 async def main():
     async with Client(URL + "/mcp") as c:

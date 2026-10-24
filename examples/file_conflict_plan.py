@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import tempfile
 import time
 
@@ -86,7 +87,7 @@ async def main(a: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://127.0.0.1:8765/mcp")
+    ap.add_argument("--url", default=f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}/mcp")
     ap.add_argument("--start", action="store_true")
     ap.add_argument("--dir", help="working directory for the plan (default: a fresh temp dir)")
     asyncio.run(main(ap.parse_args()))

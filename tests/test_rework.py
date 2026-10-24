@@ -11,9 +11,9 @@ of from explicit instructions) is not covered here; it needs an agent that reall
 edits something.
 
 Run:  uv run clearbox --mock      (one shell)
-      uv run python tests/test_rework.py [http://127.0.0.1:8765]
+      uv run python tests/test_rework.py [http://127.0.0.1:<port>]  (default: $CLEARBOX_PORT, else 8765)
 """
-import asyncio, json, sys, tempfile, time, urllib.error, urllib.request
+import asyncio, json, os, sys, tempfile, time, urllib.error, urllib.request
 
 from mcp.client.client import Client
 
@@ -22,7 +22,7 @@ from mcp.client.client import Client
 def wd():
     return tempfile.mkdtemp(prefix="cb-test-")
 
-URL = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8765").rstrip("/")
+URL = (sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}").rstrip("/")
 MARKER = "MARKER-rework-brief-must-reach-the-prompt"
 
 

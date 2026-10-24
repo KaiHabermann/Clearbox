@@ -38,7 +38,8 @@ uv run clearbox --mock          # fake agents: try the UI without spending token
 uv run python examples/demo_plan.py --start
 ```
 
-Open <http://127.0.0.1:8765/>.
+Open <http://127.0.0.1:8765/>. The port is `--port` / `CLEARBOX_PORT` (default `8765`); the
+examples, the tests and this repo's `.mcp.json` follow `CLEARBOX_PORT` too.
 
 For real agents drop `--mock`. Built-in agents run through the Claude Agent SDK, which ships its
 own Claude Code CLI and uses your existing Claude login (or `ANTHROPIC_API_KEY`).
@@ -63,7 +64,8 @@ Without uv: `pip install -e .` then `clearbox ...` (or `python -m clearbox ...`)
 
 ### Connect a model
 
-The MCP endpoint is `http://127.0.0.1:8765/mcp` (streamable HTTP).
+The MCP endpoint is `http://127.0.0.1:8765/mcp` (streamable HTTP; use your port if you passed
+`--port`).
 
 ```powershell
 claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
@@ -403,7 +405,7 @@ Every worker prompt ends with a testing paragraph chosen by the profile's `test_
 
 **`standard` is the default**, for new profiles and for every existing one (`null`), and for
 external agents claiming through `claim_next_node`. `standard` and `thorough` also tell the agent
-where the run commands live (each test file's docstring) and never to use port 8765 or the project's
+where the run commands live (each test file's docstring) and never to use the server's own port or the project's
 own database. The level is for worker agents only: reviewers keep their own prompt and **always run
 the suite** before giving a verdict, whatever the profile's level — which is why they need
 capability `run`.
