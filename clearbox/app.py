@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 from starlette.routing import Route
 
@@ -23,6 +26,7 @@ from .mcp_tools import build_mcp
 from .store import PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
+WILDCARD_HOSTS = ("0.0.0.0", "::", "")
 
 
 @dataclass
@@ -43,10 +47,11 @@ class Settings:
     openai_base_url: str | None = None
     openai_model: str | None = None
     openai_api_key_env: str = "OPENAI_API_KEY"
+    allowed_hosts: list[str] = field(default_factory=list)  # --allowed-host: extra names for the Host check
 
     @property
     def mcp_url(self) -> str:
-        host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
+        host = "127.0.0.1" if self.host in WILDCARD_HOSTS else self.host
         return f"http://{host}:{self.port}/mcp"
 
     @property
@@ -193,6 +198,73 @@ class AgentTokenGate:
         await self.app(scope, receive, send)
 
 
+def _host_entry(name: str) -> str:
+    """A bare IPv6 address as it appears in a Host header (``::1`` -> ``[::1]``); others unchanged."""
+    return f"[{name}]" if name.count(":") > 1 and not name.startswith("[") else name
+
+
+def _has_port(entry: str) -> bool:
+    return "]:" in entry if entry.startswith("[") else ":" in entry
+
+
+def allowed_hosts(settings: Settings) -> set[str]:
+    """Host header values the server answers to: loopback, the --host it binds (unless a
+    wildcard) and every --allowed-host. A name without a port allows it with the server's port and
+    without one (a reverse proxy or a default port drops it); ``name:port`` allows just that."""
+    names = ["127.0.0.1", "localhost", "::1", *settings.allowed_hosts]
+    if settings.host not in WILDCARD_HOSTS:
+        names.append(settings.host)
+    out: set[str] = set()
+    for n in names:
+        n = _host_entry(n.strip().lower())
+        if not n:
+            continue
+        out.add(n)
+        if not _has_port(n):
+            out.add(f"{n}:{settings.port}")
+    return out
+
+
+def is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class HostCheck:
+    """ASGI middleware in front of everything (REST, /api/stream, /mcp, /mcp-agent, the UI).
+
+    A request whose Host is not one of ours is a DNS-rebinding page -- its own name resolving to
+    127.0.0.1, so the browser calls it same-origin -- and gets a 421. A request whose Origin is
+    not one of ours is another web page calling across origins and gets a 403. Browsers send
+    Origin on every cross-origin and every non-GET fetch, so the UI's own requests carry ours;
+    curl, MCP clients and the tests send none and pass. Headers only, so streams are untouched.
+    """
+
+    def __init__(self, app: Any, allowed: set[str]):
+        self.app, self.allowed = app, allowed
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            headers = {k: v.decode("latin-1") for k, v in scope["headers"]}
+            host = headers.get(b"host", "").lower()
+            origin = headers.get(b"origin")
+            reason = None
+            if host not in self.allowed:
+                reason, code = f"Host {host!r} is not allowed (see --allowed-host)\n", 421
+            elif origin is not None:
+                o = urlsplit(origin)
+                if o.scheme not in ("http", "https") or o.netloc.lower() not in self.allowed:
+                    reason, code = f"cross-origin request from {origin!r} refused\n", 403
+            if reason:
+                await PlainTextResponse(reason, status_code=code)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def review_view(r: dict[str, Any] | None) -> dict[str, Any] | None:
     """A review row as the UI/REST sees it: verdict, summary, findings, agent, when. None if unreviewed."""
     if r is None:
@@ -236,17 +308,25 @@ def create_app(settings: Settings) -> FastAPI:
         ),
     )
     mcp, agent_mcp = build_mcp(engine)
+    # The MCP SDK has a Host/Origin check of its own, on by default only for a loopback --host
+    # (and then for any port). HostCheck already covers /mcp and /mcp-agent; giving the SDK the
+    # same allowlist keeps the two from disagreeing, e.g. on an --allowed-host name.
+    hosts = allowed_hosts(settings)
+    security = TransportSecuritySettings(
+        allowed_hosts=sorted(hosts),
+        allowed_origins=sorted(f"{s}://{h}" for s in ("http", "https") for h in hosts),
+    )
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
-        host=settings.host,
+        transport_security=security,
     )
     agent_mcp_app = agent_mcp.streamable_http_app(
         streamable_http_path="/mcp-agent/{token}",
         stateless_http=True,
         json_response=True,
-        host=settings.host,
+        transport_security=security,
     )
 
     @contextlib.asynccontextmanager
@@ -262,6 +342,7 @@ def create_app(settings: Settings) -> FastAPI:
                 await engine.shutdown()
 
     app = FastAPI(title="Clearbox", lifespan=lifespan)
+    app.add_middleware(HostCheck, allowed=hosts)
     app.state.engine = engine
     app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp

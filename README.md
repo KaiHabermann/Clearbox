@@ -611,6 +611,7 @@ and every later plan can use it. Two things worth knowing when a plan builds Cle
 | Flag | Env | Default |
 | --- | --- | --- |
 | `--host`, `--port` | `CLEARBOX_HOST`, `CLEARBOX_PORT` | `127.0.0.1`, `8765` |
+| `--allowed-host NAME[:PORT]` (repeatable) | `CLEARBOX_ALLOWED_HOSTS` (comma-separated) | loopback and `--host` only |
 | `--db` | `CLEARBOX_DB` | `<data dir>/clearbox.db` |
 | `--workdir` | `CLEARBOX_WORKDIR` | `<data dir>/workspace` |
 | `--max-concurrency` | `CLEARBOX_MAX_CONCURRENCY` | `3` |
@@ -640,6 +641,16 @@ prompts for Bash, and an SDK session has nobody to answer, so agents could not r
 is what capability replaced. `bypassPermissions` lifts every check (only in a sandbox). For
 `openai` agents the raw equivalent is the profile's `tools` preset.
 
+**Security.** The API has no authentication: whoever can reach the port can run agents with
+shell access on this machine. It listens on `127.0.0.1` by default, and every request must be
+addressed to one of the server's own names (`127.0.0.1`, `localhost`, `[::1]`, the `--host` it
+binds unless that is a wildcard, and each `--allowed-host`) or it gets a `421`; a request whose
+`Origin` is not one of those gets a `403`. That keeps other web pages in your browser away from
+it, including through DNS rebinding. Serving it under a name or on the network (`--host 0.0.0.0`,
+which prints a warning) needs that name in `--allowed-host`, e.g. `--allowed-host mybox.lan`; a
+name without a port is allowed with the server's port and without one (behind a reverse proxy).
+Only do that on a network you trust.
+
 ## Layout of the code
 
 ```
@@ -667,6 +678,7 @@ tests/test_flow.py          end-to-end test (run against a server started with -
 tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rules
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
 tests/test_agent_scope.py   the workers' scoped MCP endpoint: subtree rule, inherited agent, token lifetime
+tests/test_host_check.py    Host and Origin checks: foreign names and pages refused, own names and the stream pass
 tests/test_openai_harness.py  the agent loop against tests/fake_openai.py (no network, no DB)
 ```
 

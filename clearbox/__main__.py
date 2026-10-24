@@ -9,7 +9,7 @@ import sys
 
 import uvicorn
 
-from .app import Settings, create_app
+from .app import Settings, create_app, is_loopback
 from .bootstrap import StartupError
 
 
@@ -41,6 +41,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="clearbox", description=__doc__)
     ap.add_argument("--host", default=env("CLEARBOX_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(env("CLEARBOX_PORT", "8765")))
+    ap.add_argument("--allowed-host", action="append", metavar="NAME[:PORT]",
+                    default=[h for h in env("CLEARBOX_ALLOWED_HOSTS", "").split(",") if h.strip()],
+                    help="also answer requests addressed to this name (repeatable); loopback and "
+                         "--host are always allowed, any other Host or Origin is refused")
     ap.add_argument("--db", default=env("CLEARBOX_DB", legacy or os.path.join(data_dir, "clearbox.db")),
                     help=f"SQLite file (default: {os.path.join(data_dir, 'clearbox.db')})")
     ap.add_argument("--workdir", default=env("CLEARBOX_WORKDIR", os.path.join(data_dir, "workspace")),
@@ -85,6 +89,7 @@ def main() -> None:
         openai_base_url=args.openai_base_url,
         openai_model=args.openai_model,
         openai_api_key_env=args.openai_api_key_env,
+        allowed_hosts=args.allowed_host,
     )
     try:
         app = create_app(settings)
@@ -98,6 +103,10 @@ def main() -> None:
     if legacy and os.path.abspath(settings.db) == legacy:
         print(f"                  (a clearbox.db in this folder; the default is now "
               f"{os.path.join(data_dir, 'clearbox.db')} -- move it there, or keep passing --db)")
+    if not is_loopback(settings.host):
+        print(f"WARNING:          listening on {settings.host}: the API has no authentication, so anyone "
+              f"who can reach port {settings.port} can run agents with shell access on this machine. "
+              f"Requests must name an allowed host (--allowed-host).")
     # Ctrl+C must always get the port back. uvicorn waits for open connections *before* running
     # the lifespan shutdown, and /api/stream is endless, so the app has to notice the stop itself:
     # it watches server.should_exit, which is set the moment the signal arrives. The timeout is
