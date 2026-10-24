@@ -93,7 +93,7 @@ jobs:
           /tmp/fresh/bin/python -c "
           from pathlib import Path
           import clearbox.app as a
-          for f in ('index.html', 'app.js', 'style.css'):
+          for f in ('index.html', 'style.css', 'app.js', 'core.js', 'graph.js', 'drawer.js', 'agents.js'):
               assert (a.STATIC / f).is_file(), f'{f} missing from the installed package'
           print('static UI present in the installed wheel')
           "

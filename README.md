@@ -673,7 +673,8 @@ clearbox/
     registry.py      picks the harness for a node; per-profile caches and limits
     openai_check.py  /models check behind POST /api/agents/{id}/test
     probe.py         tiny completion round trip when there is no /models listing
-  static/         UI (plain HTML/CSS/JS, no build step)
+  static/         UI (plain HTML/CSS and ES modules, no build step): app.js (entry: routing, plan
+                  view, live feed), core.js (state, helpers), graph.js, drawer.js, agents.js
 examples/demo_plan.py       builds a demo plan through MCP
 examples/mixed_plan.py      builds a plan that mixes a cheap and a strong agent
 tests/unit/                 in-process unit tests of the scheduler and store: `uv run pytest`
