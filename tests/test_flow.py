@@ -29,7 +29,8 @@ async def main():
             return sc.get("result", sc) if sc is not None else json.loads(r.content[0].text)
 
         # --- cycle rejection
-        p = await call("create_plan", title="External flow", working_directory=wd())
+        p = await call("create_plan", title="External flow", working_directory=wd(),
+                       test_instructions="run `make check-ext`")
         a = (await call("add_node", plan_id=p, title="A"))[1]
         b = (await call("add_node", plan_id=p, title="B"))[1]
         cc = (await call("add_node", plan_id=p, title="C"))[1]
@@ -46,6 +47,7 @@ async def main():
         await asyncio.sleep(0.2)
         job = await call("claim_next_node", agent_name="ext-1")
         assert (job["plan_id"], job["node_id"]) == (p, a), job
+        assert "run `make check-ext`" in job["instructions"], job["instructions"]  # same as built-in agents
         assert await call("claim_next_node", agent_name="ext-2", plan_id=p) is None  # B blocked
         await call("report_progress", plan_id=p, node_id=a, message="working on A")
         # expand A into a subplan while it runs
@@ -157,6 +159,27 @@ async def main():
                     return resp.status, json.loads(resp.read())
             except urllib.error.HTTPError as e:
                 return e.code, json.loads(e.read())
+
+        # --- test_instructions: set on the top-level plan, inherited by subplans
+        t = await call("create_plan", title="Test instructions", working_directory=wd(),
+                       test_instructions="  pytest -q  ")
+        t1 = (await call("add_node", plan_id=t, title="T1"))[1]
+        ts = await call("create_plan", title="t sub", parent_plan_id=t, parent_node_id=t1)
+        assert (await call("get_plan", plan_id=t))["test_instructions"] == "pytest -q"
+        assert (await call("get_plan", plan_id=ts))["test_instructions"] == "pytest -q"
+        await call("update_plan", plan_id=t, test_instructions="make test")
+        assert (await call("get_plan", plan_id=ts))["test_instructions"] == "make test"
+        try:
+            await call("update_plan", plan_id=ts, test_instructions="nope"); print("FAIL subplan set")
+        except RuntimeError as e:
+            assert "top-level" in str(e), e
+        code, body = rest("PATCH", f"/api/plans/{t}", {"test_instructions": "tox"})
+        assert code == 200 and body["plan"]["test_instructions"] == "tox", (code, body)
+        assert rest("GET", f"/api/plans/{ts}")[1]["test_instructions"] == "tox"
+        assert rest("PATCH", f"/api/plans/{ts}", {"test_instructions": "x"})[0] == 400
+        await call("update_plan", plan_id=t, test_instructions="")
+        assert (await call("get_plan", plan_id=ts))["test_instructions"] is None
+        print("test_instructions OK")
 
         f = await call("create_plan", title="Files", working_directory=wd())
         f1 = (await call("add_node", plan_id=f, title="one", files=["Shared.txt", "docs/"]))[1]

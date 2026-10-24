@@ -77,7 +77,8 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 
 | Tool | What it does |
 | --- | --- |
-| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. |
+| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
+| `update_plan(plan_id, max_parallel=None, test_instructions=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions. Same as `PATCH /api/plans/{plan_id}`. |
 | `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | New node → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier nodes whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
 | `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
 | `remove_edge`, `remove_node` | Corrections while building. |
@@ -85,7 +86,7 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 | `set_node_files(plan_id, node_id, files)` | Replace a node's declared files on their own, without touching title/description; `[]` or `null` clears them. Only before the node has run. |
 | `set_node_results_from(plan_id, node_id, node_ids)` | Replace the earlier nodes whose result text the node receives; `[]` or `null` clears them. Each must be a node it already depends on through edges. Only before the node has run. |
 | `set_node_kind(plan_id, node_id, kind)` | Make a node the user's job (`"user"`) or an agent's (`"agent"`), see [User-job nodes](#user-job-nodes-a-step-a-person-does). Only before the node has run. |
-| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
+| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `working_directory`, `test_instructions` (the top-level plan's, for a subplan too), `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
 | `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. |
 | `create_agent(name, harness, model=None, base_url=None, api_key_env=None, params=None, tools=None, permission_mode=None, system_append=None, max_parallel=None, description="", capability=None, test_level=None)` | New agent profile. `capability` (`read` \| `run` \| `edit` \| `full`) and `test_level` (`none` \| `light` \| `standard` \| `thorough`) are explained under [Capability](#capability-what-an-agent-may-do) and [Test levels](#test-levels-how-much-a-worker-agent-tests); `permission_mode` and `tools` are raw escape hatches. Deliberately takes no literal `api_key`: secrets should not pass through a model's context. |
 | `update_agent(agent, …same fields…)` | Change only the fields passed; `""` clears a text field (for `capability` / `test_level`: back to the default), `max_parallel=0` removes the limit, `params`/`tools` replace the whole object. |
@@ -404,11 +405,15 @@ Every worker prompt ends with a testing paragraph chosen by the profile's `test_
 | `thorough` | run the full suite, and add tests for behaviour you added |
 
 **`standard` is the default**, for new profiles and for every existing one (`null`), and for
-external agents claiming through `claim_next_node`. `standard` and `thorough` also tell the agent
-where the run commands live (each test file's docstring) and never to use the server's own port or the project's
-own database. The level is for worker agents only: reviewers keep their own prompt and **always run
-the suite** before giving a verdict, whatever the profile's level — which is why they need
-capability `run`.
+external agents claiming through `claim_next_node`. `standard` and `thorough` also say how the
+project's tests are run: the plan's `test_instructions` verbatim when it has them (set them on
+`create_plan`, `update_plan` or the 🧪 pill in the UI's topbar), otherwise an instruction to work
+it out from the repository itself (README, CLAUDE.md / AGENTS.md, CI config, the test files)
+rather than invent a harness. Either way the agent is told that any server it starts for testing
+gets a free port, never the port of the Clearbox server running the plan. The level is for worker
+agents only: reviewers keep their own prompt and **always run the suite** before giving a verdict,
+whatever the profile's level — which is why they need capability `run`. They get the same
+how-to-test text.
 
 ### Which agent runs a node
 
@@ -526,6 +531,8 @@ the whole flow can be watched for free.
   key, choose **What may this agent do** (the [capability](#capability-what-an-agent-may-do)) and
   its **Test level**, cap its parallelism, and **Test connection** before trusting it. The raw
   **Permission mode** and **Tools preset** selects sit under *Advanced* as escape hatches.
+* The topbar's 📁 pill shows a top-level plan's working directory (click to change it before the
+  plan starts); the 🧪 pill next to it holds its `test_instructions` (click to edit, any time).
 * A reviewed node carries a small verdict marker (✓ / ! / ?) in its top-right corner; its full-view
   **Review** tab shows the verdict, summary and findings and a button to (re-)review it on demand.
   A review chip next to the plan status does the same for the plan-level review, see

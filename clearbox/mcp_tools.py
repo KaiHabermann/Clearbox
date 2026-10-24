@@ -205,6 +205,8 @@ Building a plan:
   1. create_plan(title, description, working_directory) -> plan_id
      working_directory is required: the absolute path of the existing directory the plan's
      agents work in (usually the repository). Subplans inherit it.
+     Optionally pass test_instructions: how this project's tests are run. Worker and reviewer
+     agents get it verbatim; without it they work it out from the repository.
   2. add_node(plan_id, title, description) -> [plan_id, node_id]   (one call per piece of work)
   3. add_edge(plan_id, from_node_id, to_node_id)                   (dependencies)
   A node can itself be a small plan: create_plan(..., parent_plan_id, parent_node_id) attaches
@@ -345,6 +347,7 @@ def build_mcp(engine: Engine) -> MCPServer:
             "title": p["title"],
             "description": p["description"],
             "working_directory": engine.plan_workdir(plan_id),
+            "test_instructions": engine.plan_test_instructions(plan_id),
             "parent": [p["parent_plan_id"], p["parent_node_id"]] if p["parent_plan_id"] else None,
             "max_parallel": p["max_parallel"],
             "default_agent": _profile_name(p["default_agent_profile_id"]),
@@ -363,6 +366,7 @@ def build_mcp(engine: Engine) -> MCPServer:
         parent_node_id: int | None = None,
         working_directory: str | None = None,
         max_parallel: int | None = None,
+        test_instructions: str | None = None,
     ) -> int:
         """Create a new plan and return its integer id.
 
@@ -378,9 +382,17 @@ def build_mcp(engine: Engine) -> MCPServer:
         (including its subplans) run at once, regardless of the server's global concurrency
         cap; null = no plan-specific limit. Useful to keep one plan from taking every free
         slot, or to throttle a plan whose agents share a rate-limited resource.
+
+        test_instructions (top-level plans only): free text saying how this project's tests are
+        run (commands, servers they need, what to avoid). Worker and reviewer agents get it
+        verbatim; without it they work it out from the repository (README, CI config, ...).
+        Subplans inherit it.
         """
         if parent_plan_id is not None and max_parallel is not None:
             raise ToolError("max_parallel can only be set on top-level plans")
+        if parent_plan_id is not None and test_instructions:
+            raise ToolError("test_instructions can only be set on top-level plans; a subplan "
+                            "uses its top-level plan's")
         if parent_plan_id is None and working_directory is None:
             raise ToolError(
                 "working_directory is required for a top-level plan: pass the absolute path of "
@@ -395,7 +407,8 @@ def build_mcp(engine: Engine) -> MCPServer:
                 raise ToolError(str(e)) from e
         try:
             pid = store.create_plan(title, description, parent_plan_id, parent_node_id, cwd=working_directory,
-                                    max_parallel=max_parallel)
+                                    max_parallel=max_parallel,
+                                    test_instructions=(test_instructions or "").strip() or None)
         except PlanError as e:
             raise ToolError(str(e)) from e
         if parent_plan_id is not None:
@@ -405,16 +418,22 @@ def build_mcp(engine: Engine) -> MCPServer:
         return pid
 
     @mcp.tool()
-    def update_plan(plan_id: int, max_parallel: int | None = None) -> str:
+    def update_plan(plan_id: int, max_parallel: int | None = None, test_instructions: str | None = None) -> str:
         """Change a top-level plan's own settings; only the fields you pass change.
 
         max_parallel: cap how many nodes of this plan's whole tree run at once (0 or null
         removes the limit). Only meaningful on top-level plans; subplans share their root
         plan's cap. See create_plan.
+
+        test_instructions: how this project's tests are run, as in create_plan; "" removes
+        them (agents then work it out from the repository). Top-level plans only; nodes that
+        start afterwards get the new text.
         """
         fields: dict[str, Any] = {}
         if max_parallel is not None:
             fields["max_parallel"] = max_parallel or None
+        if test_instructions is not None:
+            fields["test_instructions"] = test_instructions.strip() or None
         if fields:
             try:
                 store.update_plan(plan_id, **fields)

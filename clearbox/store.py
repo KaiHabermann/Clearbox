@@ -156,6 +156,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("nodes", "kind", "TEXT"),                         # NODE_KINDS; NULL = 'agent'
     ("agent_profiles", "capability", "TEXT"),          # CAPABILITIES; NULL = the registry's default for the role
     ("agent_profiles", "test_level", "TEXT"),          # TEST_LEVELS; NULL = 'standard'
+    ("plans", "test_instructions", "TEXT"),            # root plans only; NULL = agents find out from the repo
 ]
 
 # nodes.kind: who does the work. 'agent' runs on an agent profile; 'user' is the
@@ -174,7 +175,7 @@ TEST_LEVELS = ("none", "light", "standard", "thorough")
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps
 # are store-managed.
-PLAN_FIELDS = ("max_parallel", "cwd")
+PLAN_FIELDS = ("max_parallel", "cwd", "test_instructions")
 
 HARNESSES = ("claude-sdk", "openai", "mock")
 
@@ -362,6 +363,7 @@ class Store:
         parent_node_id: int | None = None,
         cwd: str | None = None,
         max_parallel: int | None = None,
+        test_instructions: str | None = None,
     ) -> int:
         with self._lock:
             if (parent_plan_id is None) != (parent_node_id is None):
@@ -378,8 +380,9 @@ class Store:
             _check_max_parallel(max_parallel)
             cur = self._exec(
                 "INSERT INTO plans(title, description, parent_plan_id, parent_node_id, cwd, max_parallel, "
-                "created_at) VALUES (?,?,?,?,?,?,?)",
-                (title, description, parent_plan_id, parent_node_id, cwd, max_parallel, time.time()),
+                "test_instructions, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (title, description, parent_plan_id, parent_node_id, cwd, max_parallel, test_instructions,
+                 time.time()),
             )
             return int(cur.lastrowid)
 
@@ -390,7 +393,8 @@ class Store:
         return p
 
     def update_plan(self, plan_id: int, **fields: Any) -> None:
-        """Change plan settings (``max_parallel``, ``cwd``); only the given fields change."""
+        """Change plan settings (``max_parallel``, ``cwd``, ``test_instructions``); only the given
+        fields change."""
         unknown = set(fields) - set(PLAN_FIELDS)
         if unknown:
             raise PlanError(f"unknown plan field(s): {', '.join(sorted(unknown))}")
@@ -399,7 +403,9 @@ class Store:
         if not fields:
             return
         with self._lock:
-            self.get_plan(plan_id)
+            if self.get_plan(plan_id)["parent_plan_id"] is not None and "test_instructions" in fields:
+                raise PlanError("test_instructions can only be set on top-level plans; a subplan "
+                                "uses its top-level plan's")
             sets = ", ".join(f"{k}=?" for k in fields)
             self._exec(f"UPDATE plans SET {sets} WHERE id=?", (*fields.values(), plan_id))
 

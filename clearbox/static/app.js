@@ -21,6 +21,7 @@ const state = {
   agentSel: null,      // agent panel: null (closed) | "list" | "new" | profile id
   agentDirty: false,   // the open agent form has unsaved edits
   workdirEdit: false,  // the topbar working-directory pill is open as an editable input
+  testsEdit: false,    // the topbar test-instructions pill is open as an editable textarea
   fullOpen: false,     // the full-screen node review is open
   fullTab: "changes",  // which full-view tab is showing; kept across nodes while reviewing
   nodeInfoResp: null,  // last /nodes/:id response, used to rebuild #node-info when full view closes
@@ -230,7 +231,7 @@ function renderPlanList() {
 
 // ------------------------------------------------------------- plan view
 async function openPlan(planId, nodeId = null) {
-  if (planId !== state.planId) { state.sel = null; closeDrawer(false); state.workdirEdit = false; }
+  if (planId !== state.planId) { state.sel = null; closeDrawer(false); state.workdirEdit = false; state.testsEdit = false; }
   state.planId = planId;
   await refreshPlan();
   if (nodeId != null) selectNode(planId, nodeId);
@@ -256,7 +257,7 @@ const loadPlansSoon = debounce(loadPlans, 400);
 function renderEmpty(html) {
   $("#nodes").innerHTML = ""; $("#edges").innerHTML = "";
   const e = $("#empty"); e.innerHTML = html; e.classList.remove("hidden");
-  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-review-agent").innerHTML = ""; $("#plan-review").innerHTML = ""; $("#plan-workdir").innerHTML = "";
+  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-review-agent").innerHTML = ""; $("#plan-review").innerHTML = ""; $("#plan-workdir").innerHTML = ""; $("#plan-tests").innerHTML = "";
 }
 
 // Working-directory pill: shows the resolved directory (hover for the full path), clickable to
@@ -301,6 +302,49 @@ function startWorkdirEdit(planId, current) {
   input.focus(); input.select();
 }
 
+// Test-instructions pill: how the project's tests are run, handed verbatim to workers and
+// reviewers. Set on the top-level plan (subplans inherit it); editable at any time, since each
+// node reads it when it starts. Ctrl+Enter or leaving the box saves, Escape cancels.
+function renderTests(d) {
+  if (state.testsEdit) return;
+  const box = $("#plan-tests");
+  box.innerHTML = "";
+  const text = d.test_instructions || "", topLevel = !d.ancestors.length;
+  box.className = `workdir-ctl${topLevel ? "" : " locked"}`;
+  box.title = (text ? `How to run the tests:\n${text}` : "No test instructions: agents work out how to run the tests from the repository")
+    + (topLevel ? "\n— click to change" : "\n(set on the top-level plan)");
+  box.append(el("span", { class: "wd-ic" }, "🧪"), el("span", { class: "wd-txt" }, text ? "tests" : "tests: auto"));
+  box.onclick = topLevel ? () => startTestsEdit(d.plan.id, text) : null;
+}
+function startTestsEdit(planId, current) {
+  state.testsEdit = true;
+  const box = $("#plan-tests");
+  box.onclick = null;
+  box.className = "workdir-ctl editing";
+  box.innerHTML = "";
+  const input = el("textarea", { class: "workdir-input", rows: 4, placeholder: "how to run this project's tests (empty = agents work it out)" });
+  input.value = current;
+  const err = el("span", { class: "workdir-err" });
+  let done = false;
+  const finish = async () => {
+    if (done) return;
+    const val = input.value.trim();
+    if (val === current) { done = true; state.testsEdit = false; renderHeader(); return; }
+    try {
+      await api(`/api/plans/${planId}`, { method: "PATCH", body: JSON.stringify({ test_instructions: val || null }) });
+      done = true; state.testsEdit = false;
+      await refreshPlan();
+    } catch (e) { err.textContent = e.message; }
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.ctrlKey) finish();
+    if (e.key === "Escape") { done = true; state.testsEdit = false; renderHeader(); }
+  });
+  input.addEventListener("blur", () => setTimeout(finish, 100));
+  box.append(input, err);
+  input.focus();
+}
+
 function renderHeader() {
   const d = state.data, crumbs = $("#crumbs");
   crumbs.innerHTML = "";
@@ -319,6 +363,7 @@ function renderHeader() {
   pill.title = `${d.progress.done}/${d.progress.total} tasks done`;
 
   renderWorkdir(d);
+  renderTests(d);
 
   // plan-wide default agent: applies to this plan's nodes and (unless they set their own) its subplans
   const pa = $("#plan-agent");

@@ -123,30 +123,57 @@ cases. Do not build test suites or fixtures.
 """.strip(),
     "standard": """
 Testing: standard. Run the existing tests that cover what you touched, and fix what you broke.
-Add a test only when you added behaviour nothing covers. Do not build new harnesses. Each test
-file's docstring in tests/ carries the exact commands to run it; most need a mock server of
-their own (`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`).
-Pick a high random port and temp paths; never use port {server_port} or the project's own database, and
-stop the server when you are done.
+Add a test only when you added behaviour nothing covers. Do not build new harnesses.
+
+{tests}
 """.strip(),
     "thorough": """
 Testing: thorough. Run the full suite and add tests for the behaviour you added. A change is not
-done while a test you can run is failing. Each test file's docstring in tests/ carries the exact
-commands to run it; most need a mock server of their own
-(`uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>`). Pick a high
-random port and temp paths; never use port {server_port} or the project's own database, and stop the
-server when you are done.
+done while a test you can run is failing.
+
+{tests}
 """.strip(),
 }
 DEFAULT_TEST_LEVEL = "standard"
 
 
-def worker_system_append(profile: dict[str, Any] | None, server_port: int) -> str:
+# How to run the tests, shared by the worker test levels and the reviewers. The plan's own
+# test_instructions go in verbatim; without them the agent finds out from the repository.
+TESTS_GIVEN = """
+How this project's tests are run, as the plan states it:
+
+{test_instructions}
+""".strip()
+
+TESTS_UNKNOWN = """
+Work out how this project's tests are run from the repository itself: its README, CLAUDE.md /
+AGENTS.md, CI configuration and the test files. Use what you find there; do not invent a test
+harness of your own.
+""".strip()
+
+SERVER_GUARD = """
+If you start a server to test against, pick a free high port and temp paths. Never use port
+{server_port} -- that is the Clearbox server running this plan -- or the project's real data, and
+stop the server when you are done.
+""".strip()
+
+
+def tests_note(test_instructions: str | None, server_port: int) -> str:
+    """The how-to-test paragraph(s) for one plan: its ``test_instructions`` (or the pointer to
+    the repository when it has none), then the guard keeping agents off ``server_port``."""
+    if test_instructions:
+        howto = TESTS_GIVEN.format(test_instructions=test_instructions.strip())
+    else:
+        howto = TESTS_UNKNOWN
+    return howto + "\n\n" + SERVER_GUARD.format(server_port=server_port)
+
+
+def worker_system_append(profile: dict[str, Any] | None, tests: str) -> str:
     """The worker prompt: SYSTEM_APPEND, the test-level paragraph for ``profile`` (NULL/absent =
-    standard), then SUMMARY_NOTE. ``server_port`` is the port this server listens on, which the
-    test notes tell the agent to keep clear of."""
+    standard), then SUMMARY_NOTE. ``tests`` is the plan's tests_note, which the standard and
+    thorough levels include."""
     level = (profile or {}).get("test_level") or DEFAULT_TEST_LEVEL
-    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL]).format(server_port=server_port)
+    note = TEST_LEVEL_NOTES.get(level, TEST_LEVEL_NOTES[DEFAULT_TEST_LEVEL]).format(tests=tests)
     return "\n\n".join((SYSTEM_APPEND, note, SUMMARY_NOTE))
 
 
@@ -160,14 +187,9 @@ you finish, so in that case do only the groundwork yourself and describe the bre
 RUN_TESTS_NOTE = """
 Run the test suite before you give a verdict. It is the part of a review that finds what reading
 cannot: a plan that changes behaviour without updating the tests asserting the old behaviour is
-exactly the failure this catches. Most tests need a mock server of their own:
+exactly the failure this catches.
 
-  uv run clearbox --mock --port <free port> --db <temp path> --workdir <temp path>
-  uv run python tests/<name>.py http://127.0.0.1:<free port>
-
-Pick a high random port and temp paths; never use port {server_port} or the project's own database, and
-stop the server when you are done. `tests/test_openai_harness.py` needs no server. Each test
-file's docstring says how to run it if it differs.
+{tests}
 
 Report every failure as a finding, with the assertion text. A failing test makes the verdict
 `concerns` at best, even when the change itself looks right. Do NOT fix the test or the code --
@@ -389,6 +411,14 @@ class Engine:
         if directory:
             validate_working_directory(directory)
         self.store.update_plan(plan_id, cwd=directory or None)
+
+    def plan_test_instructions(self, plan_id: int) -> str | None:
+        """How to run the project's tests, as the plan's top-level plan states it (or None)."""
+        return self.store.root_of(plan_id)["test_instructions"]
+
+    def tests_note(self, plan_id: int) -> str:
+        """The how-to-test text a plan's workers and reviewers get (see ``tests_note``)."""
+        return tests_note(self.plan_test_instructions(plan_id), self.config.server_port)
 
     def waiting_for_user(self, node: dict[str, Any]) -> bool:
         """Whether a node row is a user node parked for the user: ready, and no agent will
@@ -930,7 +960,7 @@ class Engine:
                 plan_id=plan_id,
                 node_id=node_id,
                 prompt=self._review_prompt(plan_id, node_id),
-                system_append=REVIEW_SYSTEM_APPEND.format(server_port=self.config.server_port),
+                system_append=REVIEW_SYSTEM_APPEND.format(tests=self.tests_note(plan_id)),
                 cwd=self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_node(plan_id, node_id)["title"],
@@ -1046,7 +1076,7 @@ class Engine:
                 plan_id=plan_id,
                 node_id=0,
                 prompt=self._plan_review_prompt(plan_id),
-                system_append=PLAN_REVIEW_SYSTEM_APPEND.format(server_port=self.config.server_port),
+                system_append=PLAN_REVIEW_SYSTEM_APPEND.format(tests=self.tests_note(plan_id)),
                 cwd=self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_plan(plan_id)["title"],
@@ -1172,7 +1202,7 @@ class Engine:
                            harness: Harness) -> None:
         key = (plan_id, node_id)
         try:
-            system_append = worker_system_append(profile, self.config.server_port)
+            system_append = worker_system_append(profile, self.tests_note(plan_id))
             if self.config.expose_mcp_to_agents:
                 system_append += "\n\n" + EXPAND_HINT.format(plan_id=plan_id, node_id=node_id)
             job = AgentJob(
@@ -1463,7 +1493,7 @@ class Engine:
                             "title": n["title"],
                             "description": n["description"],
                             "workdir": self.plan_workdir(pid),
-                            "instructions": worker_system_append(None, self.config.server_port) + "\n\n" + hint
+                            "instructions": worker_system_append(None, self.tests_note(pid)) + "\n\n" + hint
                             + "\n\nReport progress with report_progress, and finish with complete_node "
                               "(or fail_node).",
                             "context": self.build_context(pid, n["node_id"]),
