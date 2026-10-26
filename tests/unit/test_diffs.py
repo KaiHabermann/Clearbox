@@ -10,7 +10,7 @@ import subprocess
 import pytest
 
 from clearbox.diffs import Snapshots
-from conftest import running, settle
+from conftest import mock_harness, running, settle, until
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
@@ -162,3 +162,19 @@ async def test_parallel_external_claims_are_flagged_shared(store, tmp_path):
     for nid in (1, 2):
         n = store.get_node(pid, nid)
         assert n["undeclared_files"] == ["a.txt"] and n["undeclared_shared"]
+
+
+async def test_undeclared_changes_alone_get_reviewed(store, tmp_path):
+    wd = tmp_path / "wd"
+    write(wd, "a.txt", "a\n")
+    pid = store.create_plan("p", cwd=str(wd))
+    store.add_node(pid, "no files")
+    store.set_plan_review_agent(pid, store.create_profile(name="rev", harness="mock"))
+    async with running(store, mock_harness(), tmp_path) as engine:
+        engine.start_plan(pid, executor="external")
+        await settle(engine)
+        await engine.claim_next("a", pid)
+        write(wd, "a.txt", "b\n")           # no declared files, so no diff: only undeclared
+        await engine.complete_external(pid, 1, "done")
+        await until(lambda: store.review(pid, 1) is not None)
+    assert store.node_diffs(pid, 1) == []

@@ -613,9 +613,10 @@ class Engine:
 
     def _queue_review(self, plan_id: int, node_id: int) -> None:
         """Queue a reviewer run for a just-finished task node, unless there is nothing to do:
-        no review agent for this plan, or no diff was captured for this node."""
+        no review agent for this plan, or neither a diff nor an undeclared change was captured."""
         profile = self._review_profile(plan_id)
-        if profile is None or not self.store.node_diffs(plan_id, node_id):
+        if profile is None or not (self.store.node_diffs(plan_id, node_id)
+                                   or self.store.get_node(plan_id, node_id)["undeclared_files"]):
             return
         self._review_queue.append((plan_id, node_id))
         self.kick()

@@ -143,7 +143,7 @@ def node_review_prompt(store: Store, plan_id: int, node_id: int) -> str:
         )
     diffs = store.node_diffs(plan_id, node_id)
     if not diffs:
-        # only an on-demand review gets here: the automatic one is not queued without a diff
+        # an automatic review gets here only for a node with undeclared changes alone
         parts.append(
             "No diffs were captured for this node." + (
                 " Nothing in the declared scope changed." if files else
