@@ -2,12 +2,13 @@
 // transcript.
 
 import {
-  $, agentModel, agentSelect, api, el, esc, fmtDur, fmtTime, hcls, isUserNode, isWaiting, md,
+  $, agentModel, agentSelect, api, el, fmtDur, fmtTime, hcls, isUserNode, isWaiting, md,
   NODE_H, NODE_W, planDefaultAgent, post, put, reviewActivity, reviewKey, sourceText, state,
   truncate,
 } from "./core.js";
 import { applyView, renderGraph, svg } from "./graph.js";
 import { closeAgentPanel } from "./agents.js";
+import { diffView } from "./diffview.js";
 import {
   act, loadPlans, openPlan, refreshPlan, renderReviewPane, setHash, triggerNodeReview,
 } from "./app.js";
@@ -86,7 +87,7 @@ function showFullDiff(d) {
   pane.innerHTML = "";
   pane.append(
     el("div", { class: "diff-title", title: d.path }, shortPath(d.path)),
-    el("pre", { class: "diff-pre full", html: diffHtml(d.diff) }));
+    diffView(d.diff, { split: true }));
   pane.scrollTop = 0;
 }
 async function loadFullChanges(pid, nodeId) {
@@ -448,16 +449,9 @@ function renderPromptRow(pid, n) {
 }
 
 // Changes row: git diffs of this node's declared files between the start and the end of its run
-// (diffs.py, stored by engine._record_diffs). Fetched lazily since most nodes never need
-// it open; a node that is still running simply has none recorded yet.
-function diffHtml(diff) {
-  return diff.split("\n").map((line) => {
-    const cls = line.startsWith("@@") ? "hunk"
-      : (line.startsWith("+") && !line.startsWith("+++")) ? "add"
-      : (line.startsWith("-") && !line.startsWith("---")) ? "del" : "";
-    return `<span class="dl${cls ? " " + cls : ""}">${esc(line)}</span>`;
-  }).join("\n");
-}
+// (diffs.py, stored by engine._record_diffs), one column wide here; the full view shows them side
+// by side. Fetched lazily since most nodes never need it open; a node that is still running
+// simply has none recorded yet.
 function renderChangesRow(pid, n) {
   const v = el("div", { class: "v diffs-row" }, el("div", { class: "files-empty" }, "loading…"));
   const wrap = el("div", { id: "changes-row" }, el("div", { class: "k" }, "Changes"), v);
@@ -467,7 +461,7 @@ function renderChangesRow(pid, n) {
     for (const d of r.diffs) {
       v.append(el("details", { class: "diff-file" },
         el("summary", {}, d.path),
-        el("pre", { class: "diff-pre", html: diffHtml(d.diff) })));
+        diffView(d.diff)));
     }
   }).catch(() => { v.innerHTML = ""; v.append(el("div", { class: "files-empty" }, "could not load diffs")); });
   return wrap;

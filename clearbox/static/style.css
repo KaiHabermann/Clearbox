@@ -23,6 +23,22 @@
   --h-mock: #7fa3b8;
   --h-other: #8b93a5;
 
+  /* diffs (diffview.js): a neutral grey sheet, tinted rows, stronger tint on the changed words */
+  --diff-bg: #25272d;
+  --diff-gutter: #2c2f36;
+  --diff-gutter-text: #7c8392;
+  --diff-text: #d7dae1;
+  --diff-line: #363a43;
+  --diff-hunk-bg: #2a3040;
+  --diff-hunk-text: #95a3c2;
+  --diff-none: #202227;     /* the empty side of a one-sided change in the split view */
+  --diff-del-bg: rgba(239, 95, 95, .13);
+  --diff-del-gutter: rgba(239, 95, 95, .22);
+  --diff-del-word: rgba(239, 95, 95, .36);
+  --diff-add-bg: rgba(76, 195, 138, .13);
+  --diff-add-gutter: rgba(76, 195, 138, .22);
+  --diff-add-word: rgba(76, 195, 138, .36);
+
   --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
@@ -294,11 +310,38 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .diff-file { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .diff-file summary { list-style: none; cursor: pointer; padding: 6px 10px; font-family: var(--mono); font-size: 12px; background: rgba(255,255,255,.02); }
 .diff-file summary::-webkit-details-marker { display: none; }
-.diff-pre { margin: 0; padding: 8px 10px; font-family: var(--mono); font-size: 11.5px; white-space: pre; overflow-x: auto; max-height: 320px; overflow-y: auto; border-top: 1px solid var(--line); color: #c9cdd6; }
-.diff-pre .dl { display: block; }
-.diff-pre .dl.add { background: rgba(76,195,138,.12); color: var(--done); }
-.diff-pre .dl.del { background: rgba(239,95,95,.12); color: var(--failed); }
-.diff-pre .dl.hunk { color: var(--muted); }
+.diff-file .diffview { max-height: 360px; overflow: auto; border-top: 1px solid var(--line); font-size: 11.5px; }
+
+/* Diff tables (diffview.js). Long lines wrap, so the two sides of the split view stay aligned. */
+.diffview { background: var(--diff-bg); color: var(--diff-text); font: 12px/1.55 var(--mono); }
+.diff-note { padding: 6px 12px; font-family: var(--sans); font-size: 12px; color: var(--diff-gutter-text);
+  background: var(--diff-gutter); border-bottom: 1px solid var(--diff-line); }
+table.diff { width: 100%; border-collapse: collapse; table-layout: fixed; tab-size: 4; }
+table.diff col.ln { width: 4.2em; }
+table.diff td { padding: 0 10px; vertical-align: top; }
+table.diff td.code { white-space: pre-wrap; overflow-wrap: anywhere; }
+table.diff td.ln { padding: 0 8px; text-align: right; color: var(--diff-gutter-text); background: var(--diff-gutter); user-select: none; }
+table.diff tr.hunk td { padding: 3px 12px; background: var(--diff-hunk-bg); color: var(--diff-hunk-text); font-size: .95em;
+  border-top: 1px solid var(--diff-line); border-bottom: 1px solid var(--diff-line); }
+table.diff tr:first-child.hunk td { border-top: 0; }
+table.diff .dx { border-radius: 2px; }
+table.diff td.nonl::after { content: "  no newline at end of file"; color: var(--diff-gutter-text); font-family: var(--sans); font-size: .85em; }
+/* split: cells 1-2 are the old side, 3-4 the new one */
+table.diff.split td:nth-child(3) { border-left: 1px solid var(--diff-line); }
+table.diff.split tr.l-del td:nth-child(1) { background: var(--diff-del-gutter); }
+table.diff.split tr.l-del td:nth-child(2) { background: var(--diff-del-bg); }
+table.diff.split tr.r-add td:nth-child(3) { background: var(--diff-add-gutter); }
+table.diff.split tr.r-add td:nth-child(4) { background: var(--diff-add-bg); }
+table.diff.split tr.l-none td:nth-child(-n+2), table.diff.split tr.r-none td:nth-child(n+3) { background: var(--diff-none); }
+table.diff.split td:nth-child(2) .dx { background: var(--diff-del-word); }
+table.diff.split td:nth-child(4) .dx { background: var(--diff-add-word); }
+/* unified */
+table.diff.unified tr.del td.ln { background: var(--diff-del-gutter); }
+table.diff.unified tr.del td.code { background: var(--diff-del-bg); }
+table.diff.unified tr.add td.ln { background: var(--diff-add-gutter); }
+table.diff.unified tr.add td.code { background: var(--diff-add-bg); }
+table.diff.unified tr.del .dx { background: var(--diff-del-word); }
+table.diff.unified tr.add .dx { background: var(--diff-add-word); }
 .files-waiting { color: var(--files); font-size: 12.5px; background: color-mix(in srgb, var(--files) 12%, transparent); border: 1px solid color-mix(in srgb, var(--files) 35%, transparent); border-radius: 6px; padding: 5px 8px; }
 .file-item { font-family: var(--mono); font-size: 12.5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .file-item.shared .fpath { color: var(--files); }
@@ -406,7 +449,7 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 #full-diff { flex: 1; min-width: 0; overflow: auto; display: flex; flex-direction: column; }
 #full-diff .diff-title { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line);
   padding: 9px 14px; font-family: var(--mono); font-size: 12px; color: var(--fg); z-index: 1; }
-#full-diff .diff-pre.full { max-height: none; flex: 1; border: 0; padding: 10px 14px; font-size: 12px; }
+#full-diff .diffview { flex: 1; font-size: 12.5px; }
 #full-diff .files-empty.pad { padding: 20px; }
 
 /* ----------------------------------------------------------- agents panel */
