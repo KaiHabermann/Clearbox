@@ -158,7 +158,13 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("agent_profiles", "capability", "TEXT"),          # CAPABILITIES; NULL = the registry's default for the role
     ("agent_profiles", "test_level", "TEXT"),          # TEST_LEVELS; NULL = 'standard'
     ("plans", "test_instructions", "TEXT"),            # root plans only; NULL = agents find out from the repo
+    ("nodes", "undeclared_files", "TEXT"),             # JSON list of paths changed outside `files`; NULL = none
+    ("nodes", "undeclared_more", "INTEGER"),           # how many more than the stored list; NULL = none
+    ("nodes", "undeclared_shared", "INTEGER"),         # 1 = another step of the tree ran meanwhile
 ]
+
+# At most this many undeclared paths are stored per node; the rest are only counted.
+UNDECLARED_CAP = 200
 
 # nodes.kind: who does the work. 'agent' runs on an agent profile; 'user' is the
 # user's own job (push, open an MR, deploy, approve) and the plan waits there
@@ -249,6 +255,15 @@ def _normalize_files(paths: list[str] | None) -> list[tuple[str, str]]:
     for p in paths:
         out.setdefault(normalize_file(p), p.strip())
     return [(path, key) for key, path in out.items()]
+
+
+def _decode_node(n: dict[str, Any]) -> dict[str, Any]:
+    """A node row as callers see it: the undeclared paths as a list (empty = none recorded),
+    the overflow count as an int and the shared flag as a bool."""
+    n["undeclared_files"] = json.loads(n["undeclared_files"]) if n.get("undeclared_files") else []
+    n["undeclared_more"] = n.get("undeclared_more") or 0
+    n["undeclared_shared"] = bool(n.get("undeclared_shared"))
+    return n
 
 
 def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -527,10 +542,10 @@ class Store:
         n = self._one("SELECT * FROM nodes WHERE plan_id=? AND node_id=?", (plan_id, node_id))
         if n is None:
             raise PlanError(f"unknown node ({plan_id}, {node_id})")
-        return n
+        return _decode_node(n)
 
     def nodes(self, plan_id: int) -> list[dict[str, Any]]:
-        return self._q("SELECT * FROM nodes WHERE plan_id=? ORDER BY node_id", (plan_id,))
+        return [_decode_node(n) for n in self._q("SELECT * FROM nodes WHERE plan_id=? ORDER BY node_id", (plan_id,))]
 
     def update_node(self, plan_id: int, node_id: int, **fields: Any) -> None:
         if not fields:
@@ -763,7 +778,17 @@ class Store:
         )
 
     def clear_node_diffs(self, plan_id: int, node_id: int) -> None:
+        """Drop a node's diffs and its undeclared changes: both describe one run."""
         self._exec("DELETE FROM node_diffs WHERE plan_id=? AND node_id=?", (plan_id, node_id))
+        self.update_node(plan_id, node_id, undeclared_files=None, undeclared_more=None, undeclared_shared=None)
+
+    def set_node_undeclared(self, plan_id: int, node_id: int, paths: list[str], shared: bool) -> None:
+        """Record the paths a node's run changed outside its declared files (names only), capped
+        at UNDECLARED_CAP; ``shared`` = other steps of the tree ran meanwhile, so some may be theirs."""
+        paths = sorted(paths)
+        self.update_node(plan_id, node_id, undeclared_files=json.dumps(paths[:UNDECLARED_CAP]),
+                         undeclared_more=max(len(paths) - UNDECLARED_CAP, 0) or None,
+                         undeclared_shared=1 if shared else None)
 
     # ---------------------------------------------------------------- reviews
     def set_review(

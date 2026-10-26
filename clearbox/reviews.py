@@ -55,9 +55,9 @@ You are reviewing one already-finished step of a larger plan; you did not do the
 must not touch it. Judge only whether the diff below does what the node was asked to do --
 correctness, obvious bugs, leftovers. The diff covers exactly the node's declared file scope
 (listed in the prompt): every change to those paths is shown however it was made, so a change
-missing there really was not made. Files outside that scope are not diffed at all, so the absence
-of a change there is not evidence of anything. Other nodes handle other work; do not comment on
-scope beyond this node. You have read-only tools and a shell for extra context and for running
+missing there really was not made. Files outside that scope are not diffed: the prompt names any
+that changed during the run (gitignored ones excepted), but their content is not shown. Other
+nodes handle other work; do not comment on scope beyond this node. You have read-only tools and a shell for extra context and for running
 the tests -- do not modify anything.
 
 Other nodes of this plan may still be working in the same tree while you review, so a test
@@ -130,6 +130,16 @@ def node_review_prompt(store: Store, plan_id: int, node_id: int) -> str:
         parts.append(
             "Declared file scope (diff coverage is complete for these paths; a directory "
             "covers everything below it):\n" + "\n".join(f"  - {f['path']}" for f in files)
+        )
+    if node["undeclared_files"]:
+        more = f"\n  ... and {node['undeclared_more']} more" if node["undeclared_more"] else ""
+        shared = (" Other steps of this plan ran at the same time, so some of these may be their changes, "
+                  "not this node's." if node["undeclared_shared"] else "")
+        parts.append(
+            "Files changed during this node's run OUTSIDE its declared scope (names only: the content "
+            "of these changes is not shown, and a file may have been changed by a tool run rather "
+            "than edited on purpose)." + shared + "\n"
+            + "\n".join(f"  - {f}" for f in node["undeclared_files"]) + more
         )
     diffs = store.node_diffs(plan_id, node_id)
     if not diffs:

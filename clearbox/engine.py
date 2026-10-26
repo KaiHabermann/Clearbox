@@ -134,8 +134,8 @@ class Engine:
         # round-robin cursor into started_root_plans(): which root gets first pick of a free
         # slot next tick, so the oldest plan does not always take every slot (see _spawn_round_robin)
         self._rr_index = 0
-        # git snapshot of each run's declared files, taken when it is spawned or claimed;
-        # diffed by _record_diffs when the node finishes (see diffs.py)
+        # git snapshots of each run's declared files and whole working tree, taken when it is
+        # spawned or claimed; diffed by _record_diffs when the node finishes (see diffs.py)
         self._snapshots = Snapshots(self.config.snapshot_dir or os.path.join(self.config.workdir, "snapshots"))
         # review tasks run alongside node tasks but are tracked separately so a node's
         # (plan_id, node_id) task-dict slot is never mistaken for "node still running";
@@ -839,18 +839,23 @@ class Engine:
         return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
 
     def _take_snapshot(self, plan_id: int, node_id: int) -> None:
-        """Snapshot a run's declared files before its agent starts, the baseline of its diff."""
-        self._snapshots.take_declared((plan_id, node_id), self.plan_workdir(plan_id),
-                                      [f["path"] for f in self.store.node_files(plan_id, node_id)])
+        """Snapshot a run's declared files and working tree before its agent starts, the baseline
+        of its diff and of its undeclared changes. Runs of one plan tree overlap in one folder."""
+        self._snapshots.take((plan_id, node_id), self.plan_workdir(plan_id),
+                             [f["path"] for f in self.store.node_files(plan_id, node_id)],
+                             group=self.store.root_of(plan_id)["id"])
 
     def _record_diffs(self, plan_id: int, node_id: int) -> None:
-        """Store the diffs of the run that just ended, if anything was snapshotted for it."""
+        """Store the diffs and undeclared changes of the run that just ended, if anything was
+        snapshotted for it."""
         key = (plan_id, node_id)
         if key not in self._snapshots:
             return
-        diffs = self._snapshots.finish(key)
-        if diffs:
-            self.store.set_node_diffs(plan_id, node_id, diffs)
+        done = self._snapshots.finish(key)
+        if done.diffs:
+            self.store.set_node_diffs(plan_id, node_id, done.diffs)
+        if done.undeclared:
+            self.store.set_node_undeclared(plan_id, node_id, done.undeclared, done.shared)
 
     def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
         self._record_diffs(plan_id, node_id)
@@ -913,6 +918,7 @@ class Engine:
         for (pid, nid), task in list(self._tasks.items()):
             if pid in pids:
                 await self._cancel(pid, nid, task)
+                self._snapshots.discard((pid, nid))  # an abandoned run must not flag others shared
                 self._emit(pid, nid, "system", {"text": "plan stopped; node re-queued"})
                 self._set_status(pid, nid, "pending", agent_kind=None, started_at=None)
         # ready nodes go back to pending; they become ready again on restart

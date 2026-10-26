@@ -206,6 +206,9 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
                     "results_from": store.node_results_from(plan_id, n["node_id"]),
                     "result": n["result"],
                     "error": n["error"],
+                    "undeclared_files": n["undeclared_files"],
+                    "undeclared_more": n["undeclared_more"],
+                    "undeclared_shared": n["undeclared_shared"],
                 }
             )
         return {
@@ -556,7 +559,9 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         of them and could run at the same time -- those run one at a time, lowest number first.
         `results_from` lists the earlier nodes whose result text the node receives. `kind` is
         "agent" or "user"; a user node with `waiting_for_user: true` is parked for the user to
-        mark it done (nothing runs it), not waiting for an agent.
+        mark it done (nothing runs it), not waiting for an agent. `undeclared_files` names the
+        files its last run changed outside `files` (not diffed; `undeclared_more` counts those
+        left off the list, `undeclared_shared` means other steps ran meanwhile and some may be theirs).
         """
         try:
             return _plan_view(plan_id)
