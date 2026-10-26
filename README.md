@@ -2,7 +2,7 @@
 
 **Make your coding agent's session observable and reviewable.**
 
-![A plan in Clearbox: two steps done, two in progress, one of them open with its live session](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/plan.png)
+![A session's plan filling in live in Clearbox: steps are claimed and finish one after another, two at once for a while, one step's live session and another's diff open on the way, until only the user's own step is left](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/demo.gif)
 
 A long agent session is hard to follow and harder to review: one scrolling transcript, one big
 diff at the end. Clearbox gives it structure. Your session lays the work out as a plan, a graph of
