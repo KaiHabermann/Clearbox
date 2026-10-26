@@ -262,6 +262,7 @@ function renderHeader() {
       onclick: () => act(post(`/api/plans/${rid}/retry-failed`).then(() => resume && post(`/api/plans/${rid}/start`, { executor: d.root.executor || "builtin" }))),
     }, `↻ Retry failed (${d.progress.failed})`));
   }
+  c.append(exportMenu(d.plan));
   c.append(el("button", { title: "clear all results and transcripts", onclick: () => confirm("Reset all nodes of this plan (results and transcripts are cleared)?") && act(post(`/api/plans/${rid}/reset`)) }, "Reset"));
   if (!d.ancestors.length)
     c.append(el("button", { class: "danger", onclick: () => confirm(`Delete plan #${rid} and all its subplans?`) && act(api(`/api/plans/${rid}`, { method: "DELETE" }).then(() => { state.planId = null; location.hash = ""; renderEmpty(""); loadPlans().then(autoOpen); })) }, "Delete"));
@@ -287,6 +288,32 @@ function renderHeader() {
         el("span", { class: "ref" }, `${w.plan_id}.${w.node_id}`)));
     }
   }
+}
+
+// Export: the plan (this subplan, when one is open) as Markdown for a PR description, from
+// GET /api/plans/{id}/export.md. The diffs toggle survives the topbar's re-renders.
+let exportDiffs = true;
+function exportMenu(plan) {
+  const url = () => `/api/plans/${plan.id}/export.md?diffs=${exportDiffs ? 1 : 0}`;
+  const name = `${plan.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `plan-${plan.id}`}.md`;
+  const copyLbl = el("span", {}, "Copy as Markdown");
+  const copy = async () => {
+    try {
+      const r = await fetch(url());
+      if (!r.ok) throw new Error(await r.text());
+      await copyText(await r.text(), copyLbl);
+    } catch (e) { alert(e.message); }
+  };
+  const box = el("input", { type: "checkbox", checked: exportDiffs, onchange: (e) => { exportDiffs = e.target.checked; } });
+  const pop = el("div", { class: "menu-pop export-pop hidden", onclick: (e) => e.stopPropagation() },
+    el("button", { onclick: copy }, copyLbl, el("small", {}, "To paste into a pull/merge request description")),
+    el("a", { class: "menu-item", href: "#", onclick: (e) => { e.currentTarget.href = url(); e.currentTarget.download = name; } },
+      "Download .md", el("small", {}, name)),
+    el("label", { class: "export-diffs", title: "GitHub limits a description to 65,536 characters; long diffs are cut either way" },
+      box, "Include diffs"));
+  const btn = el("button", { title: "Export this plan as Markdown: steps, results, reviews and diffs",
+    onclick: (e) => { e.stopPropagation(); pop.classList.toggle("hidden"); } }, "Export");
+  return el("div", { class: "menu" }, btn, pop);
 }
 
 export async function act(p) {

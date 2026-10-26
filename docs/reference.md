@@ -272,6 +272,29 @@ retry or a new node instead.
 The brief stays on the node as `rework_brief` after the run (so a retry of a failed rework still
 carries it); the next rework replaces it, and **Reset** clears it.
 
+## Exporting a plan as a PR description
+
+Review usually happens on GitHub or GitLab, so a plan can be exported as Markdown to paste into a
+pull/merge request description (or to send to someone): **Export** in the topbar (**Copy as
+Markdown**, **Download .md**, **Include diffs**), `GET /api/plans/{id}/export.md?diffs=1`
+(`text/markdown`) or the MCP tool `export_plan(plan_id, diffs=True)` on both endpoints. It contains:
+
+* the plan's title and description (the goal);
+* a compact step list in dependency order: status glyph, number, title and the first line of the
+  result, user steps marked, a subplan's steps nested under its step (numbered `3.1`, `3.2` …);
+* per step: description, result (or error), the review's verdict, summary and findings, the files
+  it changed outside its declared ones (a `[!WARNING]` alert), and its diff per file in a collapsed
+  `<details><summary>path (+added −deleted)</summary>` block with a fenced `diff`. A fence is always
+  longer than any run of backticks inside the diff, so a diff that contains ```` ``` ```` cannot
+  break out of it;
+* the plan-level review, if there is one.
+
+An id of a subplan exports just that subplan (and the subplans below it), not its top-level plan:
+that is the part a branch usually covers. GitHub cuts a PR description at 65,536 characters, so
+each file's diff is cut after 400 lines and, once 50,000 characters of diff are in the export, the
+remaining files show only their name and line counts, each with a note. `diffs=0` (or unticking
+**Include diffs**) leaves the diffs out and lists the changed files with their line counts instead.
+
 ## Agents and harnesses
 
 A **harness** is the runtime that executes a node; an **agent profile** is a named, persisted
@@ -494,7 +517,9 @@ the whole flow can be watched for free.
 
 ## UI
 
-* Left: plans with progress bars. Top: breadcrumb (for subplans), status, Start / Stop / Reset.
+* Left: plans with progress bars. Top: breadcrumb (for subplans), status, Start / Stop / Export /
+  Reset (**Export** copies or downloads the plan as Markdown, see
+  [Exporting a plan](#exporting-a-plan-as-a-pr-description)).
 * "Working now" lists every node in the plan tree that has an agent on it right now — click to jump.
 * Graph: top-down layered DAG. A long step title first widens its card (up to about one and a
   half times the normal width), then shrinks a little, and only then is cut; the drawer always shows
@@ -568,9 +593,9 @@ On another port, use that port in the URL (with the plugin too: the plugin's ent
 
 The server offers the same tools on two endpoints (both streamable HTTP, same Host/Origin checks):
 
-* **`/mcp/observe`**, for a session that tracks its own work (way 1, what the plugin uses): ten
+* **`/mcp/observe`**, for a session that tracks its own work (way 1, what the plugin uses): eleven
   tools, `submit_plan`, `claim_next_node`, `report_progress`, `complete_node`, `fail_node`,
-  `add_node`, `add_edge`, `remove_node`, `remove_edge`, `get_plan`, and server instructions that
+  `add_node`, `add_edge`, `remove_node`, `remove_edge`, `get_plan`, `export_plan`, and server instructions that
   describe the self-tracking workflow rather than the API. Its `submit_plan` takes no
   `test_instructions` / `max_parallel` (only built-in agents use them) and **starts a top-level plan
   right away with executor `"external"`**, saying so in its result (`"started"`); if the plan cannot
@@ -584,8 +609,8 @@ the JSON of the tools list, about four characters per token):
 
 | Endpoint | Tools | Instructions | Tool schemas |
 | --- | --- | --- | --- |
-| `/mcp` | 24 | 1.6k chars | 25.3k chars (~6.7k tokens with the instructions) |
-| `/mcp/observe` | 10 | 2.4k chars | 10.4k chars (~3.2k tokens with the instructions) |
+| `/mcp` | 25 | 1.6k chars | 26.3k chars (~7.0k tokens with the instructions) |
+| `/mcp/observe` | 11 | 2.4k chars | 11.4k chars (~3.5k tokens with the instructions) |
 
 ### All tools (`/mcp`)
 
@@ -599,6 +624,7 @@ the JSON of the tools list, about four characters per token):
 | `remove_edge`, `remove_node` | Corrections. |
 | `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None, kind=None, agent=None)` | Change only what you pass, all or nothing. `files` / `results_from` omitted keeps the current value, `[]` clears it; they and `kind` change only before the node has run. `agent=""` clears the node's own agent so it inherits again; a new agent applies the next time the node starts. |
 | `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `working_directory`, `test_instructions` (the top-level plan's, for a subplan too), `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
+| `export_plan(plan_id, diffs=True)` | The plan and its subplans as Markdown for a PR description, see [Exporting a plan](#exporting-a-plan-as-a-pr-description). |
 | `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. Creating, editing, deleting and testing profiles is setup work, done in the web UI's Agents panel or over REST (`/api/agents`), not over MCP. |
 | `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
 | `start_plan(plan_id, executor="builtin" \| "external")`, `stop_plan(plan_id)` | Run / pause a top-level plan. |

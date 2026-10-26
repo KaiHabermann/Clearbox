@@ -23,6 +23,7 @@ from starlette.routing import Route
 from . import bootstrap
 from .harness.registry import HarnessDefaults, HarnessRegistry
 from .engine import Bus, ConflictCache, Engine, EngineConfig
+from .export import plan_markdown
 from .mcp_tools import build_mcp
 from .store import PlanError, Store, keys_conflict, public_profile
 
@@ -557,6 +558,15 @@ def create_app(settings: Settings) -> FastAPI:
             "nodes": [node_view(plan_id, n, scope) for n in store.nodes(plan_id)],
             "edges": store.edges(plan_id),
         }
+
+    @app.get("/api/plans/{plan_id}/export.md")
+    def export_plan(plan_id: int, diffs: bool = True) -> PlainTextResponse:
+        """The plan (a subplan: just that subplan) as Markdown for a PR description."""
+        try:
+            text = plan_markdown(store, plan_id, diffs)
+        except PlanError as e:
+            raise HTTPException(404, str(e)) from e
+        return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
 
     @app.get("/api/plans/{plan_id}/nodes/{node_id}")
     def get_node(plan_id: int, node_id: int, after: int = 0) -> dict[str, Any]:

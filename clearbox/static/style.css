@@ -428,6 +428,9 @@ table.diff.unified tr.add .dx { background: var(--diff-add-word); }
 .menu-pop button { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 10px; }
 .menu-pop button:hover { background: rgba(255,255,255,.05); }
 .menu-pop small { display: block; color: var(--muted); font-size: 12px; }
+.menu-pop .menu-item { display: block; padding: 8px 10px; border-radius: 6px; color: var(--fg); text-decoration: none; }
+.menu-pop .menu-item:hover { background: rgba(255,255,255,.05); }
+.export-diffs { display: flex; align-items: center; gap: 7px; padding: 8px 10px 6px; margin-top: 3px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; cursor: pointer; }
 
 /* ------------------------------------------------------------- full view */
 #full-view { position: fixed; inset: 0; z-index: 100; background: var(--bg); display: flex; flex-direction: column; }

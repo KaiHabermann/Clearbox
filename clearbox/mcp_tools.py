@@ -9,6 +9,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
 
 from .engine import ConflictCache, Engine
+from .export import plan_markdown
 from .harness import HarnessError
 from .store import PlanError, Store, public_profile, validate_working_directory
 
@@ -569,6 +570,18 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
             raise ToolError(str(e)) from e
 
     @mcp.tool()
+    def export_plan(plan_id: int, diffs: bool = True) -> str:
+        """The plan and its subplans as Markdown, ready to paste into a pull/merge request
+        description: the goal, the steps with their results, reviews and undeclared changes, and
+        each step's diff per file in a collapsed block (diffs=false leaves them out; long diffs
+        are cut to fit GitHub's 65,536-character limit). A subplan id exports just that subplan.
+        """
+        try:
+            return plan_markdown(store, plan_id, diffs)
+        except PlanError as e:
+            raise ToolError(str(e)) from e
+
+    @mcp.tool()
     def list_plans() -> list[dict[str, Any]]:
         """List all top-level plans with their status and progress."""
         out = []
@@ -946,7 +959,7 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         return out
 
     for fn in (claim_next_node, report_progress, complete_node, fail_node, add_node, add_edge,
-               remove_node, remove_edge, get_plan):
+               remove_node, remove_edge, get_plan, export_plan):
         observe_mcp.add_tool(fn)
 
     return mcp, agent_mcp, observe_mcp
