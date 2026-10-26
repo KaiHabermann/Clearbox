@@ -71,8 +71,9 @@ Declaring `files` buys three things: conflicting nodes are serialized (below), t
 scope, and the node gets a **diff** for review. When a node starts (a built-in run or an external
 claim), Clearbox snapshots every declared path and compares it again when the node finishes, so a
 change shows up however it was made, from the shell as well as from the file tools. Only declared
-files are diffed: a node that declares nothing gets no diff, and nothing outside its files is
-shown (see [Reviewing](#reviewing)).
+files are diffed: a node that declares nothing gets no diff, and a change outside its files shows
+up only by name (see [Changes outside the declared files](#changes-outside-the-declared-files) and
+[Reviewing](#reviewing)).
 
 Two nodes that could otherwise run at the same time and declare a shared file never actually run
 together: they run one after the other, **lowest node number first**. This spans the whole plan
@@ -109,6 +110,43 @@ joined by a dashed connector, so the stagger is visible at a glance even though 
 dependency edge; a node waiting on one says so in its drawer ("waiting for 3 "Parse config" to
 release `src/parser.py`"), and the drawer's **Files** row lets you view and edit a node's declared
 files directly (disabled once it has started).
+
+### Changes outside the declared files
+
+A step that edits a file it did not declare would otherwise look clean: its diff covers only its
+declared paths. So every run, built-in or external claim, with or without declared files, also
+snapshots the **whole working tree** when it starts and when it finishes, and Clearbox lists the
+**names** of the files that changed in between but are not covered by the declared paths (a declared
+directory covers everything below it; matching is case-insensitive and slash-agnostic, as above).
+Only names are kept, never content: these files are not diffed. A step without declared files gets
+the list too, and there every change counts — the most useful case, since such a step has no diff
+at all.
+
+The list shows as an amber block at the top of the drawer's **Changes** row and of the full view's
+**Changes** tab, and the step reviewer's prompt lists it, saying that the content of those changes
+is not shown. Node views carry it as `undeclared_files` (at most 200 names, sorted),
+`undeclared_more` (how many more were left out) and `undeclared_shared`, in REST and in MCP's
+`get_plan` alike. It is cleared whenever the step's diff is (rerun, retry, rework, reset).
+
+Limits:
+
+* **Attribution.** All steps of a plan tree share one working directory, so a change made by a
+  step running at the same time lands in this step's list as well. If any other step of the same
+  plan tree was running at any point during this run, the list is marked `undeclared_shared` and
+  the UI and reviewer say it may include other steps' changes. Anything else touching the folder
+  while the step runs (you, an editor, a build watcher) is not told apart at all.
+* **Ignored files are invisible.** The project's `.gitignore` files and Clearbox's own ignore list
+  (`.git`, `node_modules`, `__pycache__`, `.venv`, …) apply, so build output and caches stay out
+  of the list — and so does any real change to an ignored file.
+* **Net change only.** A file changed and changed back during the run is not listed.
+* **Cost.** The snapshot goes through one persistent git index per working directory, in
+  Clearbox's own snapshot git directory, shared by all steps there (a lock serialises it), so after
+  the first run `git add -A` rehashes only files whose size or timestamp changed. The **first**
+  snapshot of a working directory reads, hashes and stores every non-ignored file once — on a big
+  repository that takes a while and its size in disk space under `<data dir>/snapshots`. A large
+  non-ignored directory (data files, an unignored build tree) costs the same on every change to it.
+* Without `git` on `PATH`, or if a snapshot fails, the check is skipped for that run with one log
+  line; the step itself is not affected.
 
 ### Inherited results: edges order, `results_from` passes
 
@@ -170,8 +208,9 @@ There are two levels, deliberately kept apart so each stays inside a context it 
   diffs the two. Every change to those paths shows up, including changes made through `bash`,
   `sed -i` or a heredoc, as do added and deleted files inside a declared directory (where the
   project's `.gitignore` applies; a file declared by name is captured even if it is ignored). Files
-  the node did not declare are not diffed at all: a node is trusted to stay inside its scope. This
-  needs `git` on `PATH`. The snapshots live in a git directory of Clearbox's own next to its
+  the node did not declare are not diffed: the reviewer only gets their names, see
+  [Changes outside the declared files](#changes-outside-the-declared-files). This needs `git` on
+  `PATH`. The snapshots live in a git directory of Clearbox's own next to its
   database (`<data dir>/snapshots`), never in the project's `.git`, and the working directory does
   not have to be a repository. The reviewer is asked to run the test suite before its verdict (with the
   plan's `test_instructions`, if it has them), so reviews get capability `run` (read, search,
@@ -464,7 +503,7 @@ the whole flow can be watched for free.
   layer that share a declared file are nudged down a step each and joined by a dashed connector —
   the file stagger, see [File scoping](#file-scoping-avoiding-clobbered-edits).
 * Click a node for its drawer, or **⤢** for the full view with the tabs **Task**, **Changes** (the
-  step's diff, side by side), **Agent output** and **Review** (`←` / `→` step through the nodes).
+  step's diff, side by side, under the names of any files it changed outside its declared ones), **Agent output** and **Review** (`←` / `→` step through the nodes).
 * The drawer: task, prerequisites, result/error, the **agent** that runs it (with where that
   came from, and a select to override it), **Inherits results from** and the **Prompt** block (the
   exact prompt it gets, see [Inherited results](#inherited-results-edges-order-results_from-passes)), the **Files** row (its declared paths, which other nodes

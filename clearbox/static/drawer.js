@@ -90,6 +90,19 @@ function showFullDiff(d) {
     diffView(d.diff, { split: true }));
   pane.scrollTop = 0;
 }
+// The files a run changed outside its declared ones (diffs.py, names only: they are not diffed),
+// shown above the diffs in the drawer and the full view; null when there are none.
+function undeclaredBlock(n) {
+  const files = n?.undeclared_files || [];
+  if (!files.length) return null;
+  const total = files.length + (n.undeclared_more || 0);
+  return el("div", { class: "undeclared" },
+    el("div", { class: "uw-head" }, `Changed outside the declared files (${total})`),
+    el("div", { class: "uw-note" }, "Names only: these changes are not diffed and the reviewer does not see them."
+      + (n.undeclared_shared ? " May include other steps' changes: another step of this plan ran at the same time." : "")),
+    el("ul", { class: "uw-list" }, ...files.map((f) => el("li", { title: f }, f)),
+      ...(n.undeclared_more ? [el("li", { class: "uw-more" }, `… and ${n.undeclared_more} more`)] : [])));
+}
 async function loadFullChanges(pid, nodeId) {
   const list = $("#full-file-list"), pane = $("#full-diff");
   list.innerHTML = ""; pane.innerHTML = "";
@@ -101,10 +114,13 @@ async function loadFullChanges(pid, nodeId) {
   if (!state.fullOpen || !state.sel || state.sel.node_id !== nodeId) return;  // navigated away mid-fetch
   list.innerHTML = "";
   tab.textContent = r.diffs.length ? `Changes (${r.diffs.length})` : "Changes";
+  const warn = state.nodeData?.node_id === nodeId ? undeclaredBlock(state.nodeData) : null;
+  if (warn) list.append(warn);
   if (!r.diffs.length) {
     list.append(el("div", { class: "files-empty" }, "no file changes captured"));
     pane.append(el("div", { class: "files-empty pad" },
-      "This node recorded no file diffs. Only the files a node declares are diffed."));
+      "This node recorded no file diffs. Only the files a node declares are diffed"
+      + (warn ? "; what it changed outside them is listed on the left by name." : ".")));
     return;
   }
   for (const d of r.diffs) {
@@ -449,7 +465,8 @@ function renderPromptRow(pid, n) {
 }
 
 // Changes row: git diffs of this node's declared files between the start and the end of its run
-// (diffs.py, stored by engine._record_diffs), one column wide here; the full view shows them side
+// (diffs.py, stored by engine._record_diffs), under the names of anything it changed outside
+// them, one column wide here; the full view shows them side
 // by side. Fetched lazily since most nodes never need it open; a node that is still running
 // simply has none recorded yet.
 function renderChangesRow(pid, n) {
@@ -457,6 +474,8 @@ function renderChangesRow(pid, n) {
   const wrap = el("div", { id: "changes-row" }, el("div", { class: "k" }, "Changes"), v);
   api(`/api/plans/${pid}/nodes/${n.node_id}/diffs`).then((r) => {
     v.innerHTML = "";
+    const warn = undeclaredBlock(n);
+    if (warn) v.append(warn);
     if (!r.diffs.length) { v.append(el("div", { class: "files-empty" }, "no file changes captured")); return; }
     for (const d of r.diffs) {
       v.append(el("details", { class: "diff-file" },
