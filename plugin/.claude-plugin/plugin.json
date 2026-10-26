@@ -1,0 +1,11 @@
+{
+  "name": "clearbox",
+  "version": "0.3.3",
+  "description": "Plan, track and review your session in Clearbox: the MCP connection and the clearbox-tracking skill",
+  "author": {
+    "name": "Kai Habermann"
+  },
+  "homepage": "https://github.com/KaiHabermann/Clearbox",
+  "repository": "https://github.com/KaiHabermann/Clearbox",
+  "license": "MIT"
+}

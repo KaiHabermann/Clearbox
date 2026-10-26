@@ -493,6 +493,31 @@ the whole flow can be watched for free.
   done and will not be re-run, see [Rework](#rework-closing-the-review-loop).
 * URLs are deep-linkable: `/#/plan/2/node/3`, `/#/agents`, `/#/agents/4`.
 
+## Connecting Claude Code
+
+This repository is a Claude Code plugin marketplace. Its `clearbox` plugin (in `plugin/`) brings
+two things: the MCP server entry `clearbox` (streamable HTTP, `http://127.0.0.1:8765/mcp`) and the
+`clearbox-tracking` skill, which tells Claude when to lay out a plan in Clearbox and how to keep
+the graph in step with the work. In Claude Code:
+
+```text
+/plugin marketplace add KaiHabermann/Clearbox
+/plugin install clearbox@clearbox
+```
+
+The same works from a shell with `claude plugin marketplace add …` and `claude plugin install …`.
+The server must be running (`clearbox`); without it the skill says so in one line and Claude works
+normally.
+
+**Without the plugin**, add the MCP server by hand and tell Claude what to do in your prompt:
+
+```powershell
+claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
+```
+
+On another port, use that port in the URL (with the plugin too: the plugin's entry is fixed to
+8765, so add a manual entry instead).
+
 ## MCP tools
 
 | Tool | What it does |
