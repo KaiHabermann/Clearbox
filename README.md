@@ -39,6 +39,8 @@ multi-step tasks in Clearbox):
 /plugin install clearbox@clearbox
 ```
 
+On another port (`clearbox --port …`), set the plugin's *Clearbox port* under `/config`.
+
 Or, without the plugin, `claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp/observe`
 (the slim endpoint for observing your own session; `/mcp` has the full tool set) and ask: *Use
 clearbox to plan this task and work through the steps yourself.* See [Connecting Claude Code](https://github.com/KaiHabermann/Clearbox/blob/master/docs/reference.md#connecting-claude-code).
