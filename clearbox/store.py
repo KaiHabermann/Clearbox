@@ -161,6 +161,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("nodes", "undeclared_files", "TEXT"),             # JSON list of paths changed outside `files`; NULL = none
     ("nodes", "undeclared_more", "INTEGER"),           # how many more than the stored list; NULL = none
     ("nodes", "undeclared_shared", "INTEGER"),         # 1 = another step of the tree ran meanwhile
+    ("plans", "isolate_steps", "INTEGER"),             # 1 = built-in steps run in their own worktree (root plans)
 ]
 
 # At most this many undeclared paths are stored per node; the rest are only counted.
@@ -182,7 +183,7 @@ TEST_LEVELS = ("none", "light", "standard", "thorough")
 
 # Every plan column a caller may change through update_plan; id, parentage and timestamps
 # are store-managed.
-PLAN_FIELDS = ("max_parallel", "cwd", "test_instructions")
+PLAN_FIELDS = ("max_parallel", "cwd", "test_instructions", "isolate_steps")
 
 HARNESSES = ("claude-sdk", "openai", "mock")
 
@@ -399,6 +400,7 @@ class Store:
         cwd: str | None = None,
         max_parallel: int | None = None,
         test_instructions: str | None = None,
+        isolate_steps: bool = False,
     ) -> int:
         with self._lock:
             if (parent_plan_id is None) != (parent_node_id is None):
@@ -415,9 +417,9 @@ class Store:
             _check_max_parallel(max_parallel)
             cur = self._exec(
                 "INSERT INTO plans(title, description, parent_plan_id, parent_node_id, cwd, max_parallel, "
-                "test_instructions, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                "test_instructions, isolate_steps, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (title, description, parent_plan_id, parent_node_id, cwd, max_parallel, test_instructions,
-                 time.time()),
+                 1 if isolate_steps else None, time.time()),
             )
             return int(cur.lastrowid)
 
@@ -428,8 +430,8 @@ class Store:
         return p
 
     def update_plan(self, plan_id: int, **fields: Any) -> None:
-        """Change plan settings (``max_parallel``, ``cwd``, ``test_instructions``); only the given
-        fields change."""
+        """Change plan settings (``max_parallel``, ``cwd``, ``test_instructions``, ``isolate_steps``);
+        only the given fields change. ``Engine.set_isolate_steps`` checks the rules for the last."""
         unknown = set(fields) - set(PLAN_FIELDS)
         if unknown:
             raise PlanError(f"unknown plan field(s): {', '.join(sorted(unknown))}")

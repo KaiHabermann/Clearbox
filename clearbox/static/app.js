@@ -101,7 +101,7 @@ const loadPlansSoon = debounce(loadPlans, 400);
 function renderEmpty(html) {
   $("#nodes").innerHTML = ""; $("#edges").innerHTML = "";
   const e = $("#empty"); e.innerHTML = html; e.classList.remove("hidden");
-  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-review-agent").innerHTML = ""; $("#plan-review").innerHTML = ""; $("#plan-workdir").innerHTML = ""; $("#plan-tests").innerHTML = "";
+  $("#crumbs").innerHTML = ""; $("#controls").innerHTML = ""; $("#plan-status").textContent = ""; $("#active-bar").innerHTML = ""; $("#plan-agent").innerHTML = ""; $("#plan-review-agent").innerHTML = ""; $("#plan-review").innerHTML = ""; $("#plan-workdir").innerHTML = ""; $("#plan-tests").innerHTML = ""; $("#plan-isolate").innerHTML = "";
 }
 
 // Working-directory pill: shows the resolved directory (hover for the full path), clickable to
@@ -189,6 +189,20 @@ function startTestsEdit(planId, current) {
   input.focus();
 }
 
+// Isolation pill: whether built-in steps run in their own git worktree (isolate_steps). A click
+// toggles it on the top-level plan while no step runs; the server refuses outside a git repository.
+function renderIsolate(d) {
+  const box = $("#plan-isolate");
+  box.innerHTML = "";
+  const on = d.root.isolate_steps, topLevel = !d.ancestors.length, editable = topLevel && !d.progress.running;
+  box.className = `workdir-ctl${editable ? "" : " locked"}`;
+  box.title = (on ? "Built-in steps run in their own git worktree; their changes are applied back when they finish"
+    : "Built-in steps work directly in the working directory")
+    + (!topLevel ? "\n(set on the top-level plan)" : editable ? "\n— click to change" : "\n(locked while a step is running)");
+  box.append(el("span", { class: "wd-ic" }, "⑂"), el("span", { class: "wd-txt" }, on ? "worktrees" : "shared tree"));
+  box.onclick = editable ? () => act(api(`/api/plans/${d.plan.id}`, { method: "PATCH", body: JSON.stringify({ isolate_steps: !on }) })) : null;
+}
+
 function renderHeader() {
   const d = state.data, crumbs = $("#crumbs");
   crumbs.innerHTML = "";
@@ -208,6 +222,7 @@ function renderHeader() {
 
   renderWorkdir(d);
   renderTests(d);
+  renderIsolate(d);
 
   // plan-wide default agent: applies to this plan's nodes and (unless they set their own) its subplans
   const pa = $("#plan-agent");

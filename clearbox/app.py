@@ -77,10 +77,13 @@ class PlanPatch(BaseModel):
     max_parallel: cap how many nodes of this plan's whole tree run at once; null removes it.
     test_instructions: how the project's tests are run, given verbatim to workers and reviewers;
     null or "" removes it. Top-level plans only; subplans inherit it.
+    isolate_steps: run each built-in step in its own git worktree and apply its changes back when
+    it finishes. Top-level plans in a git repository only, and not while a step is running.
     """
 
     max_parallel: int | None = None
     test_instructions: str | None = None
+    isolate_steps: bool | None = None
 
 
 class WorkdirBody(BaseModel):
@@ -547,7 +550,8 @@ def create_app(settings: Settings) -> FastAPI:
             "default_agent": default_agent,
             "working_directory": engine.plan_workdir(plan_id),
             "test_instructions": engine.plan_test_instructions(plan_id),
-            "root": {"id": root["id"], "started": bool(root["started"]), "executor": root["executor"]},
+            "root": {"id": root["id"], "started": bool(root["started"]), "executor": root["executor"],
+                     "isolate_steps": bool(root["isolate_steps"])},
             "status": engine.plan_status(plan_id),
             "progress": engine.rollup(plan_id),
             "ancestors": store.ancestors(plan_id),
@@ -637,11 +641,15 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.patch("/api/plans/{plan_id}")
     def update_plan(plan_id: int, body: PlanPatch) -> dict[str, Any]:
-        """Change a plan's own settings (max_parallel, test_instructions); only given fields change."""
+        """Change a plan's own settings (max_parallel, test_instructions, isolate_steps); only given
+        fields change."""
         fields = body.model_dump(exclude_unset=True)
         if "test_instructions" in fields:
             fields["test_instructions"] = (fields["test_instructions"] or "").strip() or None
+        isolate = fields.pop("isolate_steps", None)
         try:
+            if isolate is not None:
+                engine.set_isolate_steps(plan_id, isolate)
             store.update_plan(plan_id, **fields)
             p = store.get_plan(plan_id)
             root_id = store.root_of(plan_id)["id"]

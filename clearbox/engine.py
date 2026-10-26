@@ -54,7 +54,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import reviews
+from . import reviews, worktrees
 from .diffs import Snapshots
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
@@ -245,7 +245,24 @@ class Engine:
             raise PlanError("cannot change the working directory of a started plan")
         if directory:
             validate_working_directory(directory)
+        if root["isolate_steps"] and not worktrees.in_git_repo(
+                directory or os.path.join(self.config.workdir, f"plan-{plan_id}")):
+            raise PlanError("this plan isolates its steps in git worktrees, so its working directory must "
+                            "be inside a git repository; turn isolate_steps off first")
         self.store.update_plan(plan_id, cwd=directory or None)
+
+    def set_isolate_steps(self, plan_id: int, on: bool) -> None:
+        """Turn per-step worktrees on or off for a top-level plan: only inside a git repository,
+        and only while no step of its tree is running (a running step keeps the mode it began in)."""
+        root = self.store.root_of(plan_id)
+        if root["id"] != plan_id:
+            raise PlanError("isolate_steps can only be set on top-level plans; subplans use their top-level plan's")
+        if on and not worktrees.in_git_repo(self.plan_workdir(plan_id)):
+            raise PlanError(f"isolate_steps needs a working directory inside a git repository; "
+                            f"{self.plan_workdir(plan_id)} is not in one")
+        if self.rollup(plan_id)["running"]:
+            raise PlanError("cannot change isolate_steps while a step of the plan is running; stop it first")
+        self.store.update_plan(plan_id, isolate_steps=1 if on else None)
 
     def plan_test_instructions(self, plan_id: int) -> str | None:
         """How to run the project's tests, as the plan's top-level plan states it (or None)."""
