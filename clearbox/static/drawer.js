@@ -3,7 +3,7 @@
 
 import {
   $, agentModel, agentSelect, api, el, fmtDur, fmtTime, hcls, isUserNode, isWaiting, md,
-  NODE_H, NODE_W, planDefaultAgent, post, put, reviewActivity, reviewKey, sourceText, state,
+  NODE_H, planDefaultAgent, post, put, reviewActivity, reviewKey, sourceText, state,
   truncate,
 } from "./core.js";
 import { applyView, renderGraph, svg } from "./graph.js";
@@ -29,9 +29,9 @@ export async function selectNode(planId, nodeId) {
 function ensureVisible(nodeId) {
   const p = state.layout?.coords.get(nodeId); if (!p) return;
   const r = svg.getBoundingClientRect(), v = state.view, m = 30;
-  const x1 = v.x + p.x * v.k, y1 = v.y + p.y * v.k, x2 = x1 + NODE_W * v.k, y2 = y1 + NODE_H * v.k;
+  const x1 = v.x + p.x * v.k, y1 = v.y + p.y * v.k, x2 = x1 + p.w * v.k, y2 = y1 + NODE_H * v.k;
   if (x1 < m || y1 < m || x2 > r.width - m || y2 > r.height - m) {
-    v.x = r.width / 2 - (p.x + NODE_W / 2) * v.k; v.y = r.height / 2 - (p.y + NODE_H / 2) * v.k; applyView();
+    v.x = r.width / 2 - (p.x + p.w / 2) * v.k; v.y = r.height / 2 - (p.y + NODE_H / 2) * v.k; applyView();
   }
 }
 export function closeDrawer(update = true) {

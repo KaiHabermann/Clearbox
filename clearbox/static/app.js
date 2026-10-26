@@ -193,12 +193,12 @@ function renderHeader() {
   const d = state.data, crumbs = $("#crumbs");
   crumbs.innerHTML = "";
   for (const a of d.ancestors) {
-    crumbs.append(el("a", { onclick: () => openPlan(a.plan_id), title: `plan #${a.plan_id}` }, a.title));
+    crumbs.append(el("a", { onclick: () => openPlan(a.plan_id), title: `${a.title} (plan #${a.plan_id})` }, a.title));
     crumbs.append(el("span", { class: "sep" }, "›"));
     crumbs.append(el("a", { onclick: () => openPlan(a.plan_id, a.node_id), title: `node ${a.node_id}` }, `[${a.node_id}] ${a.node_title}`));
     crumbs.append(el("span", { class: "sep" }, "›"));
   }
-  crumbs.append(el("span", { class: "cur" }, d.plan.title), " ", el("span", { class: "pl-id", style: "color:var(--faint);font-family:var(--mono);font-size:12px" }, `#${d.plan.id}`));
+  crumbs.append(el("span", { class: "cur", title: d.plan.title }, d.plan.title), " ", el("span", { class: "pl-id", style: "color:var(--faint);font-family:var(--mono);font-size:12px" }, `#${d.plan.id}`));
 
   const pill = $("#plan-status");
   const st = d.root.started ? (d.status === "done" ? "done" : d.status === "failed" ? "failed" : "running") : (d.status === "done" ? "done" : "idle");

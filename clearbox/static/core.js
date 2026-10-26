@@ -2,6 +2,8 @@
 // agent helpers the graph, drawer and panels all use.
 
 export const NODE_W = 230, NODE_H = 88, H_GAP = 46, V_GAP = 66;
+// a long title first widens its card up to NODE_W_MAX, then shrinks down to TITLE_MIN_PX (graph.js fitTitle)
+export const NODE_W_MAX = 380, TITLE_PX = 13.5, TITLE_MIN_PX = 11.5;
 export const CONFLICT_DY = 26;            // file stagger: each later node of a shares-a-file group sits this much lower
 export const CHIP_Y = 60, CHIP_H = 17;   // agent chip row inside a node box (between the subtitle and the bottom edge)
 export const $ = (s) => document.querySelector(s);
@@ -70,9 +72,9 @@ function fmtTokens(n) { return n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 100
 
 // "↓12.3k ↑4.5k" in the node box: input and output tokens as separate live counters.
 // Tagged with the node id so a {"type":"tokens"} message can retarget them without a redraw.
-export function tokenCounters(tin, tout, nodeId) {
+export function tokenCounters(tin, tout, nodeId, width = NODE_W) {
   const g = el("svg:g", { class: "tok", "data-tok": nodeId });
-  const t = el("svg:text", { x: NODE_W - 12, y: 50, "text-anchor": "end" },
+  const t = el("svg:text", { x: width - 12, y: 50, "text-anchor": "end" },
     el("svg:tspan", { class: "tok-in" }, `↓${fmtTokens(tin)}`),
     el("svg:tspan", { class: "tok-out", dx: 7 }, `↑${fmtTokens(tout)}`));
   t.append(el("svg:title", {}, `${tin.toLocaleString()} tokens in · ${tout.toLocaleString()} out`));

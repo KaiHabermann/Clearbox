@@ -93,8 +93,16 @@ button.danger:hover { border-color: var(--failed); color: var(--failed); }
 
 /* ------------------------------------------------------------------- main */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-#topbar { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); min-height: 56px; }
-#crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 15px; }
+#topbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); min-height: 56px; }
+/* a narrow topbar wraps whole controls onto a second row instead of squeezing them word by word */
+#topbar > * { flex-shrink: 0; white-space: nowrap; }
+/* the plan title stays on one line: a long one is cut with an ellipsis (full title as tooltip) */
+#crumbs { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; font-size: 15px; }
+#crumbs > * { white-space: nowrap; flex-shrink: 0; }
+#crumbs a, #crumbs .cur { overflow: hidden; text-overflow: ellipsis; min-width: 3em; }
+/* ancestors give way first; the plan you are looking at is cut only when it alone does not fit */
+#crumbs a { flex-shrink: 50; }
+#crumbs .cur { flex-shrink: 0.001; }  /* still the only thing that can shrink when it stands alone */
 #crumbs a { color: var(--muted); text-decoration: none; cursor: pointer; }
 #crumbs a:hover { color: var(--text); }
 #crumbs .cur { font-weight: 600; }
@@ -163,7 +171,9 @@ select.agent-sel:disabled { opacity: .55; cursor: not-allowed; }
 .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); text-align: center; pointer-events: none; padding: 20px; }
 .empty code { font-family: var(--mono); background: var(--panel-2); padding: 2px 6px; border-radius: 4px; color: var(--text); }
 #legend { position: absolute; left: 14px; bottom: 12px; display: flex; gap: 14px; font-size: 12px; color: var(--muted); background: rgba(22,25,32,.85); padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); }
-#legend span { display: inline-flex; align-items: center; gap: 6px; }
+#legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+/* narrow canvas: the legend wraps whole entries and keeps clear of the zoom buttons */
+#legend { flex-wrap: wrap; row-gap: 4px; max-width: calc(100% - 90px); }
 .hswatch { width: 10px; height: 10px; border-radius: 3px; border: 1.5px solid var(--hc); background: color-mix(in srgb, var(--hc) 22%, transparent); }
 .h-claude-sdk { --hc: var(--h-claude-sdk); }
 .h-openai { --hc: var(--h-openai); }

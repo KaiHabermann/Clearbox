@@ -571,7 +571,9 @@ the whole flow can be watched for free.
 
 * Left: plans with progress bars. Top: breadcrumb (for subplans), status, Start / Stop / Reset.
 * "Working now" lists every node in the plan tree that has an agent on it right now — click to jump.
-* Graph: top-down layered DAG. Running nodes glow and spin, edges into them animate;
+* Graph: top-down layered DAG. A long step title first widens its card (up to about one and a
+  half times the normal width), then shrinks a little, and only then is cut; the drawer always shows
+  it whole. Running nodes glow and spin, edges into them animate;
   subplan nodes are drawn as a stack with a progress bar (double-click to open). Nodes within a
   layer that share a declared file are nudged down a step each and joined by a dashed connector —
   the file stagger, see [File scoping](#file-scoping-avoiding-clobbered-edits).

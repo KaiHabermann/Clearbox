@@ -2,14 +2,37 @@
 
 import {
   $, agentKey, agentModel, CHIP_H, CHIP_Y, CONFLICT_DY, debounce, el, fmtDur, H_GAP, hcls,
-  isUserNode, isWaiting, NODE_H, NODE_W, planDefaultAgent, sourceText, state, tokenCounters,
-  truncate, V_GAP, verdictInfo,
+  isUserNode, isWaiting, NODE_H, NODE_W, NODE_W_MAX, planDefaultAgent, sourceText, state,
+  TITLE_MIN_PX, TITLE_PX, tokenCounters, truncate, V_GAP, verdictInfo,
 } from "./core.js";
 import { closeDrawer, selectNode } from "./drawer.js";
 import { openPlan } from "./app.js";
 
+// ----------------------------------------------------------- card titles
+// A title that fits keeps the default card. A longer one first widens its card (up to NODE_W_MAX),
+// then shrinks (down to TITLE_MIN_PX), and only what still does not fit is cut off -- so a plan
+// reads at a glance without every card turning wide or tiny.
+const measure = document.createElement("canvas").getContext("2d");
+const TITLE_RIGHT = 40;  // kept clear for the "1.3" reference in the top-right corner
+function textWidth(s, px) {
+  measure.font = `560 ${px}px ${getComputedStyle(document.body).fontFamily}`;
+  return measure.measureText(s).width + 2;  // a little slack: canvas and SVG metrics differ slightly
+}
+function fitTitle(title, tx) {
+  const room = (w) => w - tx - TITLE_RIGHT;
+  const full = textWidth(title, TITLE_PX);
+  if (full <= room(NODE_W)) return { w: NODE_W, px: TITLE_PX, text: title };
+  const w = Math.min(NODE_W_MAX, Math.ceil(full + tx + TITLE_RIGHT));
+  const px = Math.max(TITLE_MIN_PX, Math.min(TITLE_PX, (TITLE_PX * room(w)) / full));
+  if (textWidth(title, px) <= room(w)) return { w, px, text: title };
+  let n = title.length;
+  while (n > 1 && textWidth(title.slice(0, n).trimEnd() + "…", px) > room(w)) n--;
+  return { w, px, text: title.slice(0, n).trimEnd() + "…" };
+}
+
 // ---------------------------------------------------------------- layout
-function computeLayout(nodes, edges, planId) {
+// widths: node id -> card width (fitTitle); every card keeps NODE_H
+function computeLayout(nodes, edges, planId, widths) {
   const ids = nodes.map((n) => n.node_id);
   const preds = new Map(ids.map((i) => [i, []])), succ = new Map(ids.map((i) => [i, []]));
   const valid = edges.filter(([a, b]) => preds.has(b) && succ.has(a));
@@ -28,7 +51,7 @@ function computeLayout(nodes, edges, planId) {
   }
   // 2. split edges spanning several layers with virtual nodes so they route around real nodes
   const DUMMY_W = 16;
-  const width = new Map(ids.map((i) => [i, NODE_W]));
+  const width = new Map(ids.map((i) => [i, widths.get(i) ?? NODE_W]));
   const up = new Map(ids.map((i) => [i, []])), down = new Map(ids.map((i) => [i, []]));
   const chains = new Map(); // "a-b" -> [a, d1, d2, ..., b]
   let dummy = 0;
@@ -98,7 +121,7 @@ function computeLayout(nodes, edges, planId) {
       if (i) x += gap(L[i - 1], v);
       const off = offset.get(v) || 0;  // virtual nodes keep the baseline: they only route edges
       // top/bot: the layer's band, which edges leave and enter vertically so they never cut across a nudged card
-      coords.set(v, { x: x + (width.get(v) - NODE_W) / 2, cx: x + width.get(v) / 2, y: top[li] + off, off, top: top[li], bot: top[li] + NODE_H + maxOff[li] });
+      coords.set(v, { x, w: width.get(v), cx: x + width.get(v) / 2, y: top[li] + off, off, top: top[li], bot: top[li] + NODE_H + maxOff[li] });
       x += width.get(v);
     });
   });
@@ -154,13 +177,15 @@ function fileConnector(a, b, arc = 0) {
   // two (the barycenter sweep may interleave groups), a straight line would hide behind them and cross
   // the other group's connector, so it dips under the layer band instead, `arc` px deep.
   if (arc) {
-    const dir = b.x > a.x ? 1 : -1, sx = a.cx + dir * (NODE_W / 2 - 28), ex = b.cx - dir * (NODE_W / 2 - 28), low = a.bot + arc;
+    const dir = b.x > a.x ? 1 : -1, sx = a.cx + dir * (a.w / 2 - 28), ex = b.cx - dir * (b.w / 2 - 28), low = a.bot + arc;
     return `M${sx},${a.y + NODE_H + 2} C${sx},${low} ${ex},${low} ${ex},${b.y + NODE_H + 3}`;
   }
-  const c1 = { x: a.x + NODE_W / 2, y: a.y + NODE_H / 2 }, c2 = { x: b.x + NODE_W / 2, y: b.y + NODE_H / 2 };
+  const c1 = { x: a.cx, y: a.y + NODE_H / 2 }, c2 = { x: b.cx, y: b.y + NODE_H / 2 };
   const dx = c2.x - c1.x, dy = c2.y - c1.y;
-  const t = Math.min((NODE_W / 2 + 3) / Math.max(Math.abs(dx), 1e-6), (NODE_H / 2 + 3) / Math.max(Math.abs(dy), 1e-6));
-  return `M${c1.x + dx * t},${c1.y + dy * t} L${c2.x - dx * t},${c2.y - dy * t}`;
+  // each end is clipped to its own card, which may be wider than the other
+  const clip = (w) => Math.min((w / 2 + 3) / Math.max(Math.abs(dx), 1e-6), (NODE_H / 2 + 3) / Math.max(Math.abs(dy), 1e-6));
+  const ta = clip(a.w), tb = clip(b.w);
+  return `M${c1.x + dx * ta},${c1.y + dy * ta} L${c2.x - dx * tb},${c2.y - dy * tb}`;
 }
 
 // ----------------------------------------------------------------- graph
@@ -175,7 +200,8 @@ export function renderGraph() {
     return;
   }
   empty.classList.add("hidden");
-  const L = computeLayout(d.nodes, d.edges, d.plan.id);
+  const fits = new Map(d.nodes.map((n) => [n.node_id, fitTitle(n.title, isUserNode(n) ? 36 : 16)]));
+  const L = computeLayout(d.nodes, d.edges, d.plan.id, new Map([...fits].map(([id, f]) => [id, f.w])));
   state.layout = L;
   const byId = new Map(d.nodes.map((n) => [n.node_id, n]));
   const defKey = agentKey(planDefaultAgent(d));
@@ -197,7 +223,7 @@ export function renderGraph() {
   }
 
   for (const n of d.nodes) {
-    const p = L.coords.get(n.node_id);
+    const p = L.coords.get(n.node_id), fit = fits.get(n.node_id), W = fit.w;
     const isSel = state.sel && state.sel.plan_id === d.plan.id && state.sel.node_id === n.node_id;
     const user = isUserNode(n), waitingUser = isWaiting(n);
     const bb = n.status === "ready" && !user ? n.blocked_by : null;  // ready, but a node writing the same files goes first
@@ -208,16 +234,16 @@ export function renderGraph() {
     });
     g.append(el("svg:title", {}, [n.title, n.description, fileNote(d.plan.id, n), n.subplan_id && "(double-click to open subplan)"].filter(Boolean).join("\n\n")));
     if (n.subplan_id) {
-      g.append(el("svg:rect", { class: "ghost", x: 8, y: -8, width: NODE_W, height: NODE_H, rx: 10 }));
-      g.append(el("svg:rect", { class: "ghost", x: 4, y: -4, width: NODE_W, height: NODE_H, rx: 10 }));
+      g.append(el("svg:rect", { class: "ghost", x: 8, y: -8, width: W, height: NODE_H, rx: 10 }));
+      g.append(el("svg:rect", { class: "ghost", x: 4, y: -4, width: W, height: NODE_H, rx: 10 }));
     }
     // a user job is a different kind of thing, not just a queued node: pill-shaped card with a
     // double border, a person icon instead of the stripe, and no agent chip
     const rx = user ? NODE_H / 2 : 10;
-    g.append(el("svg:rect", { class: "halo", x: 0, y: 0, width: NODE_W, height: NODE_H, rx }));
-    g.append(el("svg:rect", { class: "card", x: 0, y: 0, width: NODE_W, height: NODE_H, rx }));
+    g.append(el("svg:rect", { class: "halo", x: 0, y: 0, width: W, height: NODE_H, rx }));
+    g.append(el("svg:rect", { class: "card", x: 0, y: 0, width: W, height: NODE_H, rx }));
     if (user) {
-      g.append(el("svg:rect", { class: "card-inner", x: 4, y: 4, width: NODE_W - 8, height: NODE_H - 8, rx: rx - 4 }));
+      g.append(el("svg:rect", { class: "card-inner", x: 4, y: 4, width: W - 8, height: NODE_H - 8, rx: rx - 4 }));
       g.append(el("svg:g", { class: "user-glyph" },
         el("svg:circle", { cx: 24, cy: 22, r: 4.5 }),
         el("svg:path", { d: "M15,37 a9,9 0 0,1 18,0" })));
@@ -225,39 +251,39 @@ export function renderGraph() {
       g.append(el("svg:rect", { class: "stripe", x: 0, y: 10, width: 4, height: NODE_H - 20, rx: 2 }));
     }
     const tx = user ? 36 : 16;
-    g.append(el("svg:text", { class: "title", x: tx, y: 27 }, truncate(n.title, user ? 21 : 25)));
+    g.append(el("svg:text", { class: "title", x: tx, y: 27, style: fit.px !== TITLE_PX ? `font-size:${fit.px}px` : null }, fit.text));
 
     let sub;
     if (n.subplan_id) {
       const pr = n.progress;
       sub = `subplan #${n.subplan_id} · ${pr.done}/${pr.total} done${pr.running ? ` · ${pr.running} running` : ""}`;
-      const w = NODE_W - 32, tot = Math.max(pr.total, 1);
+      const w = W - 32, tot = Math.max(pr.total, 1);
       g.append(el("svg:rect", { class: "pbar-bg", x: 16, y: CHIP_Y + 6, width: w, height: 4, rx: 2 }));
       g.append(el("svg:rect", { class: "pbar", x: 16, y: CHIP_Y + 6, width: (w * pr.done) / tot, height: 4, rx: 2 }));
       if (pr.running) g.append(el("svg:rect", { class: "pbar run", x: 16 + (w * pr.done) / tot, y: CHIP_Y + 6, width: (w * pr.running) / tot, height: 4, rx: 2 }));
     } else if (user) {
-      sub = waitingUser ? "waiting for you — mark done when it is" : n.status === "done" ? "done by you" : n.status === "failed" ? truncate(n.error || "failed", 32) : "your job · not its turn yet";
+      sub = waitingUser ? "waiting for you — mark done when it is" : n.status === "done" ? "done by you" : n.status === "failed" ? n.error || "failed" : "your job · not its turn yet";
     } else if (n.status === "running") {
       const dur = n.started_at ? ` · ${fmtDur(Date.now() / 1000 - n.started_at)}` : "";
       sub = `${n.agent_name || (n.agent_kind === "external" ? "external" : "agent")} working${dur}`;
     } else if (n.status === "done" && n.started_at && n.finished_at) {
       sub = `done in ${fmtDur(n.finished_at - n.started_at)}`;
     } else if (n.status === "failed") {
-      sub = truncate(n.error || "failed", 32);
+      sub = n.error || "failed";
     } else {
       sub = bb ? `${bb.reason === "running" ? "waiting for" : "queued after"} ${bb.plan_id}.${bb.node_id} · shares files`
-        : n.status === "ready" ? "ready – waiting for agent" : truncate(n.description || "pending", 32);
+        : n.status === "ready" ? "ready – waiting for agent" : n.description || "pending";
     }
     g.append(el("svg:text", {
       class: "sub", x: tx, y: n.subplan_id ? 47 : 50,
       "data-started": !n.subplan_id && n.status === "running" && n.started_at ? n.started_at : null,
       "data-who": n.agent_name || (n.agent_kind === "external" ? "external" : "agent"),
-    }, truncate(sub, 34)));
-    g.append(el("svg:text", { class: "ref", x: NODE_W - 12, y: 20, "text-anchor": "end" }, `${d.plan.id}.${n.node_id}`));
+    }, truncate(sub, Math.floor((34 * W) / NODE_W))));  // a wider card shows more of it
+    g.append(el("svg:text", { class: "ref", x: W - 12, y: 20, "text-anchor": "end" }, `${d.plan.id}.${n.node_id}`));
 
     if (!n.subplan_id && (n.tokens_in != null || n.tokens_out != null)) {
       // two counters, updated live from {"type":"tokens"} while the node runs
-      g.append(tokenCounters(n.tokens_in || 0, n.tokens_out || 0, n.node_id));
+      g.append(tokenCounters(n.tokens_in || 0, n.tokens_out || 0, n.node_id, W));
     }
 
     // agent chip: only where this node's agent differs from the plan's default (uniform plans stay quiet);
@@ -280,7 +306,7 @@ export function renderGraph() {
     }
 
     // status glyph
-    const gx = NODE_W - 22, gy = n.subplan_id ? 50 : CHIP_Y + CHIP_H / 2;
+    const gx = W - 22, gy = n.subplan_id ? 50 : CHIP_Y + CHIP_H / 2;
     if (n.status === "running") g.append(el("svg:circle", { class: "spinner", cx: gx, cy: gy, r: 7 }));
     else if (n.status === "done") g.append(el("svg:path", { class: "check", d: `M${gx - 6},${gy} l4,4 l8,-8` }));
     else if (waitingUser) g.append(el("svg:path", { class: "handglyph", d: `M${gx - 7},${gy} h14 M${gx + 1},${gy - 6} l6,6 l-6,6` }));  // "over to you" arrow
@@ -290,7 +316,7 @@ export function renderGraph() {
     // review marker: quiet for ok, a plainer badge for concerns (advice, not a failure -- a
     // failed node already has its own red state); nothing at all when the node has no review
     if (n.review) {
-      const vi = verdictInfo(n.review.verdict), rx = NODE_W - 16, ry = 34;
+      const vi = verdictInfo(n.review.verdict), rx = W - 16, ry = 34;
       const rg = el("svg:g", { class: `review-mark ${n.review.verdict}` },
         el("svg:title", {}, `review (${vi.label}): ${n.review.summary}`),
         el("svg:circle", { cx: rx, cy: ry, r: 6 }),
@@ -300,7 +326,7 @@ export function renderGraph() {
     gN.append(g);
     if (chip) {  // size the pill to its rendered text, never past the status glyph
       const t = chip.querySelector("text"), pad = +t.getAttribute("x") - tx;
-      chip.querySelector("rect").setAttribute("width", Math.min(t.getComputedTextLength() + pad + 9, NODE_W - 16 - 40));
+      chip.querySelector("rect").setAttribute("width", Math.min(t.getComputedTextLength() + pad + 9, W - 16 - 40));
     }
   }
 
@@ -313,8 +339,11 @@ export function applyView() { const v = state.view; vp.setAttribute("transform",
 function fit() {
   const L = state.layout; if (!L) return;
   const r = svg.getBoundingClientRect(), pad = 60;
-  const k = Math.min(1.15, (r.width - pad * 2) / Math.max(L.width, 1), (r.height - pad * 2) / Math.max(L.height + 10, 1));
-  state.view = { k, x: (r.width - L.width * k) / 2, y: Math.max(pad, (r.height - L.height * k) / 2) };
+  // the legend floats over the bottom of the canvas: fit the graph above it, not behind it
+  const lg = $("#legend").getBoundingClientRect();
+  const padB = lg.height ? Math.max(pad, r.bottom - lg.top + 24) : pad, room = r.height - pad - padB;
+  const k = Math.min(1.15, (r.width - pad * 2) / Math.max(L.width, 1), room / Math.max(L.height + 10, 1));
+  state.view = { k, x: (r.width - L.width * k) / 2, y: pad + Math.max(0, (room - L.height * k) / 2) };
   applyView();
 }
 function zoomAt(f, cx, cy) {
