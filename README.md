@@ -39,12 +39,12 @@ multi-step tasks in Clearbox):
 /plugin install clearbox@clearbox
 ```
 
-Or, without the plugin, `claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp` and
-ask: *Use clearbox to plan this task and work through the steps yourself (executor "external").*
-See [Connecting Claude Code](https://github.com/KaiHabermann/Clearbox/blob/master/docs/reference.md#connecting-claude-code).
+Or, without the plugin, `claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp/observe`
+(the slim endpoint for observing your own session; `/mcp` has the full tool set) and ask: *Use
+clearbox to plan this task and work through the steps yourself.* See [Connecting Claude Code](https://github.com/KaiHabermann/Clearbox/blob/master/docs/reference.md#connecting-claude-code).
 
-That is way 1: the plan appears in the browser and fills in as your session works. For way 2, ask
-it to *start the plan with the built-in executor* instead; `clearbox --mock` lets you try that
+That is way 1: the plan appears in the browser and fills in as your session works. For way 2, connect
+the full `/mcp` endpoint and ask it to *start the plan with the built-in executor* instead; `clearbox --mock` lets you try that
 without spending tokens.
 
 ## What you see

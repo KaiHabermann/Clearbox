@@ -98,6 +98,7 @@ def main() -> None:
         sys.exit(2)
     print(f"Clearbox UI:  http://{settings.host}:{settings.port}/")
     print(f"MCP endpoint:     {settings.mcp_url}   (agents: {settings.agent})")
+    print(f"Observe endpoint: {settings.observe_mcp_url}   (a session tracking its own work)")
     print(f"Agents:           {app.state.agents_line}")
     print(f"Database:         {os.path.abspath(settings.db)}")
     if legacy and os.path.abspath(settings.db) == legacy:

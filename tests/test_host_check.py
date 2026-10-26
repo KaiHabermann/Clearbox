@@ -1,8 +1,9 @@
 """Host and Origin checks, against a running --mock server on 127.0.0.1.
 
 A web page must not drive the local server: DNS rebinding (the page's own name resolving to
-127.0.0.1) shows up as a foreign Host header and gets a 421 on REST, /mcp and /mcp-agent alike;
-another page calling across origins shows up as a foreign Origin and gets a 403. The server's
+127.0.0.1) shows up as a foreign Host header and gets a 421 on REST, /mcp, /mcp/observe and
+/mcp-agent alike; another page calling across origins shows up as a foreign Origin and gets a 403.
+The server's
 own names pass, with or without a same-origin Origin, and the endless /api/stream still streams.
 Raw sockets, because urllib would fill in Host itself.
 
@@ -48,18 +49,19 @@ def main():
     # a foreign Host is refused everywhere, before any route runs
     for method, path, body in [("GET", "/api/plans", None), ("POST", "/api/agents", "{}"),
                                ("GET", "/", None), ("POST", "/mcp", MCP_INIT),
-                               ("POST", "/mcp-agent/x", MCP_INIT)]:
+                               ("POST", "/mcp/observe", MCP_INIT), ("POST", "/mcp-agent/x", MCP_INIT)]:
         code, text = send(method, path, evil, body=body)
         assert code == 421, (method, path, code, text)
         assert "not allowed" in text, text
-    print("ok  foreign Host refused on /api, /, /mcp and /mcp-agent")
+    print("ok  foreign Host refused on /api, /, /mcp, /mcp/observe and /mcp-agent")
 
     # the server's own names pass
     for host in (ours, f"localhost:{PORT}", "localhost"):
         code, text = send("GET", "/api/plans", host)
         assert code == 200, (host, code, text)
-    code, text = send("POST", "/mcp", ours, body=MCP_INIT)
-    assert code == 200, (code, text)
+    for path in ("/mcp", "/mcp/observe"):
+        code, text = send("POST", path, ours, body=MCP_INIT)
+        assert code == 200, (path, code, text)
     code, _ = send("POST", "/mcp-agent/x", ours, body=MCP_INIT)
     assert code == 404, code  # passes the check, then the unknown token is turned away
     print("ok  127.0.0.1 and localhost pass on /api and /mcp")
@@ -68,8 +70,9 @@ def main():
     for origin in ("http://evil.example", f"http://localhost:{PORT + 1}", "null"):
         code, text = send("POST", "/api/agents", ours, origin=origin, body="{}")
         assert code == 403, (origin, code, text)
-        code, _ = send("POST", "/mcp", ours, origin=origin, body=MCP_INIT)
-        assert code == 403, (origin, code)
+        for path in ("/mcp", "/mcp/observe"):
+            code, _ = send("POST", path, ours, origin=origin, body=MCP_INIT)
+            assert code == 403, (origin, path, code)
     for origin in (f"http://{ours}", f"http://localhost:{PORT}", None):
         code, text = send("POST", "/api/agents", ours, origin=origin, body="{}")
         assert code == 422, (origin, code, text)  # reached the route: the empty body is invalid

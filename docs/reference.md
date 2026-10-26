@@ -281,8 +281,8 @@ $env:OPENAI_API_KEY = "sk-…"; uv run clearbox --agent-profile openai   # every
 
 ### Worker agents' MCP tools
 
-A built-in worker never sees the `/mcp` endpoint your own session uses. When the engine starts a
-built-in node it mints a random token for that run and hands the agent
+A built-in worker never sees the `/mcp` or `/mcp/observe` endpoint your own session uses. When the
+engine starts a built-in node it mints a random token for that run and hands the agent
 `http://127.0.0.1:<port>/mcp-agent/<token>` instead; the token names the node and is revoked the
 moment the run ends (finished, failed or stopped), after which the endpoint answers 404, as it
 does for a token it never minted. That endpoint serves only what expanding a node needs:
@@ -296,8 +296,8 @@ agent: `submit_plan`, `add_node` and `update_node` refuse an `agent` argument wi
 Instead a subplan a worker creates gets **the creating node's resolved agent profile as its plan
 default**, so expanding a node never runs the sub-work on a more capable agent than the node itself
 had (see [Which agent runs a node](#which-agent-runs-a-node)). Reviewers get no clearbox tools at
-all; external agents claiming over `/mcp` are trusted like you. The token never appears in a
-transcript; only a `--mock` server hands it out, on a debug route the tests use.
+all; external agents claiming over `/mcp` or `/mcp/observe` are trusted like you. The token never
+appears in a transcript; only a `--mock` server hands it out, on a debug route the tests use.
 
 This closes the tool layer, not the machine: an agent with capability `run` or `full` has a shell
 and can reach `/mcp` on localhost directly. The scoping protects `read` and `edit` agents, and
@@ -496,7 +496,8 @@ the whole flow can be watched for free.
 ## Connecting Claude Code
 
 This repository is a Claude Code plugin marketplace. Its `clearbox` plugin (in `plugin/`) brings
-two things: the MCP server entry `clearbox` (streamable HTTP, `http://127.0.0.1:8765/mcp`) and the
+two things: the MCP server entry `clearbox` (streamable HTTP, `http://127.0.0.1:8765/mcp/observe`,
+see [Two endpoints](#two-endpoints-mcp-and-mcpobserve)) and the
 `clearbox-tracking` skill, which tells Claude when to lay out a plan in Clearbox and how to keep
 the graph in step with the work. In Claude Code:
 
@@ -509,16 +510,45 @@ The same works from a shell with `claude plugin marketplace add …` and `claude
 The server must be running (`clearbox`); without it the skill says so in one line and Claude works
 normally.
 
-**Without the plugin**, add the MCP server by hand and tell Claude what to do in your prompt:
+**Without the plugin**, add the MCP server by hand. For your session tracking its own work, the
+observe endpoint is enough, and its instructions already carry the workflow:
 
 ```powershell
-claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
+claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp/observe
 ```
+
+To have Clearbox run plans with its own agents, or to use reviews and agent profiles, add the full
+endpoint `http://127.0.0.1:8765/mcp` instead and tell Claude what to do in your prompt.
 
 On another port, use that port in the URL (with the plugin too: the plugin's entry is fixed to
 8765, so add a manual entry instead).
 
 ## MCP tools
+
+### Two endpoints: `/mcp` and `/mcp/observe`
+
+The server offers the same tools on two endpoints (both streamable HTTP, same Host/Origin checks):
+
+* **`/mcp/observe`**, for a session that tracks its own work (way 1, what the plugin uses): ten
+  tools, `submit_plan`, `claim_next_node`, `report_progress`, `complete_node`, `fail_node`,
+  `add_node`, `add_edge`, `remove_node`, `remove_edge`, `get_plan`, and server instructions that
+  describe the self-tracking workflow rather than the API. Its `submit_plan` takes no
+  `test_instructions` / `max_parallel` (only built-in agents use them) and **starts a top-level plan
+  right away with executor `"external"`**, saying so in its result (`"started"`); if the plan cannot
+  start (another running plan works in the same folder) nothing is created. A subplan
+  (`parent_plan_id`, `parent_node_id`) is not started on its own: it runs with its parent plan.
+* **`/mcp`**, the full set below: building, built-in execution, agent profiles, reviews and rework.
+  Use it when Clearbox runs the plan (way 2) or you want those features.
+
+What a client loads up front, measured with an MCP client against a mock server (instructions plus
+the JSON of the tools list, about four characters per token):
+
+| Endpoint | Tools | Instructions | Tool schemas |
+| --- | --- | --- | --- |
+| `/mcp` | 24 | 1.6k chars | 25.3k chars (~6.7k tokens with the instructions) |
+| `/mcp/observe` | 10 | 2.4k chars | 10.4k chars (~3.2k tokens with the instructions) |
+
+### All tools (`/mcp`)
 
 | Tool | What it does |
 | --- | --- |

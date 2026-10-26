@@ -49,6 +49,41 @@ on it and pass no results. Every sub-node runs on your own agent, after your ses
 """.strip()
 
 
+OBSERVE_INSTRUCTIONS = """
+Clearbox shows the user your work live as a plan: a graph of steps, each with its own diff. Use it
+for every task of three or more steps; skip it for questions and one-step edits. You do the work
+yourself: Clearbox runs no agents here.
+
+Start: ONE submit_plan(title, working_directory, nodes, edges) per task; it also starts the plan.
+  title: the task in a few words; description: the goal and what "done" means.
+  nodes: one per step, title a short verb phrase ("Parse config file"), description for the user
+    (what and why), files = the paths it will create or modify (its diff in the UI).
+  edges: [from_key, to_key] for every real dependency ("must finish first"); none between
+    independent steps. kind="user" for a step only the user can do (push, deploy, approve).
+  Then give the user one line and the link http://127.0.0.1:{port}/#/plan/<plan_id> instead of
+  writing the plan out in chat.
+
+Work: claim_next_node(agent_name, plan_id) gives the lowest-numbered ready step, so number steps
+in the order you mean to do them. Claim one at a time and work only on what you claimed.
+complete_node(plan_id, node_id, result) the moment it is done, with 1-3 sentences: what was done
+and any deviation. Never in a batch afterwards. fail_node with the reason if it is abandoned.
+report_progress only at real milestones (a finding, a decision, a dead end).
+
+Keep the graph true, at the moment you learn something:
+- new work: add_node, then add_edge from what it depends on and to each pending step needing it.
+- a running step needs something first: complete it with what it did, add the missing step and a
+  follow-up for the rest, wire current -> missing -> follow-up -> former dependants.
+- unnecessary step: remove_node, reconnect its neighbours. Wrong dependency: remove_edge/add_edge.
+- too big: submit_plan(parent_plan_id, parent_node_id, ...) expands a step into a subplan that
+  runs with its plan. For the step you hold, complete it first: then its subplan's steps are
+  claimable, and the step is done when they all are.
+- changed direction: remove or fail what no longer applies; leave no stale pending steps.
+Blocked on the user (a token, an install, a decision): complete the current step saying what is
+missing, add_node(kind="user") with an exact instruction for a person, wire a follow-up after it,
+and tell the user in one line with the link. Do not work around the blocker.
+""".strip()
+
+
 class NodeSpec(BaseModel):
     """One node of a submit_plan call."""
 
@@ -79,9 +114,10 @@ def _in_subtree(store: Store, plan_id: int, node: tuple[int, int]) -> bool:
     return False
 
 
-def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
-    """The planning server the user's own session reaches at /mcp, and the scoped server built-in
-    worker agents reach at /mcp-agent/<token> (a checked subset of the same tools)."""
+def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
+    """The planning server the user's own session reaches at /mcp, the scoped server built-in
+    worker agents reach at /mcp-agent/<token> (a checked subset of the same tools), and the slim
+    server at /mcp/observe for a session that tracks its own work (another subset)."""
     mcp = MCPServer("clearbox", instructions=INSTRUCTIONS)
     store = engine.store
 
@@ -865,4 +901,47 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer]:
         plan_id, node_id, _ = _caller(ctx)
         return report_progress(plan_id, node_id, message, kind)
 
-    return mcp, agent_mcp
+    # ------------------------------------------------------ observing itself
+    # The slim server at /mcp/observe: a session that tracks its own work as an external executor
+    # needs only these tools, and submit_plan starts a top-level plan right away.
+    observe_mcp = MCPServer("clearbox", instructions=OBSERVE_INSTRUCTIONS.format(port=engine.config.server_port))
+
+    @observe_mcp.tool(name="submit_plan")
+    def observe_submit_plan(title: str, working_directory: str | None = None, description: str = "",
+                            nodes: list[NodeSpec] | None = None, edges: list[tuple[str, str]] | None = None,
+                            parent_plan_id: int | None = None,
+                            parent_node_id: int | None = None) -> dict[str, Any]:
+        """Create a whole plan -- its nodes and edges -- in one call and, if it is a top-level
+        plan, start it with you as the executor. Returns {"plan_id", "nodes": {key: node_id},
+        "started"}. All or nothing: every problem is reported in one error, and then nothing has
+        been created.
+
+        working_directory: absolute path of the project you work in (top-level plans only, required
+        there). nodes: [{key, title, description, files, results_from, kind}, ...]; key is your own
+        label. files: paths, relative to the working directory, the step will CREATE or MODIFY (its
+        diff in the UI). results_from: keys of nodes it depends on whose result text it receives.
+        kind="user": a step only the user can do; the plan waits there for them.
+        edges: [[from_key, to_key], ...] -- from must finish before to starts; no cycles.
+        parent_plan_id + parent_node_id: expand that node into this subplan instead; it runs with
+        its parent plan and completes when all its nodes are done.
+        """
+        out = submit_plan(title, working_directory, description, None, nodes, edges, parent_plan_id,
+                          parent_node_id)
+        if parent_plan_id is None:
+            try:
+                start_plan(out["plan_id"], "external")
+            except ToolError as e:  # e.g. another running plan in this folder: keep all or nothing
+                store.delete_plan(out["plan_id"])
+                engine.bus.publish({"type": "plan", "plan_id": out["plan_id"], "root_id": out["plan_id"],
+                                    "deleted": True})
+                raise ToolError(f"nothing was created: {e}") from e
+            out["started"] = 'yes, executor "external": claim its steps with claim_next_node'
+        else:
+            out["started"] = "runs with its parent plan"
+        return out
+
+    for fn in (claim_next_node, report_progress, complete_node, fail_node, add_node, add_edge,
+               remove_node, remove_edge, get_plan):
+        observe_mcp.add_tool(fn)
+
+    return mcp, agent_mcp, observe_mcp
