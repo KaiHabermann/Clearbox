@@ -153,7 +153,9 @@ class Engine:
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self) -> None:
-        # Built-in agents do not survive a restart: put their nodes back in the queue.
+        # Built-in agents do not survive a restart: put their nodes back in the queue, and drop
+        # the worktrees of isolated ones.
+        await asyncio.to_thread(worktrees.remove_all, self._snapshots.root)
         for n in self.store._q("SELECT plan_id, node_id FROM nodes WHERE status='running' AND agent_kind='builtin' AND agent_done=0"):
             self._emit(n["plan_id"], n["node_id"], "system", {"text": "agent interrupted by service restart; node re-queued"})
             self._set_status(n["plan_id"], n["node_id"], "pending", agent_kind=None, started_at=None)
@@ -791,8 +793,12 @@ class Engine:
                            harness: Harness) -> None:
         key = (plan_id, node_id)
         token = None
+        wt: worktrees.Worktree | None = None
         try:
-            await self._take_snapshot(plan_id, node_id)  # before the agent can touch anything
+            if self.store.root_of(plan_id)["isolate_steps"]:
+                wt = await asyncio.to_thread(worktrees.create, self._snapshots, key, self.plan_workdir(plan_id))
+                self._emit(plan_id, node_id, "system", {"text": f"working in its own worktree: {wt.path}"})
+            await self._take_snapshot(plan_id, node_id, wt)  # before the agent can touch anything
             system_append = worker_system_append(profile, self.tests_note(plan_id))
             if self.config.agent_mcp_url:
                 token = secrets.token_urlsafe(24)
@@ -804,7 +810,7 @@ class Engine:
                 node_id=node_id,
                 prompt=self.build_context(plan_id, node_id),
                 system_append=system_append,
-                cwd=self.plan_workdir(plan_id),
+                cwd=wt.path if wt else self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_node(plan_id, node_id)["title"],
                 mcp_url=f"{self.config.agent_mcp_url}/{token}" if token else None,
@@ -830,7 +836,7 @@ class Engine:
                 errs = (result or {}).get("errors") or [(result or {}).get("text") or "agent failed"]
                 await self._finish(plan_id, node_id, ok=False, text="; ".join(map(str, errs)))
             else:
-                await self._finish(plan_id, node_id, ok=True, text=result.get("text", ""))
+                await self._finish(plan_id, node_id, ok=True, text=result.get("text", ""), wt=wt)
         except asyncio.CancelledError:
             if key in self._stopping:
                 self._stopping.discard(key)
@@ -838,11 +844,16 @@ class Engine:
         except HarnessError as e:  # setup problem surfaced by the harness: actionable, no traceback
             self._emit(plan_id, node_id, "error", {"text": f"agent misconfigured: {e}"})
             await self._finish(plan_id, node_id, ok=False, text=str(e))
+        except worktrees.WorktreeError as e:  # the worktree could not be created
+            self._emit(plan_id, node_id, "error", {"text": str(e)})
+            await self._finish(plan_id, node_id, ok=False, text=str(e))
         except Exception as e:  # noqa: BLE001
             log.exception("agent for node %s failed", key)
             self._emit(plan_id, node_id, "error", {"text": f"{type(e).__name__}: {e}"})
             await self._finish(plan_id, node_id, ok=False, text=f"{type(e).__name__}: {e}")
         finally:
+            if wt is not None:
+                await asyncio.to_thread(worktrees.remove, wt)
             self._agent_tokens.pop(token, None)
             self._tasks.pop(key, None)
             self._task_profiles.pop(key, None)
@@ -859,15 +870,17 @@ class Engine:
         (app.py serves it under --mock): nothing else may hand a token out."""
         return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
 
-    async def _take_snapshot(self, plan_id: int, node_id: int) -> None:
+    async def _take_snapshot(self, plan_id: int, node_id: int, wt: worktrees.Worktree | None = None) -> None:
         """Snapshot a run's declared files and working tree before its agent starts, the baseline
-        of its diff and of its undeclared changes. Runs of one plan tree overlap in one folder.
+        of its diff and of its undeclared changes. Runs of one plan tree overlap in one folder,
+        unless they have their own worktree ``wt``, which is then what is snapshotted.
         The git work runs in a thread; a run cancelled meanwhile never registers its snapshot."""
         key = (plan_id, node_id)
         self._snapshots.discard(key)
         run = await asyncio.to_thread(
-            self._snapshots.capture, key, self.plan_workdir(plan_id),
-            [f["path"] for f in self.store.node_files(plan_id, node_id)], self.store.root_of(plan_id)["id"])
+            self._snapshots.capture, key, wt.path if wt else self.plan_workdir(plan_id),
+            [f["path"] for f in self.store.node_files(plan_id, node_id)], self.store.root_of(plan_id)["id"],
+            (wt.git_dir, wt.base, wt.index) if wt else None)
         if run is not None:
             self._snapshots.register(key, run)
 
@@ -883,11 +896,24 @@ class Engine:
         if done.undeclared:
             self.store.set_node_undeclared(plan_id, node_id, done.undeclared, done.shared)
 
-    async def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
+    async def _finish(self, plan_id: int, node_id: int, ok: bool, text: str,
+                      wt: worktrees.Worktree | None = None) -> None:
+        """End a run: store its diffs, apply a successful isolated run's changes from its worktree
+        ``wt`` to the working directory (failing the step if they no longer apply), set the status."""
         key = (plan_id, node_id)
         self._finishing.add(key)
         try:
             await self._record_diffs(plan_id, node_id)
+            if ok and wt is not None:
+                try:
+                    names = await asyncio.to_thread(worktrees.apply_back, self._snapshots, wt,
+                                                    self.plan_workdir(plan_id), key)
+                    if names:
+                        self._emit(plan_id, node_id, "system",
+                                   {"text": f"applied {len(names)} changed file(s) to the working directory"})
+                except worktrees.WorktreeError as e:
+                    ok, text = False, str(e)
+                    self._emit(plan_id, node_id, "error", {"text": text})
         finally:
             self._finishing.discard(key)
         if not ok:
