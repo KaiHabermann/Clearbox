@@ -7,5 +7,15 @@
   },
   "homepage": "https://github.com/KaiHabermann/Clearbox",
   "repository": "https://github.com/KaiHabermann/Clearbox",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "port": {
+      "type": "number",
+      "title": "Clearbox port",
+      "description": "Port the clearbox server listens on: its --port / CLEARBOX_PORT (default 8765)",
+      "default": 8765,
+      "min": 1,
+      "max": 65535
+    }
+  }
 }

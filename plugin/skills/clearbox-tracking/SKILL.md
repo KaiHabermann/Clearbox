@@ -5,7 +5,7 @@ description: Use at the start of any task with more than two steps (implementing
 
 # Clearbox tracking
 
-The user follows your work in the Clearbox UI (<http://127.0.0.1:8765/>), not in the chat.
+The user follows your work in the Clearbox UI (<http://127.0.0.1:${user_config.port}/>), not in the chat.
 The graph there must always answer three questions at a glance: **what is the plan, what is
 being worked on right now, and why does each step come where it does.** A person should be able
 to judge whether the approach is reasonable from the flowchart alone, without reading your
@@ -22,7 +22,7 @@ you claim and complete its nodes yourself. Clearbox runs no agents of its own he
 - Skip it for questions, explanations, and one-step edits.
 
 The tools come from the Clearbox server, which the user starts with `clearbox` (it serves the UI
-and the MCP endpoint `/mcp/observe` on port 8765). If the Clearbox MCP tools are not available (server not
+and the MCP endpoint `/mcp/observe` on port ${user_config.port}). If the Clearbox MCP tools are not available (server not
 running), say so once in one line, suggesting `clearbox`, and work normally. Do not stall on it.
 
 ## Starting a plan
@@ -41,7 +41,7 @@ running), say so once in one line, suggesting `clearbox`, and work normally. Do 
      credential). The plan visibly stops there and waits for them. See "Blocked on the user"
      below for ones that turn up during the work.
 2. Instead of writing the plan out in chat, give one or two lines plus the link
-   `http://127.0.0.1:8765/#/plan/<plan_id>`.
+   `http://127.0.0.1:${user_config.port}/#/plan/<plan_id>`.
 
 ## Working through it
 

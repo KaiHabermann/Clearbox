@@ -648,8 +648,9 @@ claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp/observe
 To have Clearbox run plans with its own agents, or to use reviews and agent profiles, add the full
 endpoint `http://127.0.0.1:8765/mcp` instead and tell Claude what to do in your prompt.
 
-On another port, use that port in the URL (with the plugin too: the plugin's entry is fixed to
-8765, so add a manual entry instead).
+On another port (`clearbox --port 9000`, or `CLEARBOX_PORT`), set the plugin's **Clearbox port**
+option under `/config` (it defaults to 8765); the plugin's MCP entry and the skill's links use it.
+Without the plugin, use that port in the URL.
 
 Codex CLI, Cursor, VS Code and Gemini CLI: see [Other MCP clients](clients.md).
 
