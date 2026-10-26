@@ -54,7 +54,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import reviews
+from . import reviews, worktrees
 from .diffs import Snapshots
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
@@ -137,6 +137,9 @@ class Engine:
         # git snapshots of each run's declared files and whole working tree, taken when it is
         # spawned or claimed; diffed by _record_diffs when the node finishes (see diffs.py)
         self._snapshots = Snapshots(self.config.snapshot_dir or os.path.join(self.config.workdir, "snapshots"))
+        # runs whose end snapshot is being taken (off the event loop): a second complete/fail of
+        # the same external claim must not slip in while the first is still finishing
+        self._finishing: set[tuple[int, int]] = set()
         # review tasks run alongside node tasks but are tracked separately so a node's
         # (plan_id, node_id) task-dict slot is never mistaken for "node still running";
         # queued review requests wait here until a slot of the shared max_concurrency is free.
@@ -150,7 +153,9 @@ class Engine:
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self) -> None:
-        # Built-in agents do not survive a restart: put their nodes back in the queue.
+        # Built-in agents do not survive a restart: put their nodes back in the queue, and drop
+        # the worktrees of isolated ones.
+        await asyncio.to_thread(worktrees.remove_all, self._snapshots.root)
         for n in self.store._q("SELECT plan_id, node_id FROM nodes WHERE status='running' AND agent_kind='builtin' AND agent_done=0"):
             self._emit(n["plan_id"], n["node_id"], "system", {"text": "agent interrupted by service restart; node re-queued"})
             self._set_status(n["plan_id"], n["node_id"], "pending", agent_kind=None, started_at=None)
@@ -242,7 +247,24 @@ class Engine:
             raise PlanError("cannot change the working directory of a started plan")
         if directory:
             validate_working_directory(directory)
+        if root["isolate_steps"] and not worktrees.in_git_repo(
+                directory or os.path.join(self.config.workdir, f"plan-{plan_id}")):
+            raise PlanError("this plan isolates its steps in git worktrees, so its working directory must "
+                            "be inside a git repository; turn isolate_steps off first")
         self.store.update_plan(plan_id, cwd=directory or None)
+
+    def set_isolate_steps(self, plan_id: int, on: bool) -> None:
+        """Turn per-step worktrees on or off for a top-level plan: only inside a git repository,
+        and only while no step of its tree is running (a running step keeps the mode it began in)."""
+        root = self.store.root_of(plan_id)
+        if root["id"] != plan_id:
+            raise PlanError("isolate_steps can only be set on top-level plans; subplans use their top-level plan's")
+        if on and not worktrees.in_git_repo(self.plan_workdir(plan_id)):
+            raise PlanError(f"isolate_steps needs a working directory inside a git repository; "
+                            f"{self.plan_workdir(plan_id)} is not in one")
+        if self.rollup(plan_id)["running"]:
+            raise PlanError("cannot change isolate_steps while a step of the plan is running; stop it first")
+        self.store.update_plan(plan_id, isolate_steps=1 if on else None)
 
     def plan_test_instructions(self, plan_id: int) -> str | None:
         """How to run the project's tests, as the plan's top-level plan states it (or None)."""
@@ -610,9 +632,10 @@ class Engine:
 
     def _queue_review(self, plan_id: int, node_id: int) -> None:
         """Queue a reviewer run for a just-finished task node, unless there is nothing to do:
-        no review agent for this plan, or no diff was captured for this node."""
+        no review agent for this plan, or neither a diff nor an undeclared change was captured."""
         profile = self._review_profile(plan_id)
-        if profile is None or not self.store.node_diffs(plan_id, node_id):
+        if profile is None or not (self.store.node_diffs(plan_id, node_id)
+                                   or self.store.get_node(plan_id, node_id)["undeclared_files"]):
             return
         self._review_queue.append((plan_id, node_id))
         self.kick()
@@ -757,7 +780,6 @@ class Engine:
                                tokens_in=None, tokens_out=None)
         self.store.clear_node_diffs(plan_id, node_id)
         self._cancel_review(plan_id, node_id)
-        self._take_snapshot(plan_id, node_id)
         self._set_status(plan_id, node_id, "running", agent_kind="builtin",
                          agent_name=self.harnesses.agent_name(profile))
         self._emit(plan_id, node_id, "system", {"text": self.harnesses.label(profile),
@@ -771,7 +793,12 @@ class Engine:
                            harness: Harness) -> None:
         key = (plan_id, node_id)
         token = None
+        wt: worktrees.Worktree | None = None
         try:
+            if self.store.root_of(plan_id)["isolate_steps"]:
+                wt = await asyncio.to_thread(worktrees.create, self._snapshots, key, self.plan_workdir(plan_id))
+                self._emit(plan_id, node_id, "system", {"text": f"working in its own worktree: {wt.path}"})
+            await self._take_snapshot(plan_id, node_id, wt)  # before the agent can touch anything
             system_append = worker_system_append(profile, self.tests_note(plan_id))
             if self.config.agent_mcp_url:
                 token = secrets.token_urlsafe(24)
@@ -783,7 +810,7 @@ class Engine:
                 node_id=node_id,
                 prompt=self.build_context(plan_id, node_id),
                 system_append=system_append,
-                cwd=self.plan_workdir(plan_id),
+                cwd=wt.path if wt else self.plan_workdir(plan_id),
                 profile=profile,
                 node_title=self.store.get_node(plan_id, node_id)["title"],
                 mcp_url=f"{self.config.agent_mcp_url}/{token}" if token else None,
@@ -807,21 +834,26 @@ class Engine:
                                        tokens_out=result.get("tokens_out"))
             if result is None or result.get("is_error"):
                 errs = (result or {}).get("errors") or [(result or {}).get("text") or "agent failed"]
-                self._finish(plan_id, node_id, ok=False, text="; ".join(map(str, errs)))
+                await self._finish(plan_id, node_id, ok=False, text="; ".join(map(str, errs)))
             else:
-                self._finish(plan_id, node_id, ok=True, text=result.get("text", ""))
+                await self._finish(plan_id, node_id, ok=True, text=result.get("text", ""), wt=wt)
         except asyncio.CancelledError:
             if key in self._stopping:
                 self._stopping.discard(key)
             raise
         except HarnessError as e:  # setup problem surfaced by the harness: actionable, no traceback
             self._emit(plan_id, node_id, "error", {"text": f"agent misconfigured: {e}"})
-            self._finish(plan_id, node_id, ok=False, text=str(e))
+            await self._finish(plan_id, node_id, ok=False, text=str(e))
+        except worktrees.WorktreeError as e:  # the worktree could not be created
+            self._emit(plan_id, node_id, "error", {"text": str(e)})
+            await self._finish(plan_id, node_id, ok=False, text=str(e))
         except Exception as e:  # noqa: BLE001
             log.exception("agent for node %s failed", key)
             self._emit(plan_id, node_id, "error", {"text": f"{type(e).__name__}: {e}"})
-            self._finish(plan_id, node_id, ok=False, text=f"{type(e).__name__}: {e}")
+            await self._finish(plan_id, node_id, ok=False, text=f"{type(e).__name__}: {e}")
         finally:
+            if wt is not None:
+                await asyncio.to_thread(worktrees.remove, wt)
             self._agent_tokens.pop(token, None)
             self._tasks.pop(key, None)
             self._task_profiles.pop(key, None)
@@ -838,27 +870,52 @@ class Engine:
         (app.py serves it under --mock): nothing else may hand a token out."""
         return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
 
-    def _take_snapshot(self, plan_id: int, node_id: int) -> None:
+    async def _take_snapshot(self, plan_id: int, node_id: int, wt: worktrees.Worktree | None = None) -> None:
         """Snapshot a run's declared files and working tree before its agent starts, the baseline
-        of its diff and of its undeclared changes. Runs of one plan tree overlap in one folder."""
-        self._snapshots.take((plan_id, node_id), self.plan_workdir(plan_id),
-                             [f["path"] for f in self.store.node_files(plan_id, node_id)],
-                             group=self.store.root_of(plan_id)["id"])
-
-    def _record_diffs(self, plan_id: int, node_id: int) -> None:
-        """Store the diffs and undeclared changes of the run that just ended, if anything was
-        snapshotted for it."""
+        of its diff and of its undeclared changes. Runs of one plan tree overlap in one folder,
+        unless they have their own worktree ``wt``, which is then what is snapshotted.
+        The git work runs in a thread; a run cancelled meanwhile never registers its snapshot."""
         key = (plan_id, node_id)
-        if key not in self._snapshots:
+        self._snapshots.discard(key)
+        run = await asyncio.to_thread(
+            self._snapshots.capture, key, wt.path if wt else self.plan_workdir(plan_id),
+            [f["path"] for f in self.store.node_files(plan_id, node_id)], self.store.root_of(plan_id)["id"],
+            (wt.git_dir, wt.base, wt.index) if wt else None)
+        if run is not None:
+            self._snapshots.register(key, run)
+
+    async def _record_diffs(self, plan_id: int, node_id: int) -> None:
+        """Store the diffs and undeclared changes of the run that just ended, if anything was
+        snapshotted for it (the git work in a thread)."""
+        run = self._snapshots.pop((plan_id, node_id))
+        if run is None:
             return
-        done = self._snapshots.finish(key)
+        done = await asyncio.to_thread(self._snapshots.compare, (plan_id, node_id), run)
         if done.diffs:
             self.store.set_node_diffs(plan_id, node_id, done.diffs)
         if done.undeclared:
             self.store.set_node_undeclared(plan_id, node_id, done.undeclared, done.shared)
 
-    def _finish(self, plan_id: int, node_id: int, ok: bool, text: str) -> None:
-        self._record_diffs(plan_id, node_id)
+    async def _finish(self, plan_id: int, node_id: int, ok: bool, text: str,
+                      wt: worktrees.Worktree | None = None) -> None:
+        """End a run: store its diffs, apply a successful isolated run's changes from its worktree
+        ``wt`` to the working directory (failing the step if they no longer apply), set the status."""
+        key = (plan_id, node_id)
+        self._finishing.add(key)
+        try:
+            await self._record_diffs(plan_id, node_id)
+            if ok and wt is not None:
+                try:
+                    names = await asyncio.to_thread(worktrees.apply_back, self._snapshots, wt,
+                                                    self.plan_workdir(plan_id), key)
+                    if names:
+                        self._emit(plan_id, node_id, "system",
+                                   {"text": f"applied {len(names)} changed file(s) to the working directory"})
+                except worktrees.WorktreeError as e:
+                    ok, text = False, str(e)
+                    self._emit(plan_id, node_id, "error", {"text": text})
+        finally:
+            self._finishing.discard(key)
         if not ok:
             self.store.update_node(plan_id, node_id, agent_done=1)
             self._set_status(plan_id, node_id, "failed", error=text)
@@ -981,7 +1038,7 @@ class Engine:
         task = self._tasks.get((plan_id, node_id))
         if task is not None:
             await self._cancel(plan_id, node_id, task)
-        self._record_diffs(plan_id, node_id)
+        await self._record_diffs(plan_id, node_id)
         text = (result or "").strip() or self._last_result_text(plan_id, node_id)
         note = "marked done by user" + ("" if text else " (no result recorded)")
         self._emit(plan_id, node_id, "system", {"text": note})
@@ -1075,7 +1132,7 @@ class Engine:
         self.notify_plan(root["id"])
 
     # ------------------------------------------------------- external agents
-    def claim_next(self, agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
+    async def claim_next(self, agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
         roots = [r for r in self.store.started_root_plans() if r["executor"] == "external"]
         if plan_id is not None:
             want = self.store.root_of(plan_id)["id"]
@@ -1088,9 +1145,11 @@ class Engine:
                         self.store.update_node(pid, n["node_id"], agent_done=0, result=None, error=None)
                         self.store.clear_node_diffs(pid, n["node_id"])
                         self._cancel_review(pid, n["node_id"])
-                        self._take_snapshot(pid, n["node_id"])
+                        # running first, so no other claim takes the node while the snapshot runs;
+                        # it is complete before this returns, so before the agent does anything
                         self._set_status(pid, n["node_id"], "running", agent_kind="external", agent_name=agent_name)
                         self._emit(pid, n["node_id"], "system", {"text": f"claimed by external agent '{agent_name}'"})
+                        await self._take_snapshot(pid, n["node_id"])
                         hint = EXPAND_HINT.format(plan_id=pid, node_id=n["node_id"])
                         return {
                             "plan_id": pid,
@@ -1107,7 +1166,7 @@ class Engine:
 
     def _require_external_running(self, plan_id: int, node_id: int) -> dict[str, Any]:
         n = self.store.get_node(plan_id, node_id)
-        if n["status"] != "running" or n["agent_done"]:
+        if n["status"] != "running" or n["agent_done"] or (plan_id, node_id) in self._finishing:
             raise PlanError(f"node ({plan_id}, {node_id}) is not being worked on (status {n['status']})")
         return n
 
@@ -1117,12 +1176,12 @@ class Engine:
             kind = "text"
         self._emit(plan_id, node_id, kind, {"text": message})
 
-    def complete_external(self, plan_id: int, node_id: int, result: str) -> None:
+    async def complete_external(self, plan_id: int, node_id: int, result: str) -> None:
         self._require_external_running(plan_id, node_id)
         self._emit(plan_id, node_id, "result", {"text": result, "is_error": False})
-        self._finish(plan_id, node_id, ok=True, text=result)
+        await self._finish(plan_id, node_id, ok=True, text=result)
 
-    def fail_external(self, plan_id: int, node_id: int, error: str) -> None:
+    async def fail_external(self, plan_id: int, node_id: int, error: str) -> None:
         self._require_external_running(plan_id, node_id)
         self._emit(plan_id, node_id, "error", {"text": error})
-        self._finish(plan_id, node_id, ok=False, text=error)
+        await self._finish(plan_id, node_id, ok=False, text=error)

@@ -12,6 +12,7 @@ from .engine import ConflictCache, Engine
 from .export import plan_markdown
 from .harness import HarnessError
 from .store import PlanError, Store, public_profile, validate_working_directory
+from .worktrees import in_git_repo
 
 INSTRUCTIONS = """
 Clearbox runs a plan: a DAG of nodes, each one piece of work done by one agent session. Edges
@@ -220,6 +221,7 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
             "test_instructions": engine.plan_test_instructions(plan_id),
             "parent": [p["parent_plan_id"], p["parent_node_id"]] if p["parent_plan_id"] else None,
             "max_parallel": p["max_parallel"],
+            "isolate_steps": bool(store.root_of(plan_id)["isolate_steps"]),
             "default_agent": _profile_name(p["default_agent_profile_id"]),
             "started": bool(store.root_of(plan_id)["started"]),
             "status": engine.plan_status(plan_id),
@@ -229,10 +231,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
 
     # ------------------------------------------------------------ building
     def _check_plan_args(parent_plan_id: int | None, working_directory: str | None,
-                         max_parallel: int | None, test_instructions: str | None) -> None:
+                         max_parallel: int | None, test_instructions: str | None,
+                         isolate_steps: bool | None = None) -> None:
         """The rules for a new plan's own settings, shared by create_plan and submit_plan."""
         if parent_plan_id is not None and max_parallel is not None:
             raise ToolError("max_parallel can only be set on top-level plans")
+        if parent_plan_id is not None and isolate_steps:
+            raise ToolError("isolate_steps can only be set on top-level plans; a subplan uses its "
+                            "top-level plan's")
         if parent_plan_id is not None and test_instructions:
             raise ToolError("test_instructions can only be set on top-level plans; a subplan "
                             "uses its top-level plan's")
@@ -248,11 +254,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
                 validate_working_directory(working_directory)
             except PlanError as e:
                 raise ToolError(str(e)) from e
+            if isolate_steps and not in_git_repo(working_directory):
+                raise ToolError(f"isolate_steps needs a working directory inside a git repository; "
+                                f"{working_directory} is not in one")
 
     def _submit(title: str, working_directory: str | None, description: str, test_instructions: str | None,
                 nodes: list[NodeSpec], edges: list[tuple[str, str]], parent_plan_id: int | None,
                 parent_node_id: int | None, max_parallel: int | None,
-                default_profile_id: int | None = None) -> dict[str, Any]:
+                default_profile_id: int | None = None, isolate_steps: bool | None = None) -> dict[str, Any]:
         """submit_plan for both endpoints. The checks that need nothing written run first; the rest
         (subplan rules, files, kind, cycles, results_from) are the store's and engine's own, applied
         by writing the plan inside one transaction that any error rolls back. Every error is
@@ -266,7 +275,8 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
                 errors.append(f"{label}{e}")
                 return None
 
-        check("", _check_plan_args, parent_plan_id, working_directory, max_parallel, test_instructions)
+        check("", _check_plan_args, parent_plan_id, working_directory, max_parallel, test_instructions,
+              isolate_steps)
         keys = [n.key for n in nodes]
         for k in sorted({k for k in keys if keys.count(k) > 1}):
             errors.append(f"duplicate node key {k!r}")
@@ -285,7 +295,8 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         try:
             with store.transaction():
                 pid = check("", store.create_plan, title, description, parent_plan_id, parent_node_id,
-                            working_directory, max_parallel, (test_instructions or "").strip() or None)
+                            working_directory, max_parallel, (test_instructions or "").strip() or None,
+                            bool(isolate_steps))
                 if pid is not None:
                     if default_profile_id is not None:
                         store.set_plan_profile(pid, default_profile_id)
@@ -336,6 +347,7 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         parent_plan_id: int | None = None,
         parent_node_id: int | None = None,
         max_parallel: int | None = None,
+        isolate_steps: bool | None = None,
     ) -> dict[str, Any]:
         """Create a whole plan -- its nodes and edges -- in one call; the way to build a plan.
         Returns {"plan_id": ..., "nodes": {key: node_id}}.
@@ -354,12 +366,12 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         they mark it done. agent (optional): a profile from list_agents; omit to inherit.
         edges: [[from_key, to_key], ...] -- from must finish before to starts; no cycles.
 
-        working_directory, test_instructions, max_parallel: as in create_plan (top-level plans
-        only; working_directory is required there). parent_plan_id + parent_node_id make this the
+        working_directory, test_instructions, max_parallel, isolate_steps: as in create_plan
+        (top-level plans only; working_directory is required there). parent_plan_id + parent_node_id make this the
         subplan of that node, which then completes when the whole subplan is done.
         """
         return _submit(title, working_directory, description, test_instructions, nodes or [],
-                       edges or [], parent_plan_id, parent_node_id, max_parallel)
+                       edges or [], parent_plan_id, parent_node_id, max_parallel, isolate_steps=isolate_steps)
 
     @mcp.tool()
     def create_plan(
@@ -370,6 +382,7 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         working_directory: str | None = None,
         max_parallel: int | None = None,
         test_instructions: str | None = None,
+        isolate_steps: bool | None = None,
     ) -> int:
         """Create an empty plan and return its integer id; submit_plan creates one with its nodes
         and edges in a single call, and is the usual way.
@@ -391,12 +404,19 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         run (commands, servers they need, what to avoid). Worker and reviewer agents get it
         verbatim; without it they work it out from the repository (README, CI config, ...).
         Subplans inherit it.
+
+        isolate_steps (top-level plans only, working directory inside a git repository): every
+        step a built-in agent runs works in its own git worktree, a copy of the working directory
+        as it is when the step starts (uncommitted and untracked files included); its changes are
+        applied back when it succeeds, and the step fails if they no longer apply. Steps claimed
+        with claim_next_node are not isolated. Off by default.
         """
-        _check_plan_args(parent_plan_id, working_directory, max_parallel, test_instructions)
+        _check_plan_args(parent_plan_id, working_directory, max_parallel, test_instructions, isolate_steps)
         try:
             pid = store.create_plan(title, description, parent_plan_id, parent_node_id, cwd=working_directory,
                                     max_parallel=max_parallel,
-                                    test_instructions=(test_instructions or "").strip() or None)
+                                    test_instructions=(test_instructions or "").strip() or None,
+                                    isolate_steps=bool(isolate_steps))
         except PlanError as e:
             raise ToolError(str(e)) from e
         if parent_plan_id is not None:
@@ -406,7 +426,8 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         return pid
 
     @mcp.tool()
-    def update_plan(plan_id: int, max_parallel: int | None = None, test_instructions: str | None = None) -> str:
+    def update_plan(plan_id: int, max_parallel: int | None = None, test_instructions: str | None = None,
+                    isolate_steps: bool | None = None) -> str:
         """Change a top-level plan's own settings; only the fields you pass change.
 
         max_parallel: cap how many nodes of this plan's whole tree run at once (0 or null
@@ -416,7 +437,15 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         test_instructions: how this project's tests are run, as in create_plan; "" removes
         them (agents then work it out from the repository). Top-level plans only; nodes that
         start afterwards get the new text.
+
+        isolate_steps: run built-in steps in their own git worktrees, as in create_plan. Only
+        while no step of the plan is running.
         """
+        if isolate_steps is not None:
+            try:
+                engine.set_isolate_steps(plan_id, isolate_steps)
+            except PlanError as e:
+                raise ToolError(str(e)) from e
         fields: dict[str, Any] = {}
         if max_parallel is not None:
             fields["max_parallel"] = max_parallel or None
@@ -746,14 +775,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
 
     # ----------------------------------------------------- external agents
     @mcp.tool()
-    def claim_next_node(agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
+    async def claim_next_node(agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
         """Claim the next ready node of a plan started with executor="external".
 
         Returns the node with full context (overall goal, requested earlier results, instructions)
         or null if nothing is ready right now. Optionally restrict to one plan tree.
         """
         try:
-            return engine.claim_next(agent_name, plan_id)
+            return await engine.claim_next(agent_name, plan_id)
         except PlanError as e:
             raise ToolError(str(e)) from e
 
@@ -770,19 +799,19 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         return "ok"
 
     @mcp.tool()
-    def complete_node(plan_id: int, node_id: int, result: str) -> str:
+    async def complete_node(plan_id: int, node_id: int, result: str) -> str:
         """Mark a claimed node as done. result is a concise summary passed on to dependent nodes."""
         try:
-            engine.complete_external(plan_id, node_id, result)
+            await engine.complete_external(plan_id, node_id, result)
         except PlanError as e:
             raise ToolError(str(e)) from e
         return "ok"
 
     @mcp.tool()
-    def fail_node(plan_id: int, node_id: int, error: str) -> str:
+    async def fail_node(plan_id: int, node_id: int, error: str) -> str:
         """Mark a claimed node as failed (dependent nodes will not start until it is retried)."""
         try:
-            engine.fail_external(plan_id, node_id, error)
+            await engine.fail_external(plan_id, node_id, error)
         except PlanError as e:
             raise ToolError(str(e)) from e
         return "ok"

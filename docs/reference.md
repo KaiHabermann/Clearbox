@@ -25,7 +25,8 @@ lives. Working on Clearbox itself is in [development.md](development.md).
   through a built-in MCP client, prefixed `vc_` (`vc_submit_plan`, …). These are a restricted set
   on their own endpoint, see [Worker agents' MCP tools](#worker-agents-mcp-tools).
 * All agents of one plan tree share its working directory: the `working_directory` the top-level
-  plan names (usually the repository). Subplans inherit it.
+  plan names (usually the repository). Subplans inherit it. With `isolate_steps`, each built-in
+  step works in its own git worktree instead, see [Isolated steps](#isolated-steps-a-worktree-per-step).
 * A failed node blocks its dependents. Use **Retry** in the UI. **Stop** cancels running built-in
   agents and re-queues their nodes; **Reset** clears all results and transcripts.
 * Everything is stored in one SQLite database, see
@@ -134,7 +135,8 @@ Limits:
   step running at the same time lands in this step's list as well. If any other step of the same
   plan tree was running at any point during this run, the list is marked `undeclared_shared` and
   the UI and reviewer say it may include other steps' changes. Anything else touching the folder
-  while the step runs (you, an editor, a build watcher) is not told apart at all.
+  while the step runs (you, an editor, a build watcher) is not told apart at all. A step in its
+  own worktree ([Isolated steps](#isolated-steps-a-worktree-per-step)) has an exact list.
 * **Ignored files are invisible.** The project's `.gitignore` files and Clearbox's own ignore list
   (`.git`, `node_modules`, `__pycache__`, `.venv`, …) apply, so build output and caches stay out
   of the list — and so does any real change to an ignored file.
@@ -147,6 +149,53 @@ Limits:
   non-ignored directory (data files, an unignored build tree) costs the same on every change to it.
 * Without `git` on `PATH`, or if a snapshot fails, the check is skipped for that run with one log
   line; the step itself is not affected.
+
+### Isolated steps: a worktree per step
+
+File scoping keeps parallel steps off each other's *declared* files, but they still share one
+folder: a step sees the half-done edits of the others, a test run can fail on them, and a change
+outside the declared files cannot be told apart from theirs. `isolate_steps` (off by default)
+gives every **built-in** step of a plan its own copy instead. Set it with `submit_plan` / `create_plan` /
+`update_plan(isolate_steps=True)`, `PATCH /api/plans/{id}` (`{"isolate_steps": true}`) or the
+topbar's ⑂ pill. It is a top-level plan setting (subplans follow it), allowed only when the working
+directory is inside a git repository, and it can only be changed while no step of the plan is
+running.
+
+* **Start.** Before the agent starts, Clearbox snapshots the whole working directory (the same
+  snapshot as for [undeclared changes](#changes-outside-the-declared-files), so uncommitted and
+  untracked files are in it; ignored ones are not), makes a commit of it in its own snapshot git
+  directory and checks that out as a git worktree under `<data dir>/snapshots/worktrees`, outside
+  the project. The commit's parent is the project's `HEAD`, so inside the worktree `git log` shows
+  the project's history and `git status` / `git diff` show exactly what the step changed. The agent's
+  working directory is the worktree; the project's own `.git`, branches and index are not touched.
+* **Finish.** When the step succeeds, its changes (the worktree against the snapshot it started
+  from, binary files included) are applied to the real working directory in one go. The step's diff
+  and its undeclared-change list come from its worktree, so they are exact even with steps running
+  in parallel, and never marked shared. A step that fails or is stopped applies nothing.
+* **Conflicts.** If the real tree changed in the same places while the step ran (another step's
+  changes landed there, or you edited it), nothing is applied and the step **fails** with a message
+  naming the files. Its patch is kept under `<data dir>/snapshots/patches` (the path is in the
+  error), so nothing is lost: resolve it and `git apply` it by hand, or **Retry** the step, which
+  starts again from the current tree. Changes in other parts of the same file apply fine.
+* **Cleanup.** The worktree is removed when the step ends, however it ends, and any left over from
+  a server that stopped mid-run are removed on the next start.
+
+When to use it: built-in plans with steps that run in parallel, especially without declared files
+or with tests or builds that would trip over each other's edits. File scoping still applies on top,
+so steps that declare the same file still run one after the other.
+
+Cost and limits:
+
+* Every step checks out a full copy of the non-ignored tree, which takes time and disk space on a big
+  repository. Ignored files are **not** copied: no `node_modules`, `.venv` or build output, so a
+  step that needs them has to recreate them in its worktree (and whatever it builds there is not
+  applied back).
+* **Built-in steps only.** A step claimed with `claim_next_node` is your own session, which works in
+  the real working directory; such plans are not isolated.
+* It isolates the working directory, not the machine: a tool given an absolute path, a shell
+  command that `cd`s elsewhere, a server or database outside the folder all still reach the real
+  thing. Commits an agent makes inside its worktree stay in Clearbox's snapshot git directory; only
+  the resulting file changes are applied back.
 
 ### Inherited results: edges order, `results_from` passes
 
@@ -265,7 +314,8 @@ retry or a new node instead.
   follow-up nodes.
 * **Re-review by itself.** A rework is just another run of the node: its transcript, token counters,
   diff and file locks reset as on any start, and it finishes through the normal path. So if the plan
-  has a review agent and the run captured a diff, a new step review is queued with no extra trigger.
+  has a review agent and the run captured a diff (or changed files outside its declared ones), a new
+  step review is queued with no extra trigger.
   Read it with `get_reviews` and repeat if needed. Without a review agent, trigger one with
   `review_node`.
 
@@ -546,7 +596,10 @@ the whole flow can be watched for free.
   its **Test level**, cap its parallelism, and **Test connection** before trusting it. The raw
   **Permission mode** and **Tools preset** selects sit under *Advanced* as escape hatches.
 * The topbar's 📁 pill shows a top-level plan's working directory (click to change it before the
-  plan starts); the 🧪 pill next to it holds its `test_instructions` (click to edit, any time).
+  plan starts); the 🧪 pill next to it holds its `test_instructions` (click to edit, any time); the
+  ⑂ pill shows whether built-in steps run in their own worktree ("worktrees") or in the working
+  directory ("shared tree"); click to switch while no step runs, see
+  [Isolated steps](#isolated-steps-a-worktree-per-step).
 * A reviewed node carries a small verdict marker (✓ / ! / ?) in its top-right corner; its full-view
   **Review** tab shows the verdict, summary and findings and a button to (re-)review it on demand.
   A review chip next to the plan status does the same for the plan-level review, see
@@ -616,9 +669,9 @@ the JSON of the tools list, about four characters per token):
 
 | Tool | What it does |
 | --- | --- |
-| `submit_plan(title, working_directory=None, description="", test_instructions=None, nodes=[…], edges=[…], parent_plan_id=None, parent_node_id=None, max_parallel=None)` | **The way to build a plan**: the plan, all its nodes and all its edges in one call → `{"plan_id": …, "nodes": {key: node_id}}`. `nodes` are `{key, title, description, files, results_from, kind, agent}` objects, where `key` is your own label; `edges` are `[from_key, to_key]` pairs and `results_from` names keys too. All or nothing: every problem (duplicate or unknown keys, cycles, a `results_from` the node does not depend on, a path outside the working directory, an unknown agent or kind, the working-directory and subplan rules) is reported in one error, and then nothing has been created. Plan fields as for `create_plan`; with a parent it becomes the **subplan** of that node. |
-| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New empty plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
-| `update_plan(plan_id, max_parallel=None, test_instructions=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions. Same as `PATCH /api/plans/{plan_id}`. |
+| `submit_plan(title, working_directory=None, description="", test_instructions=None, nodes=[…], edges=[…], parent_plan_id=None, parent_node_id=None, max_parallel=None, isolate_steps=None)` | **The way to build a plan**: the plan, all its nodes and all its edges in one call → `{"plan_id": …, "nodes": {key: node_id}}`. `nodes` are `{key, title, description, files, results_from, kind, agent}` objects, where `key` is your own label; `edges` are `[from_key, to_key]` pairs and `results_from` names keys too. All or nothing: every problem (duplicate or unknown keys, cycles, a `results_from` the node does not depend on, a path outside the working directory, an unknown agent or kind, the working-directory and subplan rules) is reported in one error, and then nothing has been created. Plan fields as for `create_plan`; with a parent it becomes the **subplan** of that node. |
+| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None, isolate_steps=None)` | New empty plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests); `isolate_steps=True` runs each built-in step in its own git worktree, see [Isolated steps](#isolated-steps-a-worktree-per-step). Subplans inherit these and may not set them. |
+| `update_plan(plan_id, max_parallel=None, test_instructions=None, isolate_steps=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions, `isolate_steps` switches per-step worktrees on or off (not while a step runs). Same as `PATCH /api/plans/{plan_id}`. |
 | `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | Extend or correct a plan one node at a time → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier node ids whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
 | `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
 | `remove_edge`, `remove_node` | Corrections. |
