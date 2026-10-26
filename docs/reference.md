@@ -651,6 +651,8 @@ endpoint `http://127.0.0.1:8765/mcp` instead and tell Claude what to do in your 
 On another port, use that port in the URL (with the plugin too: the plugin's entry is fixed to
 8765, so add a manual entry instead).
 
+Codex CLI, Cursor, VS Code and Gemini CLI: see [Other MCP clients](clients.md).
+
 ## MCP tools
 
 ### Two endpoints: `/mcp` and `/mcp/observe`
