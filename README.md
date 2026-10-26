@@ -71,6 +71,8 @@ and the tests. Reviews are advisory; **Rework this step** re-runs a step with th
   until you mark it done.
 * **Edges order, they do not pass results.** A step gets only its own task, plus the earlier
   results it asks for with `results_from`.
+* **Export for review.** **Export** in the topbar copies the plan as Markdown for a pull request
+  description: goal, steps, results, reviews and each step's diff (also `export_plan` over MCP).
 * **Parallel steps that share a file** run one after the other instead of overwriting each other.
 * **Built-in agents are only as restricted as you make them.** By default they may edit files and
   run commands in the plan's working directory; each agent profile sets what it may do.

@@ -36,6 +36,7 @@ clearbox/
   prompts.py      what a worker agent is told: system prompt, test levels, the per-node context
   diffs.py        git snapshots of a node's declared files at start and finish, and the diff between them
   reviews.py      step and plan reviews: reviewer prompts, reply parser, the review session
+  export.py       a plan as Markdown for a PR description (export_plan, GET /api/plans/{id}/export.md)
   bootstrap.py    built-in profiles, server default, startup banner and validation
   mcp_bridge.py   MCP client that hands the clearbox tools to non-Claude harnesses (vc_*)
   mcp_tools.py    MCP tool definitions, and the scoped subset worker agents get

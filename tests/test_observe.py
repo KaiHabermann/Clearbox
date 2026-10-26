@@ -1,8 +1,8 @@
 """The slim /mcp/observe endpoint for a session tracking its own work, against a running --mock server.
 
-It offers exactly the ten self-tracking tools; its submit_plan starts a top-level plan with the
+It offers exactly the eleven self-tracking tools; its submit_plan starts a top-level plan with the
 external executor at once and leaves a subplan to run with its parent; a full round (claim,
-complete) records the diff of the step's declared file; and an auto-start that fails (another
+complete) records the diff of the step's declared file, which export_plan shows; and an auto-start that fails (another
 running plan in the folder) leaves nothing behind.
 
 Run:  uv run clearbox --mock      (one shell)
@@ -16,7 +16,7 @@ from mcp.client.client import Client
 URL = (sys.argv[1] if len(sys.argv) > 1 else f"http://127.0.0.1:{os.environ.get('CLEARBOX_PORT', '8765')}").rstrip("/")
 
 TOOLS = {"submit_plan", "claim_next_node", "report_progress", "complete_node", "fail_node",
-         "add_node", "add_edge", "remove_node", "remove_edge", "get_plan"}
+         "add_node", "add_edge", "remove_node", "remove_edge", "get_plan", "export_plan"}
 
 
 def rest(path):
@@ -38,7 +38,7 @@ async def main():
         names = {t.name for t in (await c.list_tools()).tools}
         assert names == TOOLS, sorted(names ^ TOOLS)
         assert "claim_next_node" in c.instructions and "/#/plan/" in c.instructions, c.instructions
-        print("ok  exactly the ten tools, workflow instructions")
+        print("ok  exactly the eleven tools, workflow instructions")
 
         out = await call("submit_plan", title="Observe test", working_directory=str(work),
                          nodes=[{"key": "edit", "title": "Edit notes", "files": ["notes.txt"]},
@@ -62,7 +62,9 @@ async def main():
                 break
             time.sleep(0.1)
         assert [d["path"] for d in diffs] == ["notes.txt"] and "+two" in diffs[0]["diff"], diffs
-        print("ok  claim and complete, with the declared file's diff")
+        md = await call("export_plan", plan_id=pid)
+        assert md.startswith("# Observe test") and "<summary>notes.txt (+1 −0)</summary>" in md, md
+        print("ok  claim and complete, with the declared file's diff, in the export too")
 
         node = await call("claim_next_node", agent_name="t", plan_id=pid)
         assert node and node["node_id"] == more, node
