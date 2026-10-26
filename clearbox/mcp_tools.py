@@ -746,14 +746,14 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
 
     # ----------------------------------------------------- external agents
     @mcp.tool()
-    def claim_next_node(agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
+    async def claim_next_node(agent_name: str, plan_id: int | None = None) -> dict[str, Any] | None:
         """Claim the next ready node of a plan started with executor="external".
 
         Returns the node with full context (overall goal, requested earlier results, instructions)
         or null if nothing is ready right now. Optionally restrict to one plan tree.
         """
         try:
-            return engine.claim_next(agent_name, plan_id)
+            return await engine.claim_next(agent_name, plan_id)
         except PlanError as e:
             raise ToolError(str(e)) from e
 
@@ -770,19 +770,19 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         return "ok"
 
     @mcp.tool()
-    def complete_node(plan_id: int, node_id: int, result: str) -> str:
+    async def complete_node(plan_id: int, node_id: int, result: str) -> str:
         """Mark a claimed node as done. result is a concise summary passed on to dependent nodes."""
         try:
-            engine.complete_external(plan_id, node_id, result)
+            await engine.complete_external(plan_id, node_id, result)
         except PlanError as e:
             raise ToolError(str(e)) from e
         return "ok"
 
     @mcp.tool()
-    def fail_node(plan_id: int, node_id: int, error: str) -> str:
+    async def fail_node(plan_id: int, node_id: int, error: str) -> str:
         """Mark a claimed node as failed (dependent nodes will not start until it is retried)."""
         try:
-            engine.fail_external(plan_id, node_id, error)
+            await engine.fail_external(plan_id, node_id, error)
         except PlanError as e:
             raise ToolError(str(e)) from e
         return "ok"

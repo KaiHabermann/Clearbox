@@ -18,6 +18,8 @@ and the changed paths no declared path covers are reported by name only, never a
 project's ``.gitignore`` and Clearbox's own ignore list apply. A run that overlapped another run of
 the same plan tree is flagged as shared, since some of those changes may be the other run's.
 
+The git work runs in a worker thread (``capture`` / ``compare``), so a big tree's first snapshot
+does not stall the server; only ``register`` / ``pop`` touch the runs in flight, on the event loop.
 In memory only, like the engine's running tasks: a restart loses in-flight start snapshots the
 same way it re-queues the node.
 """
@@ -161,18 +163,27 @@ class Snapshots:
         return self._run_git(run, "write-tree").strip()
 
     def take(self, key: Key, workdir: str, paths: list[str], group: int = 0) -> None:
-        """Take a run's start snapshots before the agent does anything: its declared paths (a run
-        without declared files gets none, and so no diff) and the whole working tree."""
+        """``capture`` and ``register`` in one call (the engine runs ``capture`` in a thread)."""
         self.discard(key)
+        run = self.capture(key, workdir, paths, group)
+        if run is not None:
+            self.register(key, run)
+
+    def capture(self, key: Key, workdir: str, paths: list[str], group: int = 0) -> _Run | None:
+        """Take a run's start snapshots before the agent does anything: its declared paths (a run
+        without declared files gets none, and so no diff) and the whole working tree. Only git
+        work, no shared state: safe in a worker thread. None if nothing could be snapshotted."""
         paths = sorted({_clean(p) for p in paths} - {""})
         if self._git is None:
-            return
+            return None
         try:
             git_dir = self._git_dir(workdir)
         except (OSError, subprocess.SubprocessError) as e:
             log.warning("node %s: no snapshot git dir, so no diff: %s", key, _git_error(e))
-            return
+            return None
         run = _Run(git_dir, os.path.join(git_dir, f"index-{key[0]}-{key[1]}"), workdir, paths, "", group=group)
+        with contextlib.suppress(OSError):
+            os.remove(run.index)  # left over by a capture whose run was abandoned before register
         if paths:
             try:
                 run.tree = self._snapshot(run)
@@ -180,11 +191,20 @@ class Snapshots:
                 log.warning("node %s: no start snapshot, so no diff: %s", key, _git_error(e))
         run.whole = self._whole_tree(key, git_dir, workdir)
         if not run.tree and not run.whole:
-            return
+            return None
+        return run
+
+    def register(self, key: Key, run: _Run) -> None:
+        """Make a captured run the one in flight for ``key`` (on the event loop, like ``pop``)."""
+        self._runs.pop(key, None)  # a stale run of the key had the same index file: keep it
         for other in self._runs.values():
-            if other.group == group:
+            if other.group == run.group:
                 other.shared = run.shared = True
         self._runs[key] = run
+
+    def pop(self, key: Key) -> _Run | None:
+        """Take a run out of flight, for ``compare``."""
+        return self._runs.pop(key, None)
 
     def discard(self, key: Key) -> None:
         run = self._runs.pop(key, None)
@@ -193,13 +213,15 @@ class Snapshots:
                 os.remove(run.index)
 
     def finish(self, key: Key) -> Finished:
-        """Drop a run's snapshots and return what changed since they were taken: the diff of every
-        declared file modified, created, deleted, or added inside a declared directory, and the
-        names of the changed paths outside the declared ones."""
-        run = self._runs.get(key)
+        """``pop`` and ``compare`` in one call (the engine runs ``compare`` in a thread)."""
+        run = self.pop(key)
+        return Finished() if run is None else self.compare(key, run)
+
+    def compare(self, key: Key, run: _Run) -> Finished:
+        """What changed since a popped run's snapshots were taken: the diff of every declared file
+        modified, created, deleted, or added inside a declared directory, and the names of the
+        changed paths outside the declared ones. Removes the run's index; safe in a thread."""
         out = Finished()
-        if run is None:
-            return out
         try:
             if run.tree:
                 end = self._snapshot(run)
@@ -220,7 +242,8 @@ class Snapshots:
         except (OSError, subprocess.SubprocessError) as e:
             log.warning("node %s: undeclared-change check failed: %s", key, _git_error(e))
         finally:
-            self.discard(key)
+            with contextlib.suppress(OSError):
+                os.remove(run.index)
         return out
 
 

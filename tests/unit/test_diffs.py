@@ -131,11 +131,11 @@ async def test_external_claim_gets_a_diff(store, tmp_path):
     async with running(store, None, tmp_path) as engine:
         engine.start_plan(pid, executor="external")
         await settle(engine)
-        claim = engine.claim_next("tester", pid)
+        claim = await engine.claim_next("tester", pid)
         assert claim["node_id"] == 1
         write(wd, "out.txt", "new\n")       # written by the external agent, from any tool
         write(wd, "stray.txt", "s\n")       # outside its declared files
-        engine.complete_external(pid, 1, "done")
+        await engine.complete_external(pid, 1, "done")
     diffs = store.node_diffs(pid, 1)
     assert [d["path"] for d in diffs] == ["out.txt"]
     assert "-old\n+new" in diffs[0]["diff"]
@@ -154,11 +154,11 @@ async def test_parallel_external_claims_are_flagged_shared(store, tmp_path):
     async with running(store, None, tmp_path) as engine:
         engine.start_plan(pid, executor="external")
         await settle(engine)
-        assert engine.claim_next("a", pid)["node_id"] == 1
-        assert engine.claim_next("b", pid)["node_id"] == 2
+        assert (await engine.claim_next("a", pid))["node_id"] == 1
+        assert (await engine.claim_next("b", pid))["node_id"] == 2
         write(wd, "a.txt", "b\n")
-        engine.complete_external(pid, 1, "done")
-        engine.complete_external(pid, 2, "done")
+        await engine.complete_external(pid, 1, "done")
+        await engine.complete_external(pid, 2, "done")
     for nid in (1, 2):
         n = store.get_node(pid, nid)
         assert n["undeclared_files"] == ["a.txt"] and n["undeclared_shared"]

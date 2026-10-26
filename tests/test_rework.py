@@ -129,8 +129,9 @@ async def reviews():
         try:
             await call("start_plan", plan_id=pid)
             end = time.time() + 30
-            while rest(f"/api/plans/{pid}")[1]["nodes"][0]["status"] != "running":
-                assert time.time() < end, "node never started"
+            # the agent's session starts once the start snapshot is taken (not at "running")
+            while not any((e["data"] or {}).get("session_id") for e in rest(f"/api/plans/{pid}/nodes/{a}")[1]["events"]):
+                assert time.time() < end, "agent never started"
                 time.sleep(0.05)
             with open(os.path.join(work, "out.txt"), "w") as f:  # snapshot is taken: this is a diff
                 f.write("hello\n")
