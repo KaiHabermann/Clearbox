@@ -75,10 +75,17 @@ The git tag is the trigger and the single source of truth. Bump the version, tag
 
 ```powershell
 uv version --bump patch         # or minor / major; edits pyproject.toml
+# set the same version in plugin/.claude-plugin/plugin.json
+# rename CHANGELOG.md's [Unreleased] section to the new version, and add its compare link
 git commit -am "Release 0.1.1: what changed"
 git tag v0.1.1
 git push origin master v0.1.1
 ```
+
+Changes are recorded as they land under `## [Unreleased]` in `CHANGELOG.md`; on release that
+section becomes the new version's, with the tag's date, and a fresh empty Unreleased section goes
+on top. The plugin's version in `plugin/.claude-plugin/plugin.json` is bumped together with
+`pyproject.toml`, so the two always match.
 
 `.github/workflows/release.yml` then builds the sdist and wheel, refuses to continue if the tag
 disagrees with `pyproject.toml`, checks the wheel really contains `clearbox/static/`, publishes to
