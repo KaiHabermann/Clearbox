@@ -383,7 +383,7 @@ $env:OPENAI_API_KEY = "sk-…"; uv run clearbox --agent-profile openai   # every
 | `api_key_env` | `openai` only: **name** of the server environment variable holding the key, read when a node starts. | none (`OPENAI_API_KEY` for the default OpenAI url) |
 | `api_key` | Literal key, settable from the UI / REST only. Write-only: responses only say `has_api_key`. | none |
 | `params` | JSON object. `openai`: `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `reasoning_effort`, `seed`, `parallel_tool_calls`, `max_turns` (50), `stream` (true; false for endpoints with broken streaming), `timeout` (600 s), `max_retries` (2), `extra_body` (passed through verbatim), `input_price_per_mtok` / `output_price_per_mtok` (USD, enables the cost shown in the transcript). `claude-sdk`: `max_turns`. `mock`: `speed`. | `{}` |
-| `capability` | What the agent may do, the same for every harness: `read` \| `run` \| `edit` \| `full`, see [Capability](#capability-what-an-agent-may-do). | `null` = `full` as a worker, `run` as a reviewer |
+| `capability` | What the agent may do, the same for every harness: `read` \| `run` \| `edit` \| `full`, see [Capability](#capability-what-an-agent-may-do). | `null` = `--default-capability` (`full`) as a worker, `run` as a reviewer |
 | `test_level` | How much a worker agent is told to test: `none` \| `light` \| `standard` \| `thorough`, see [Test levels](#test-levels-how-much-a-worker-agent-tests). | `null` = `standard` |
 | `tools` | JSON object, `openai` only, **raw escape hatch** (the capability picks this for you): `{"preset": "all" \| "readonly" \| "none", "allow": […], "deny": […], "mcp": true \| false}`. `allow` adds to the preset, `deny` removes (deny wins); `mcp` overrides `--no-agent-mcp`'s on/off for this profile (it cannot turn the tools on when the server has `--no-agent-mcp`) and is the one key the capability keeps. | from the capability; `mcp` as the server |
 | `permission_mode` | `claude-sdk` only, **raw escape hatch**: same values as `--permission-mode`, overrides the mode the capability chose. | from the capability |
@@ -428,11 +428,22 @@ A profile's `capability` is one setting that means the same thing on every harne
 | `edit` | read, search and edit files; no commands | + Write, Edit, MultiEdit | `readonly` + `allow: ["write_file", "edit_file"]` |
 | `full` | everything | all of the above, in the server's `--permission-mode` | preset `all` |
 
-Unset (`null`) means **`full` for a worker agent and `run` for a reviewer** — a reviewer has to run
-the test suite but must never edit. **`full` lets an agent run arbitrary commands in the plan's
+Unset (`null`) means **the server's `--default-capability` for a worker agent — `full` unless you
+set it — and `run` for a reviewer**: a reviewer has to run the test suite but must never edit. The
+flag covers every harness and the implicit CLI harness; a profile with its own capability is
+unaffected, and so are reviewers. **`full` lets an agent run arbitrary commands in the plan's
 working directory**, with the rights of the Clearbox process; that is the operator's choice, made
 when picking the profile (see the warning under [Tools of the `openai` harness](#tools-of-the-openai-harness)
-and use a sandbox for anything you do not trust).
+and use a sandbox for anything you do not trust). `--default-capability run` (or `read`) makes a
+stricter default one flag away; give the profiles that must edit an explicit capability.
+
+You can always see what applies. The startup banner has a `Built-in agents:` line naming the
+default capability (and the server-default profile's, when it differs); the Agents panel shows each
+profile's effective capability as a badge, marked `default` when it comes from the server setting
+and `custom` when the profile's raw `permission_mode` / `tools` decide; and the node drawer's Agent
+row shows the capability of the agent that runs the step. Over REST and `list_agents` a profile
+carries `effective_capability`, `capability_source` (`profile` | `default` | `custom`) and
+`review_capability`; a node's `agent` carries `capability` and `capability_source`.
 
 For `claude-sdk` the gating is done with the SDK's `allowed_tools`: everything listed is
 pre-approved and runs without a prompt. Below `full` the session runs in permission mode `dontAsk`,
@@ -554,8 +565,8 @@ uv run python examples/mixed_plan.py --start
 
 It creates the agents it needs if missing and prints them: `cheap` (an `openai` copy of the first
 configured `openai` profile with preset `readonly`, `max_turns` 20, `max_parallel` 1) and `strong`
-(`claude-sdk` with raw permission mode `default` — note that with no `capability` set this is
-`full`, every tool pre-approved; set `capability="read"` on it for a genuinely read-only
+(`claude-sdk` with raw permission mode `default` — note that with no `capability` set this is the
+server's `--default-capability` (`full` unless set: every tool pre-approved); set `capability="read"` on it for a genuinely read-only
 reviewer) over REST, then tests
 `cheap` (`POST /api/agents/{id}/test`). It builds the plan node by node, the incremental way, and
 assigns the agents the three ways: `set_plan_agent` makes `cheap` the plan default (the inventory
@@ -699,6 +710,7 @@ the JSON of the tools list, about four characters per token):
 | `--workdir` | `CLEARBOX_WORKDIR` | `<data dir>/workspace` |
 | `--max-concurrency` | `CLEARBOX_MAX_CONCURRENCY` | `3` |
 | `--permission-mode` | `CLEARBOX_PERMISSION_MODE` | `acceptEdits` |
+| `--default-capability {read,run,edit,full}` | `CLEARBOX_DEFAULT_CAPABILITY` | `full` |
 | `--model` | `CLEARBOX_MODEL` | SDK default |
 | `--max-turns` | | unlimited |
 | `--mock`, `--mock-speed` | `CLEARBOX_AGENT=mock` | off |
@@ -716,7 +728,8 @@ profile is the source of truth — edit it in the Agents panel or with `PATCH /a
 ones that do.
 
 What an agent may do is set per profile by its [capability](#capability-what-an-agent-may-do), not
-by `--permission-mode`. The flag is the fallback: it is the mode a `claude-sdk` session runs in at
+by `--permission-mode`; `--default-capability` is what a worker gets when its profile sets none (an
+unknown value stops the server at startup). The flag is the fallback: it is the mode a `claude-sdk` session runs in at
 capability `full`, after every file and shell tool has already been pre-approved, so it only
 governs what the model reaches for beyond those. Below `full` the session runs in `dontAsk`
 regardless. On its own `acceptEdits` is **not** a usable default for unattended agents — it
