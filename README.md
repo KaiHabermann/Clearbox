@@ -67,6 +67,18 @@ and the tests. Reviews are advisory; **Rework this step** re-runs a step with th
 
 ![A step review: verdict, summary and findings, with buttons to re-review or rework the step](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/review.png)
 
+## How is this different
+
+Clearbox is for observing and reviewing **your own single session**, with no extra agents.
+
+* **The agent's own todo list** lives in the transcript and is gone when the session ends; it has
+  no dependencies between items and no diff per item. A Clearbox plan stays, and each step keeps
+  its own diff, result and review.
+* **Multi-agent orchestrators and agent task boards** spawn and manage many agents. Clearbox's main
+  mode spawns none: your session does the work. Running a fresh agent per step is optional.
+* **One big pull request diff at the end** shows what changed, but not in which step or why;
+  Clearbox shows the change step by step, next to the plan that explains it.
+
 ## Good to know
 
 * **Steps for you.** A step can be yours (push a branch, approve a deploy): the plan waits there
@@ -103,3 +115,5 @@ The rest is in the [reference](https://github.com/KaiHabermann/Clearbox/blob/mas
   MCP tools, every option, where data lives.
 * [Development](https://github.com/KaiHabermann/Clearbox/blob/master/docs/development.md):
   working on Clearbox with Clearbox, the code layout, tests and releases.
+* [Changelog](https://github.com/KaiHabermann/Clearbox/blob/master/CHANGELOG.md): what changed in
+  each version.
