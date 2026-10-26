@@ -2,7 +2,7 @@
 // transcript.
 
 import {
-  $, agentModel, agentSelect, api, el, fmtDur, fmtTime, hcls, isUserNode, isWaiting, md,
+  $, agentModel, agentSelect, api, capBadge, el, fmtDur, fmtTime, hcls, isUserNode, isWaiting, md,
   NODE_H, planDefaultAgent, post, put, reviewActivity, reviewKey, sourceText, state,
   truncate,
 } from "./core.js";
@@ -251,7 +251,7 @@ function renderNodeInfo(r) {
     info.append(el("div", {}, el("div", { class: "k" }, "Agent"),
       el("div", { class: `v agent-row ${hcls(a.harness)}` },
         el("span", { class: "aname" }, a.name), el("span", {}, `(${agentModel(a)})`),
-        el("span", { class: "asrc" }, sourceText(a)), sel),
+        capBadge(a.capability, a.capability_source), el("span", { class: "asrc" }, sourceText(a)), sel),
       a.error && el("div", { class: "v err" }, a.error)));
   }
   info.append(renderFilesRow(pid, n));

@@ -123,12 +123,26 @@ export function lastSeg(path) {
 export const put = (p, body) => api(p, { method: "PUT", body: JSON.stringify(body || {}) });
 
 // ---------------------------------------------------------------- agents
-// Nodes carry their resolved agent ({name, harness, model, profile_id, source, from_plan});
+// Nodes carry their resolved agent ({name, harness, model, profile_id, capability, capability_source,
+// source, from_plan});
 // these helpers turn that into chips, labels and selects. Colours come from --h-<harness>.
 export const HARNESSES = ["claude-sdk", "openai", "mock"];
 export const hcls = (harness) => `h-${HARNESSES.includes(harness) ? harness : "other"}`;
 export const agentKey = (a) => (a ? (a.profile_id != null ? `p${a.profile_id}` : `n${a.name}`) : "");
 export const agentModel = (a) => (a.harness === "mock" ? "mock" : `${a.harness} / ${a.model || "default model"}`);
+// What a worker on the agent may do, as the server resolved it (never re-derived here).
+const CAP_TEXT = {
+  read: "read and search files only; no edits, no commands",
+  run: "read files and run any command in the plan's working directory; no edits",
+  edit: "read and edit files; no commands",
+  full: "edit files and run any command in the plan's working directory",
+};
+export function capBadge(cap, source) {
+  if (!cap) return null;
+  const tip = source === "custom" ? `${cap}, but the profile's raw permission mode / tools decide what it may do`
+    : `${cap}: ${CAP_TEXT[cap] || cap}` + (source === "default" ? "\n(the profile sets none: the server's --default-capability applies)" : "");
+  return el("span", { class: `capchip cap-${cap}`, title: tip }, source === "custom" ? "custom" : cap, source === "default" ? el("span", { class: "capsrc" }, " · default") : null);
+}
 export function harnessOfName(name) {
   // active_nodes only carries agent_name; map it back to a harness via the profile list
   const p = state.agents.find((x) => x.name === name);

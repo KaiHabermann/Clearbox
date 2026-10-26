@@ -1,6 +1,6 @@
 // The Agents panel: list, create, edit, test and delete agent profiles.
 
-import { $, api, debounce, el, HARNESSES, hcls, post, state } from "./core.js";
+import { $, api, capBadge, debounce, el, HARNESSES, hcls, post, state } from "./core.js";
 import { renderGraph } from "./graph.js";
 import { closeDrawer } from "./drawer.js";
 import { refreshPlan, setHash } from "./app.js";
@@ -10,7 +10,9 @@ import { refreshPlan, setHash } from "./app.js";
 // next to the graph like the node drawer does; only one of the two is open at a time.
 const PERMISSION_MODES = ["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"];
 // capability: what the harness lets the agent do, the same for every harness (the registry maps it
-// to the SDK's allowed tools or the openai tools preset). null = the role default: full for a worker, run for a reviewer.
+// to the SDK's allowed tools or the openai tools preset). null = the role default: the server's
+// --default-capability (full unless set) for a worker, run for a reviewer. The server reports the
+// result as effective_capability / capability_source; the badges show that.
 const CAPABILITIES = [
   ["read", "read and search only; no edits, no commands"],
   ["run", "read, search and run commands; no edits"],
@@ -55,7 +57,7 @@ function renderAgentList() {
     },
       el("span", { class: "ag-name" }, a.name, a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, " ●") : null),
       el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness),
-      el("span", { class: "ag-model" }, a.model || "default model")));
+      el("span", { class: "ag-model" }, el("span", {}, a.model || "default model"), capBadge(a.effective_capability, a.capability_source))));
   }
 }
 
@@ -85,6 +87,7 @@ function agentHead(title, meta) {
 function agentMeta(a) {
   return [
     el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness),
+    capBadge(a.effective_capability, a.capability_source),
     el("span", { style: "font-family:var(--mono)" }, `agent #${a.id}`),
     a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, "● server default") : null,
     a.harness !== "openai" ? null : el("span", { title: "a literal key is stored, or the api_key_env variable is set on the server" }, a.has_api_key ? "key: set" : "key: none"),
@@ -129,7 +132,7 @@ function renderAgentOverview(body) {
   const wrap = el("div", { class: "ag-overview" });
   for (const a of state.agents)
     wrap.append(el("button", { class: "ag-card", onclick: () => openAgentPanel(a.id) },
-      el("div", { class: "ag-card-h" }, el("b", {}, a.name), a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, "●") : null, el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness)),
+      el("div", { class: "ag-card-h" }, el("b", {}, a.name), a.default ? el("span", { class: "ag-default", title: DEFAULT_TIP }, "●") : null, capBadge(a.effective_capability, a.capability_source), el("span", { class: `hchip ${hcls(a.harness)}` }, a.harness)),
       el("div", { class: "ag-card-m" }, [a.model || "default model", a.base_url, a.max_parallel ? `max ${a.max_parallel} parallel` : null, a.in_use ? `used by ${a.in_use}` : null].filter(Boolean).join(" · "))));
   if (!state.agents.length) wrap.append(el("div", { class: "ag-missing" }, "No agent profiles yet. Nodes run with the server's CLI harness."));
   wrap.append(el("div", {}, el("button", { class: "primary", onclick: () => openAgentPanel("new") }, "+ New agent")));
@@ -153,7 +156,7 @@ function renderAgentForm(body, a) {
   const preset = select("ag-preset", [["all", "all – read, write, edit, shell"], ["readonly", "readonly – read_file, list_dir, glob, grep"], ["none", "none – text only"]], tools.preset || "all");
   const mcp = el("input", { type: "checkbox", id: "ag-mcp" }); mcp.checked = tools.mcp ?? true;
   const perm = select("ag-perm", [["", "(server default)"], ...PERMISSION_MODES.map((m) => [m, m])], v.permission_mode || "");
-  const cap = select("ag-cap", [["", "default — full as a worker, run as a reviewer"], ...CAPABILITIES.map(([k, t]) => [k, `${k} — ${t}`])], v.capability || "");
+  const cap = select("ag-cap", [["", "default — the server's --default-capability as a worker, run as a reviewer"], ...CAPABILITIES.map(([k, t]) => [k, `${k} — ${t}`])], v.capability || "");
   const level = select("ag-level", TEST_LEVELS.map(([k, t]) => [k, `${k} — ${t}`]), v.test_level || "standard");
   const sys = el("textarea", { id: "ag-sys", rows: 3, placeholder: "extra system prompt text for this agent" }); sys.value = v.system_append || "";
   const paramsErr = el("div", { class: "fld-err", id: "ag-params-err", role: "alert" });
@@ -187,7 +190,7 @@ function renderAgentForm(body, a) {
       el("small", {}, isNew ? "leave empty for local endpoints or when using the env var"
         : (a.has_api_key ? "a key is available; leave empty to keep it" : "no key stored; type one to store it")),
       isNew ? null : el("label", { class: "chk" }, keyClear, " clear the stored key")),
-    fld("ag-cap", "What may this agent do", cap, "same meaning on every harness; the default is full for a worker agent and run when it reviews"),
+    fld("ag-cap", "What may this agent do", cap, "same meaning on every harness; the default is the server's --default-capability (full unless set) for a worker agent and run when it reviews"),
     fld("ag-level", "Test level", level, "how much a worker agent is told to test; a reviewer always runs the suite"),
     fld("ag-maxpar", "Max parallel", inp("ag-maxpar", v.max_parallel, { type: "number", min: 1, step: 1, placeholder: "unlimited" }), "at most this many nodes run on this agent at once (e.g. 1 for a single local GPU)"),
     el("div", { class: "fld", "data-only": "openai" },

@@ -147,6 +147,9 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
     def _agent_view(profile: dict[str, Any]) -> dict[str, Any]:
         out = public_profile(profile)
         out["default"] = out["id"] == _default_profile_id()
+        cap = registry.capability_for(profile)
+        out.update(effective_capability=cap["capability"], capability_source=cap["source"],
+                   review_capability=registry.review_capability_for(profile))
         return out
 
     def _profile_name(profile_id: int | None) -> str | None:
@@ -582,8 +585,8 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
     def get_plan(plan_id: int) -> dict[str, Any]:
         """Return a plan with its nodes (status, results, subplan ids) and edges.
 
-        Each node shows `agent` (name, harness and model of the profile that will run it, after
-        inheritance) and `agent_override` (the profile set on the node itself, or null); the plan
+        Each node shows `agent` (name, harness, model and effective capability of the profile that
+        will run it, after inheritance) and `agent_override` (the profile set on the node itself, or null); the plan
         shows `default_agent` (its plan-wide default, or null). `files` lists the files the node
         declared; `conflicts` the [plan_id, node_id] of other nodes in the plan tree that share one
         of them and could run at the same time -- those run one at a time, lowest number first.
@@ -635,6 +638,9 @@ def build_mcp(engine: Engine) -> tuple[MCPServer, MCPServer, MCPServer]:
         Each entry has name, harness, model, base_url, max_parallel, capability, test_level, ... and
         `default: true` on the server-wide default profile. capability is what the agent may do: read
         (read and search only), run (also run commands), edit (also edit files, no commands) or full;
+        effective_capability is what a worker on it actually gets (capability_source "default" when
+        the profile sets none and the server's --default-capability applies, "custom" when its raw
+        permission_mode/tools decide), review_capability what a reviewer on it gets;
         test_level how much a worker tests: none, light, standard or thorough (null = the default).
         Profiles are set up in the web UI or over REST (/api/agents), not here. Secrets are never
         shown: `has_api_key` says whether a key is available (from the api_key_env variable, or one

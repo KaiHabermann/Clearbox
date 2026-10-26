@@ -75,7 +75,9 @@ and the tests. Reviews are advisory; **Rework this step** re-runs a step with th
   description: goal, steps, results, reviews and each step's diff (also `export_plan` over MCP).
 * **Parallel steps that share a file** run one after the other instead of overwriting each other.
 * **Built-in agents are only as restricted as you make them.** By default they may edit files and
-  run commands in the plan's working directory; each agent profile sets what it may do.
+  run commands in the plan's working directory; each agent profile sets what it may do, and
+  `--default-capability run` (or `read`) restricts every profile that does not. The startup banner
+  and the Agents panel show what applies.
 * **No authentication.** The server listens on `127.0.0.1` and refuses requests from other web
   pages; whoever can reach the port can run agents.
 
