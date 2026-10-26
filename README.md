@@ -29,12 +29,19 @@ Needs Python ≥ 3.10 and `git` on `PATH` (for the per-step diffs).
 ```powershell
 uv tool install clearbox                 # or: pipx install clearbox, or: pip install clearbox
 clearbox                                 # UI on http://127.0.0.1:8765/
-claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
 ```
 
-Then, in Claude Code:
+Then, in Claude Code, install the plugin (the MCP connection plus a skill that has Claude plan
+multi-step tasks in Clearbox):
 
-> *Use clearbox to plan this task and work through the steps yourself (executor "external").*
+```text
+/plugin marketplace add KaiHabermann/Clearbox
+/plugin install clearbox@clearbox
+```
+
+Or, without the plugin, `claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp` and
+ask: *Use clearbox to plan this task and work through the steps yourself (executor "external").*
+See [Connecting Claude Code](https://github.com/KaiHabermann/Clearbox/blob/master/docs/reference.md#connecting-claude-code).
 
 That is way 1: the plan appears in the browser and fills in as your session works. For way 2, ask
 it to *start the plan with the built-in executor* instead; `clearbox --mock` lets you try that

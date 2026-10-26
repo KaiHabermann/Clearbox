@@ -1,0 +1,15 @@
+{
+  "name": "clearbox",
+  "description": "Clearbox: make your coding agent's session observable and reviewable",
+  "owner": {
+    "name": "Kai Habermann",
+    "url": "https://github.com/KaiHabermann"
+  },
+  "plugins": [
+    {
+      "name": "clearbox",
+      "source": "./plugin",
+      "description": "Plan, track and review your session in Clearbox: the MCP connection and the clearbox-tracking skill"
+    }
+  ]
+}
