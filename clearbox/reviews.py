@@ -53,13 +53,12 @@ never as a severity level; a real problem you did find is "concerns".
 NODE_REVIEW_SYSTEM_APPEND = """
 You are reviewing one already-finished step of a larger plan; you did not do the step and you
 must not touch it. Judge only whether the diff below does what the node was asked to do --
-correctness, obvious bugs, leftovers. Diff coverage depends on the path. For the node's
-declared file scope (listed in the prompt when it has one) the diff is complete: every change to
-those paths is shown however it was made, so a change missing there really was not made. Outside
-that scope the diff is best-effort, file-tool writes only: anything written via bash or another
-shell-out is not shown, so the absence of a change there is not evidence of anything. Other nodes
-handle other work; do not comment on scope beyond this node. You have read-only tools and a shell
-for extra context and for running the tests -- do not modify anything.
+correctness, obvious bugs, leftovers. The diff covers exactly the node's declared file scope
+(listed in the prompt): every change to those paths is shown however it was made, so a change
+missing there really was not made. Files outside that scope are not diffed at all, so the absence
+of a change there is not evidence of anything. Other nodes handle other work; do not comment on
+scope beyond this node. You have read-only tools and a shell for extra context and for running
+the tests -- do not modify anything.
 
 Other nodes of this plan may still be working in the same tree while you review, so a test
 failure is not automatically this node's fault. Say which failures you can tie to this change
@@ -137,20 +136,13 @@ def node_review_prompt(store: Store, plan_id: int, node_id: int) -> str:
         # only an on-demand review gets here: the automatic one is not queued without a diff
         parts.append(
             "No diffs were captured for this node." + (
-                " Nothing in the declared scope changed; anything written elsewhere via bash is "
-                "not shown." if files else
-                " The node may still have written files via bash, which are not shown; say so "
-                "rather than assume nothing changed."
+                " Nothing in the declared scope changed." if files else
+                " It declared no files, and only declared files are diffed; say so rather than "
+                "assume nothing changed."
             )
         )
         return "\n\n".join(parts)
-    parts.append(
-        "Unified diffs captured for this node (complete for the declared scope; elsewhere "
-        "file-tool writes only, and files written there via bash are not shown):"
-        if files else
-        "Unified diffs captured for this node (file-tool writes only; a node may have "
-        "written other files via bash that are not shown here):"
-    )
+    parts.append("Git diffs of the declared scope between the start and the end of this node's run:")
     for d in diffs:
         parts.append(f"--- {d['path']} ---\n{d['diff']}")
     return "\n\n".join(parts)

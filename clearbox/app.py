@@ -305,6 +305,7 @@ def create_app(settings: Settings) -> FastAPI:
             max_concurrency=settings.max_concurrency,
             agent_mcp_url=settings.agent_mcp_url if settings.expose_mcp_to_agents else None,
             server_port=settings.port,
+            snapshot_dir=str(Path(settings.db).resolve().parent / "snapshots"),
         ),
     )
     mcp, agent_mcp = build_mcp(engine)

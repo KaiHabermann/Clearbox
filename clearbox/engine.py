@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import reviews
-from .diffs import Snapshots, file_tool_path
+from .diffs import Snapshots
 from .harness import AgentJob, Harness, HarnessError
 from .harness.registry import HarnessRegistry
 from .prompts import EXPAND_HINT, EXPAND_SCOPE_NOTE, build_context, tests_note, worker_system_append
@@ -107,6 +107,8 @@ class EngineConfig:
     # "<agent_mcp_url>/<token>". None = built-in agents get no clearbox tools (--no-agent-mcp).
     agent_mcp_url: str | None = None
     server_port: int = 8765   # the port this server listens on; agents are told to keep clear of it
+    # where the git snapshots behind node diffs live (diffs.py); None = <workdir>/snapshots
+    snapshot_dir: str | None = None
 
 
 @dataclass
@@ -132,9 +134,9 @@ class Engine:
         # round-robin cursor into started_root_plans(): which root gets first pick of a free
         # slot next tick, so the oldest plan does not always take every slot (see _spawn_round_robin)
         self._rr_index = 0
-        # before-texts of the files each run may change, taken at _spawn and from tool_use
-        # events; diffed by _record_diffs when the node finishes (see diffs.py)
-        self._snapshots = Snapshots()
+        # git snapshot of each run's declared files, taken when it is spawned or claimed;
+        # diffed by _record_diffs when the node finishes (see diffs.py)
+        self._snapshots = Snapshots(self.config.snapshot_dir or os.path.join(self.config.workdir, "snapshots"))
         # review tasks run alongside node tasks but are tracked separately so a node's
         # (plan_id, node_id) task-dict slot is never mistaken for "node still running";
         # queued review requests wait here until a slot of the shared max_concurrency is free.
@@ -179,8 +181,6 @@ class Engine:
 
     # ------------------------------------------------------------------ helpers
     def _emit(self, plan_id: int, node_id: int, kind: str, data: dict[str, Any]) -> None:
-        if kind == "tool_use" and (path := file_tool_path(data)):
-            self._snapshots.take((plan_id, node_id), self.plan_workdir(plan_id), path)
         if kind == "usage":
             self._add_usage(plan_id, node_id, data)
             return  # a running total, not something to show in the transcript
@@ -757,8 +757,7 @@ class Engine:
                                tokens_in=None, tokens_out=None)
         self.store.clear_node_diffs(plan_id, node_id)
         self._cancel_review(plan_id, node_id)
-        self._snapshots.take_declared((plan_id, node_id), self.plan_workdir(plan_id),
-                                      [f["path"] for f in self.store.node_files(plan_id, node_id)])
+        self._take_snapshot(plan_id, node_id)
         self._set_status(plan_id, node_id, "running", agent_kind="builtin",
                          agent_name=self.harnesses.agent_name(profile))
         self._emit(plan_id, node_id, "system", {"text": self.harnesses.label(profile),
@@ -839,12 +838,17 @@ class Engine:
         (app.py serves it under --mock): nothing else may hand a token out."""
         return next((t for t, run in self._agent_tokens.items() if run[:2] == (plan_id, node_id)), None)
 
+    def _take_snapshot(self, plan_id: int, node_id: int) -> None:
+        """Snapshot a run's declared files before its agent starts, the baseline of its diff."""
+        self._snapshots.take_declared((plan_id, node_id), self.plan_workdir(plan_id),
+                                      [f["path"] for f in self.store.node_files(plan_id, node_id)])
+
     def _record_diffs(self, plan_id: int, node_id: int) -> None:
         """Store the diffs of the run that just ended, if anything was snapshotted for it."""
         key = (plan_id, node_id)
         if key not in self._snapshots:
             return
-        diffs = self._snapshots.finish(key, self.plan_workdir(plan_id))
+        diffs = self._snapshots.finish(key)
         if diffs:
             self.store.set_node_diffs(plan_id, node_id, diffs)
 
@@ -1078,6 +1082,7 @@ class Engine:
                         self.store.update_node(pid, n["node_id"], agent_done=0, result=None, error=None)
                         self.store.clear_node_diffs(pid, n["node_id"])
                         self._cancel_review(pid, n["node_id"])
+                        self._take_snapshot(pid, n["node_id"])
                         self._set_status(pid, n["node_id"], "running", agent_kind="external", agent_name=agent_name)
                         self._emit(pid, n["node_id"], "system", {"text": f"claimed by external agent '{agent_name}'"})
                         hint = EXPAND_HINT.format(plan_id=pid, node_id=n["node_id"])

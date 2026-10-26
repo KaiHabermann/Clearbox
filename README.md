@@ -160,10 +160,11 @@ Declare nothing and a node behaves exactly as before — no conflicts, no waitin
 every plan made before this feature keeps working unchanged.
 
 Declaring `files` buys three things: conflicting nodes are serialized (below), the agent is told its
-scope, and the node gets a **complete diff** for review. Before a node starts, Clearbox snapshots
-every declared path and compares it again when the node finishes, so a change shows up however it
-was made, from the shell as well as from the file tools. A node that declares nothing only gets the
-writes made through its file tools (see [Reviewing](#reviewing)).
+scope, and the node gets a **diff** for review. When a node starts (a built-in run or an external
+claim), Clearbox snapshots every declared path and compares it again when the node finishes, so a
+change shows up however it was made, from the shell as well as from the file tools. Only declared
+files are diffed: a node that declares nothing gets no diff, and nothing outside its files is
+shown (see [Reviewing](#reviewing)).
 
 Two nodes that could otherwise run at the same time and declare a shared file never actually run
 together: they run one after the other, **lowest node number first**. This spans the whole plan
@@ -256,16 +257,15 @@ There are two levels, deliberately kept apart so each stays inside a context it 
 * **Step review** (`review_node` / `POST /api/plans/{id}/nodes/{node_id}/review`): once a node is
   `done`, a reviewer looks at *that node's* captured diff against *that node's* task description —
   one diff, one task, nothing else. It runs in the background after the node has already finished,
-  so it never delays whatever depends on it. The diff has two sources: a snapshot of the node's
-  declared `files` taken before it starts, compared again when it finishes (directories are walked,
-  so added and deleted files show up too), plus every write the node makes through the file tools
-  (`write_file`, `edit_file`, the Claude harness's own edit tools). Within the declared scope the
-  diff is therefore complete, including changes made through `bash`, `sed -i` or a heredoc; outside
-  it, and for a node that declares nothing, it is best-effort and covers file-tool writes only. The
-  reviewer is told which case applies, so it can treat a missing change in the declared scope as
-  not made and stays cautious elsewhere. Agents are still asked to edit through the file tools: those
-  edits show up in the transcript as reviewable steps, and they are the only ones captured outside
-  the declared scope. The reviewer is asked to run the test suite before its verdict (with the
+  so it never delays whatever depends on it. The diff covers exactly the node's declared `files`:
+  Clearbox stages them into a git tree when the node starts and again when it finishes, and
+  diffs the two. Every change to those paths shows up, including changes made through `bash`,
+  `sed -i` or a heredoc, as do added and deleted files inside a declared directory (where the
+  project's `.gitignore` applies; a file declared by name is captured even if it is ignored). Files
+  the node did not declare are not diffed at all: a node is trusted to stay inside its scope. This
+  needs `git` on `PATH`. The snapshots live in a git directory of Clearbox's own next to its
+  database (`<data dir>/snapshots`), never in the project's `.git`, and the working directory does
+  not have to be a repository. The reviewer is asked to run the test suite before its verdict (with the
   plan's `test_instructions`, if it has them), so reviews get capability `run` (read, search,
   shell; no edits) whatever the profile allows for normal runs, see
   [Capability](#capability-what-an-agent-may-do).
@@ -658,7 +658,7 @@ clearbox/
   store.py        SQLite schema + DAG operations (ids, cycle check) + agent profiles
   engine.py       scheduler, node lifecycle, subplans, external-agent protocol
   prompts.py      what a worker agent is told: system prompt, test levels, the per-node context
-  diffs.py        before-snapshots of a node's files and the diffs taken from them when it finishes
+  diffs.py        git snapshots of a node's declared files at start and finish, and the diff between them
   reviews.py      step and plan reviews: reviewer prompts, reply parser, the review session
   bootstrap.py    built-in profiles, server default, startup banner and validation
   mcp_bridge.py   MCP client that hands the clearbox tools to non-Claude harnesses (vc_*)

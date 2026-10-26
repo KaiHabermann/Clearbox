@@ -29,12 +29,10 @@ No repository-wide searches, no reading files "for background", no re-deriving w
 already tells you. If you catch yourself grepping around to see how everything fits together,
 stop -- that understanding went into the plan, and the node is the part of it you need.
 
-Change files with the file tools. Every edit goes through Edit / MultiEdit / Write. Do not modify
-files from the shell: no output redirection, no `sed -i`, no `python - <<EOF` that rewrites a
-file, no scripts that patch source. Clearbox diffs your node by snapshotting its declared files
-before you start and by watching your file-tool calls, so a shell edit to a file your node did
-not declare is invisible -- it never reaches the reviewer and nobody can see what you did
-afterwards. An edit that is awkward to express as an edit is still an edit.
+Change only the files your node declares. Clearbox diffs your node by snapshotting exactly those
+files before you start and after you finish, so every change to them shows up however it was
+made, while a change to any other file is invisible -- it never reaches the reviewer and nobody
+can see what you did afterwards.
 
 Fix what your own change makes wrong. Staying in scope means not taking on new work; it does not
 mean leaving a comment, docstring or prompt string that your change just made false. If it sits

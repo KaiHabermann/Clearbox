@@ -103,7 +103,7 @@ async function loadFullChanges(pid, nodeId) {
   if (!r.diffs.length) {
     list.append(el("div", { class: "files-empty" }, "no file changes captured"));
     pane.append(el("div", { class: "files-empty pad" },
-      "This node recorded no file diffs. Files written by bash are not captured."));
+      "This node recorded no file diffs. Only the files a node declares are diffed."));
     return;
   }
   for (const d of r.diffs) {
@@ -447,8 +447,8 @@ function renderPromptRow(pid, n) {
   return el("div", {}, el("div", { class: "k" }, "Prompt"), el("div", { class: "v" }, d));
 }
 
-// Changes row: the file diffs captured from this node's Write/Edit/MultiEdit/NotebookEdit tool
-// calls (diffs.py, stored by engine._record_diffs). Fetched lazily since most nodes never need
+// Changes row: git diffs of this node's declared files between the start and the end of its run
+// (diffs.py, stored by engine._record_diffs). Fetched lazily since most nodes never need
 // it open; a node that is still running simply has none recorded yet.
 function diffHtml(diff) {
   return diff.split("\n").map((line) => {
