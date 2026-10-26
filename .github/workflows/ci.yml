@@ -1,6 +1,10 @@
 # Checks on every push and pull request. Deliberately small: the package must build, install
 # clean and start, and the tests that need no API key must pass. Everything here also runs as
 # part of a release, so a green CI means a tag will not fail halfway through publishing.
+#
+# Every job runs on Linux, macOS and Windows. The steps are written once, in bash (Git Bash on
+# the Windows runners), and the few platform differences are settled in one place: the venv's
+# executables live in Scripts/ on Windows and bin/ elsewhere, and temp files go to $RUNNER_TEMP.
 name: ci
 
 on:
@@ -16,12 +20,17 @@ concurrency:                       # a new push supersedes an in-flight run of t
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash                    # also on Windows, so every step is the same script everywhere
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.10", "3.13"]   # the oldest supported and the newest, not every version between
     steps:
       - uses: actions/checkout@v7.0.1
@@ -44,25 +53,35 @@ jobs:
         run: uv run pytest
 
       # The rest drive a real server. Mock agents only, so no API key and no token spend.
-      - name: Start a mock server
-        run: |
-          uv run clearbox --mock --port 8765 --db "$RUNNER_TEMP/ci.db" --workdir "$RUNNER_TEMP/ws" \
-            > "$RUNNER_TEMP/server.log" 2>&1 &
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8765/api/plans >/dev/null && exit 0
-            sleep 1
-          done
-          echo "::error::server did not come up"; exit 1
-
+      # The server is started, used and stopped in this one step: a process left running in the
+      # background between steps is not something every runner OS handles the same way. It is
+      # the venv's own executable, not `uv run`, so the pid in $! is the server and kill stops it.
+      #
       # Runs every test even if an earlier one fails, so one run shows every problem instead of
       # only the first, and names the failures in the step summary. A test that fails because the
       # server itself broke leaves no trace in the test output, so the server log is dumped too.
       - name: End-to-end tests
         run: |
+          bin=bin; [ "$RUNNER_OS" = Windows ] && bin=Scripts
+          url=http://127.0.0.1:8765
+          ".venv/$bin/clearbox" --mock --port 8765 --db "$RUNNER_TEMP/ci.db" --workdir "$RUNNER_TEMP/ws" \
+            > "$RUNNER_TEMP/server.log" 2>&1 &
+          server=$!
+          trap 'kill $server 2>/dev/null || true' EXIT
+          up=""
+          for i in $(seq 1 60); do
+            curl -sf "$url/api/plans" >/dev/null && { up=1; break; }
+            sleep 1
+          done
+          if [ -z "$up" ]; then
+            cat "$RUNNER_TEMP/server.log" || true
+            echo "::error::server did not come up"; exit 1
+          fi
+
           failed=""
           for t in test_flow test_agents_api test_file_conflicts test_mixed_run test_rework test_agent_scope test_host_check test_observe; do
             echo "::group::$t"
-            uv run python "tests/$t.py" http://127.0.0.1:8765 || failed="$failed $t"
+            uv run python "tests/$t.py" "$url" || failed="$failed $t"
             echo "::endgroup::"
           done
           if [ -n "$failed" ]; then
@@ -74,7 +93,11 @@ jobs:
           fi
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.2
@@ -87,10 +110,12 @@ jobs:
       # and it catches a missing data file or entry point that an editable install hides.
       - name: Install the wheel and run it
         run: |
-          uv venv /tmp/fresh
-          VIRTUAL_ENV=/tmp/fresh uv pip install dist/*.whl
-          /tmp/fresh/bin/clearbox --help
-          /tmp/fresh/bin/python -c "
+          bin=bin; [ "$RUNNER_OS" = Windows ] && bin=Scripts
+          fresh="$RUNNER_TEMP/fresh"
+          uv venv "$fresh"
+          uv pip install --python "$fresh" dist/*.whl
+          "$fresh/$bin/clearbox" --help
+          "$fresh/$bin/python" -c "
           from pathlib import Path
           import clearbox.app as a
           for f in ('index.html', 'style.css', 'app.js', 'core.js', 'graph.js', 'drawer.js', 'agents.js'):
