@@ -2,10 +2,27 @@
 
 **Observable, reviewable agent work.** Big changes, broken into a graph you can watch and audit.
 
-A small service that lets a model **post a plan as a DAG of work items over MCP**, executes the
-plan node by node (roots first, then their dependents, in parallel where possible) with agent
-sessions attached to the nodes, and shows everything live in the browser: which nodes are being
-worked on right now, and — on click — the agent's session in that node as it happens.
+![A plan in Clearbox: two steps done, two agents at work, one of them open with its live session](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/plan.png)
+
+Clearbox is a small local service between the model that plans a change and the agents that carry
+it out. The model posts a plan over MCP: a graph of steps and what each one waits for. Clearbox
+runs it, one agent session per step, in parallel wherever the graph allows, and shows all of it
+live in the browser. Click a step to watch its agent work, read the diff it produced and see what
+a reviewer made of it.
+
+* **A plan you can see.** The graph shows what is done, what is running and what waits on what;
+  *Working now* lists every agent at work.
+* **Small, focused agents.** Each step's agent gets its own task, the files it may change and only
+  the earlier results it asked for, not one ever-growing conversation.
+* **A diff per step.** Clearbox snapshots each step's declared files before and after it runs, so
+  you review a big change one step at a time, side by side.
+* **Reviews, if you want them.** A reviewer agent checks each finished step against its own diff
+  and runs the tests. Verdicts are advisory; one click re-runs a step with the findings.
+* **Steps for you.** Pushing a branch or approving a deploy can be a step of its own; the plan
+  waits for you there.
+* **Any model, per step.** Claude through the Claude Agent SDK, or any OpenAI-compatible endpoint
+  (OpenAI, OpenRouter, vLLM, Ollama, LM Studio): cheap models for the mechanical steps, strong
+  ones for the hard steps.
 
 ```
  model ──MCP──►  submit_plan (plan + nodes + edges) / start_plan
@@ -16,51 +33,37 @@ worked on right now, and — on click — the agent's session in that node as it
                  │                │      · OpenAI-compatible endpoints (OpenAI, vLLM, Ollama, …)
                  └───────┬────────┘◄── or external agents: claim_next_node / complete_node
                          │ SSE
-                     browser UI  (DAG view, running markers, live transcripts)
+                     browser UI  (DAG view, running markers, live transcripts, diffs, reviews)
 ```
 
 ## Install
 
-Needs Python ≥ 3.10.
+Needs Python ≥ 3.10, and `git` on `PATH` for the per-step diffs.
 
 ```powershell
 uv tool install clearbox        # or: pipx install clearbox, or: pip install clearbox
 clearbox --mock                 # fake agents: try the UI without spending tokens
 ```
 
-## Quick start
-
-From a clone, with [uv](https://docs.astral.sh/uv/):
-
-```powershell
-cd Clearbox
-uv run clearbox --mock          # fake agents: try the UI without spending tokens
-uv run python examples/demo_plan.py --start
-```
-
-Open <http://127.0.0.1:8765/>. The port is `--port` / `CLEARBOX_PORT` (default `8765`); the
-examples, the tests and this repo's `.mcp.json` follow `CLEARBOX_PORT` too.
+Open <http://127.0.0.1:8765/>. The port is `--port` / `CLEARBOX_PORT` (default `8765`).
 
 For real agents drop `--mock`. Built-in agents run through the Claude Agent SDK, which ships its
-own Claude Code CLI and uses your existing Claude login (or `ANTHROPIC_API_KEY`).
+own Claude Code CLI and uses your existing Claude login (or `ANTHROPIC_API_KEY`):
 
 ```powershell
-uv run clearbox                                   # real Claude sessions, 3 in parallel
-uv run clearbox --max-concurrency 5
+clearbox                                   # real Claude sessions, 3 in parallel
+clearbox --max-concurrency 5
+```
+
+Nodes can also run on any OpenAI-compatible endpoint, a local Ollama or vLLM model or OpenAI
+itself, and one plan can mix them per node, see [Agents and harnesses](#agents-and-harnesses):
+
+```powershell
+clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
 ```
 
 Agents may edit files and run commands in their plan's working directory by default; what each
 agent profile may do is its [capability](#capability-what-an-agent-may-do).
-
-Nodes can also run on any OpenAI-compatible endpoint instead — a local Ollama or vLLM model, or
-OpenAI itself — and one plan can mix them per node, see
-[Agents and harnesses](#agents-and-harnesses):
-
-```powershell
-uv run clearbox --openai-base-url http://localhost:11434/v1 --openai-model qwen2.5-coder:14b
-```
-
-Without uv: `pip install -e .` then `clearbox ...` (or `python -m clearbox ...`).
 
 ### Connect a model
 
@@ -73,28 +76,46 @@ claude mcp add --transport http clearbox http://127.0.0.1:8765/mcp
 
 Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
 
-## MCP tools
+### Try it from a clone
 
-| Tool | What it does |
-| --- | --- |
-| `submit_plan(title, working_directory=None, description="", test_instructions=None, nodes=[…], edges=[…], parent_plan_id=None, parent_node_id=None, max_parallel=None)` | **The way to build a plan**: the plan, all its nodes and all its edges in one call → `{"plan_id": …, "nodes": {key: node_id}}`. `nodes` are `{key, title, description, files, results_from, kind, agent}` objects, where `key` is your own label; `edges` are `[from_key, to_key]` pairs and `results_from` names keys too. All or nothing: every problem (duplicate or unknown keys, cycles, a `results_from` the node does not depend on, a path outside the working directory, an unknown agent or kind, the working-directory and subplan rules) is reported in one error, and then nothing has been created. Plan fields as for `create_plan`; with a parent it becomes the **subplan** of that node. |
-| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New empty plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
-| `update_plan(plan_id, max_parallel=None, test_instructions=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions. Same as `PATCH /api/plans/{plan_id}`. |
-| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | Extend or correct a plan one node at a time → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier node ids whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
-| `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
-| `remove_edge`, `remove_node` | Corrections. |
-| `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None, kind=None, agent=None)` | Change only what you pass, all or nothing. `files` / `results_from` omitted keeps the current value, `[]` clears it; they and `kind` change only before the node has run. `agent=""` clears the node's own agent so it inherits again; a new agent applies the next time the node starts. |
-| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `working_directory`, `test_instructions` (the top-level plan's, for a subplan too), `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
-| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. Creating, editing, deleting and testing profiles is setup work, done in the web UI's Agents panel or over REST (`/api/agents`), not over MCP. |
-| `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
-| `start_plan(plan_id, executor="builtin" \| "external")`, `stop_plan(plan_id)` | Run / pause a top-level plan. |
-| `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node, with the same prompt a built-in agent would get. |
-| `report_progress(plan_id, node_id, message, kind="text")` | Append to the node's live transcript. |
-| `complete_node(plan_id, node_id, result)`, `fail_node(plan_id, node_id, error)` | Finish a claimed node. |
-| `set_plan_review_agent(plan_id, agent)` | Name (or `null` to clear) the agent profile that automatically reviews this plan's steps and, once it finishes, the plan as a whole; see [Reviewing](#reviewing). |
-| `review_node(plan_id, node_id, agent=None)`, `review_plan(plan_id, agent=None)` | Review a done node's diff, or a finished plan's steps as a whole, right now; `agent` is a one-off override, used for this run only. |
-| `get_reviews(plan_id)` | Every review recorded for this plan: the plan-level one plus each node's verdict and findings. |
-| `rework_node(plan_id, node_id, instructions=None)` | Re-run one finished (`done` or `failed`) step with its review findings, or your `instructions`, in its prompt; dependants are left alone. It is reviewed again by itself afterwards, see [Rework](#rework-closing-the-review-loop). |
+With [uv](https://docs.astral.sh/uv/), and no model at all:
+
+```powershell
+cd Clearbox
+uv run clearbox --mock
+uv run python examples/demo_plan.py --start     # builds and starts a demo plan over MCP
+```
+
+The examples, the tests and this repo's `.mcp.json` follow `CLEARBOX_PORT` too. Without uv:
+`pip install -e .` then `clearbox ...` (or `python -m clearbox ...`).
+
+## A tour
+
+**1. The model posts a plan.** One `submit_plan` call creates the whole graph: every step with a
+self-contained description, the files it will change, the edges that order it, and which earlier
+results it needs. Steps that only you can do (`kind="user"`) sit in the graph like any other. The
+plan names the directory its agents work in, usually the repository.
+
+**2. Agents work, and you watch.** Each ready step gets its own session; independent steps run at
+the same time. The topbar's *Working now* lists them, and a step's **Agent output** shows its
+session as it happens: messages, thinking, tool calls and their results.
+
+![The live session of one step: what the agent says, the files it read and edited, the test run in progress](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/session.png)
+
+**3. Every step leaves a diff.** When a step finishes, its declared files are compared with how
+they were when it started, whichever tool changed them. **Changes** shows each file side by side,
+with the changed words marked.
+
+![The side-by-side diff of one step, with line numbers and the changed words highlighted](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/diff.png)
+
+**4. Reviews close the loop.** With a review agent set, every finished step is checked against
+its own diff and the test suite, and the plan as a whole once it is done. A review never blocks
+anything; **Rework this step** re-runs a step with the findings in its prompt.
+
+![A step review: verdict, summary and findings, with buttons to re-review or rework the step](https://raw.githubusercontent.com/KaiHabermann/Clearbox/master/docs/images/review.png)
+
+The rest of this README is the reference: how execution works, file scoping and results, reviews,
+agents and their capabilities, the UI, the MCP tools and the server options.
 
 ## How execution works
 
@@ -117,11 +138,12 @@ Then ask, e.g. *"Use clearbox to make a plan for … and start it."*
   finishes after that subplan (disable with `--no-agent-mcp`). `openai` agents get the same tools
   through a built-in MCP client, prefixed `vc_` (`vc_submit_plan`, …). These are a restricted set
   on their own endpoint, see [Worker agents' MCP tools](#worker-agents-mcp-tools).
-* All agents of one plan tree share a working directory: `<workdir>/plan-<root id>`
-  (default `./workspace/plan-N`).
+* All agents of one plan tree share its working directory: the `working_directory` the top-level
+  plan names (usually the repository). Subplans inherit it.
 * A failed node blocks its dependents. Use **Retry** in the UI. **Stop** cancels running built-in
   agents and re-queues their nodes; **Reset** clears all results and transcripts.
-* Everything is stored in `clearbox.db`. Built-in sessions that were running when the service
+* Everything is stored in one SQLite database, see
+  [Where Clearbox keeps its data](#where-clearbox-keeps-its-data). Built-in sessions that were running when the service
   stopped are re-queued on the next start.
 
 ### User-job nodes: a step a person does
@@ -169,7 +191,7 @@ shown (see [Reviewing](#reviewing)).
 Two nodes that could otherwise run at the same time and declare a shared file never actually run
 together: they run one after the other, **lowest node number first**. This spans the whole plan
 tree — a node in a subplan can conflict with one in the root plan or a sibling subplan — because all
-agents of one plan tree share a single working directory (`<workdir>/plan-<root id>`, see above).
+agents of one plan tree share a single working directory (the plan's `working_directory`, see above).
 Nodes already ordered by a dependency edge are never held back for this: if `A` must finish before
 `B` starts, they cannot overlap, so sharing a file is fine and costs nothing extra. A node takes all
 of its declared files at once, never one at a time, so two nodes that each declare the other's file
@@ -553,7 +575,9 @@ the whole flow can be watched for free.
   subplan nodes are drawn as a stack with a progress bar (double-click to open). Nodes within a
   layer that share a declared file are nudged down a step each and joined by a dashed connector —
   the file stagger, see [File scoping](#file-scoping-avoiding-clobbered-edits).
-* Click a node: task, prerequisites, result/error, the **agent** that runs it (with where that
+* Click a node for its drawer, or **⤢** for the full view with the tabs **Task**, **Changes** (the
+  step's diff, side by side), **Agent output** and **Review** (`←` / `→` step through the nodes).
+* The drawer: task, prerequisites, result/error, the **agent** that runs it (with where that
   came from, and a select to override it), **Inherits results from** and the **Prompt** block (the
   exact prompt it gets, see [Inherited results](#inherited-results-edges-order-results_from-passes)), the **Files** row (its declared paths, which other nodes
   share one, and — while waiting — which node to wait for) and the **live agent session**
@@ -580,6 +604,29 @@ the whole flow can be watched for free.
   **Re-run with these instructions**. A line warns when later steps that depend on it are already
   done and will not be re-run, see [Rework](#rework-closing-the-review-loop).
 * URLs are deep-linkable: `/#/plan/2/node/3`, `/#/agents`, `/#/agents/4`.
+
+## MCP tools
+
+| Tool | What it does |
+| --- | --- |
+| `submit_plan(title, working_directory=None, description="", test_instructions=None, nodes=[…], edges=[…], parent_plan_id=None, parent_node_id=None, max_parallel=None)` | **The way to build a plan**: the plan, all its nodes and all its edges in one call → `{"plan_id": …, "nodes": {key: node_id}}`. `nodes` are `{key, title, description, files, results_from, kind, agent}` objects, where `key` is your own label; `edges` are `[from_key, to_key]` pairs and `results_from` names keys too. All or nothing: every problem (duplicate or unknown keys, cycles, a `results_from` the node does not depend on, a path outside the working directory, an unknown agent or kind, the working-directory and subplan rules) is reported in one error, and then nothing has been created. Plan fields as for `create_plan`; with a parent it becomes the **subplan** of that node. |
+| `create_plan(title, description="", parent_plan_id=None, parent_node_id=None, working_directory=None, max_parallel=None, test_instructions=None)` | New empty plan → integer id (1, 2, 3 …). With a parent it becomes the **subplan** of that node. A top-level plan must name its `working_directory`; `test_instructions` is free text saying how the project's tests are run, see [Test levels](#test-levels-how-much-a-worker-agent-tests). Subplans inherit both and may not set them. |
+| `update_plan(plan_id, max_parallel=None, test_instructions=None)` | Change a top-level plan's settings; only what you pass changes. `max_parallel=0` removes the limit, `test_instructions=""` removes the instructions. Same as `PATCH /api/plans/{plan_id}`. |
+| `add_node(plan_id, title, description="", agent=None, files=None, results_from=None, kind=None)` | Extend or correct a plan one node at a time → `[plan_id, node_id]`. Node ids count up per plan. `agent` (profile name or id) pins the node to an agent profile; omitted = inherit. `files` declares the paths it will create or modify, see [File scoping](#file-scoping-avoiding-clobbered-edits). `results_from` lists earlier node ids whose result text it receives, see [Inherited results](#inherited-results-edges-order-results_from-passes). `kind="user"` makes it the user's own job, see [User-job nodes](#user-job-nodes-a-step-a-person-does); default `"agent"`. |
+| `add_edge(plan_id, from_node_id, to_node_id)` | `from` must finish before `to` starts. Cycles are rejected. Passes no result; that is `results_from`. |
+| `remove_edge`, `remove_node` | Corrections. |
+| `update_node(plan_id, node_id, title=None, description=None, files=None, results_from=None, kind=None, agent=None)` | Change only what you pass, all or nothing. `files` / `results_from` omitted keeps the current value, `[]` clears it; they and `kind` change only before the node has run. `agent=""` clears the node's own agent so it inherits again; a new agent applies the next time the node starts. |
+| `get_plan(plan_id)`, `list_plans()` | Structure, status, results, progress. `get_plan` also shows `working_directory`, `test_instructions` (the top-level plan's, for a subplan too), `default_agent` and, per node, the resolved `agent` and its `agent_override`, plus `files` and `conflicts` (see [File scoping](#file-scoping-avoiding-clobbered-edits)), `results_from`, `kind` and `waiting_for_user` (a user node that is ready and waiting to be marked done). |
+| `list_agents()` | Agent profiles (secrets redacted to `has_api_key`; `default: true` marks the server default), including each one's `capability` and `test_level`. Creating, editing, deleting and testing profiles is setup work, done in the web UI's Agents panel or over REST (`/api/agents`), not over MCP. |
+| `set_plan_agent(plan_id, agent)` | Default for the plan and its subplans; `null` clears it. |
+| `start_plan(plan_id, executor="builtin" \| "external")`, `stop_plan(plan_id)` | Run / pause a top-level plan. |
+| `claim_next_node(agent_name, plan_id=None)` | External agents: take the next ready node, with the same prompt a built-in agent would get. |
+| `report_progress(plan_id, node_id, message, kind="text")` | Append to the node's live transcript. |
+| `complete_node(plan_id, node_id, result)`, `fail_node(plan_id, node_id, error)` | Finish a claimed node. |
+| `set_plan_review_agent(plan_id, agent)` | Name (or `null` to clear) the agent profile that automatically reviews this plan's steps and, once it finishes, the plan as a whole; see [Reviewing](#reviewing). |
+| `review_node(plan_id, node_id, agent=None)`, `review_plan(plan_id, agent=None)` | Review a done node's diff, or a finished plan's steps as a whole, right now; `agent` is a one-off override, used for this run only. |
+| `get_reviews(plan_id)` | Every review recorded for this plan: the plan-level one plus each node's verdict and findings. |
+| `rework_node(plan_id, node_id, instructions=None)` | Re-run one finished (`done` or `failed`) step with its review findings, or your `instructions`, in its prompt; dependants are left alone. It is reviewed again by itself afterwards, see [Rework](#rework-closing-the-review-loop). |
 
 ## Developing Clearbox with Clearbox
 
@@ -674,16 +721,21 @@ clearbox/
     openai_check.py  /models check behind POST /api/agents/{id}/test
     probe.py         tiny completion round trip when there is no /models listing
   static/         UI (plain HTML/CSS and ES modules, no build step): app.js (entry: routing, plan
-                  view, live feed), core.js (state, helpers), graph.js, drawer.js, agents.js
+                  view, live feed), core.js (state, helpers), graph.js, drawer.js, diffview.js
+                  (side-by-side and unified diff tables), agents.js
 examples/demo_plan.py       builds a demo plan through MCP
 examples/mixed_plan.py      builds a plan that mixes a cheap and a strong agent
-tests/unit/                 in-process unit tests of the scheduler and store: `uv run pytest`
+docs/images/                the README's screenshots
+tests/unit/                 in-process unit tests of the scheduler, the store and the diffs: `uv run pytest`
 tests/test_flow.py          end-to-end test (run against a server started with --mock)
 tests/test_agents_api.py    REST agent lifecycle, incl. the secret-handling rules
 tests/test_mixed_run.py     per-node agents and max_parallel in a real run
+tests/test_file_conflicts.py  file scoping: conflicting nodes run one after the other
+tests/test_rework.py        automatic and on-demand reviews, and rework with the findings
 tests/test_agent_scope.py   the workers' scoped MCP endpoint: subtree rule, inherited agent, token lifetime
 tests/test_host_check.py    Host and Origin checks: foreign names and pages refused, own names and the stream pass
 tests/test_openai_harness.py  the agent loop against tests/fake_openai.py (no network, no DB)
+tests/test_review_format.py   the reviewer reply parser (no server)
 ```
 
 ## Where Clearbox keeps its data
@@ -711,9 +763,9 @@ The git tag is the trigger and the single source of truth. Bump the version, tag
 
 ```powershell
 uv version --bump patch         # or minor / major; edits pyproject.toml
-git commit -am "release v0.1.1"
+git commit -am "Release 0.1.1: what changed"
 git tag v0.1.1
-git push origin main --tags
+git push origin master v0.1.1
 ```
 
 `.github/workflows/release.yml` then builds the sdist and wheel, refuses to continue if the tag
