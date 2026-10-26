@@ -11,9 +11,8 @@ being worked on right now, and why does each step come where it does.** A person
 to judge whether the approach is reasonable from the flowchart alone, without reading your
 messages or tool calls.
 
-You are the executor: the plan runs with `executor="external"`, and you claim and complete
-its nodes yourself. Never start a plan with the `builtin` executor; that launches separate agent
-sessions.
+You are the executor: `submit_plan` starts the plan with `executor="external"` right away, and
+you claim and complete its nodes yourself. Clearbox runs no agents of its own here.
 
 ## When to use it
 
@@ -23,12 +22,12 @@ sessions.
 - Skip it for questions, explanations, and one-step edits.
 
 The tools come from the Clearbox server, which the user starts with `clearbox` (it serves the UI
-and the MCP endpoint on port 8765). If the Clearbox MCP tools are not available (server not
+and the MCP endpoint `/mcp/observe` on port 8765). If the Clearbox MCP tools are not available (server not
 running), say so once in one line, suggesting `clearbox`, and work normally. Do not stall on it.
 
 ## Starting a plan
 
-1. Create the plan in one call with `submit_plan`:
+1. Create and start the plan in one call with `submit_plan`:
    - `title`: the task in a few words. `description`: the goal and what "done" means.
    - `working_directory`: the absolute path of the project you are working in.
    - `nodes`: one per step. Write `title` as a short verb phrase ("Parse config file"), so the
@@ -41,8 +40,7 @@ running), say so once in one line, suggesting `clearbox`, and work normally. Do 
    - Use `kind="user"` for steps only the user can do (push, deploy, approve, provide a
      credential). The plan visibly stops there and waits for them. See "Blocked on the user"
      below for ones that turn up during the work.
-2. `start_plan(plan_id, executor="external")`.
-3. Instead of writing the plan out in chat, give one or two lines plus the link
+2. Instead of writing the plan out in chat, give one or two lines plus the link
    `http://127.0.0.1:8765/#/plan/<plan_id>`.
 
 ## Working through it
@@ -75,9 +73,10 @@ moment you learn something:
   its neighbours with `add_edge` if they still depend on each other through it.
 - **A dependency was wrong:** `remove_edge` / `add_edge`. Adding an edge into a ready node puts
   it back to pending, which is correct.
-- **A step is too big:** while you hold it, expand it into a subplan with
-  `submit_plan(parent_plan_id=…, parent_node_id=…, nodes=…, edges=…)`. Its nodes are claimable
-  like any other, and the parent finishes when they all have.
+- **A step is too big:** expand it into a subplan with
+  `submit_plan(parent_plan_id=…, parent_node_id=…, nodes=…, edges=…)`; it runs with its plan, not
+  on its own. If you hold the step, complete it with what it did so far: then the subplan's nodes
+  are claimable like any other, and the step finishes when they all have.
 - **Direction changes** (the user redirects you, or the approach fails): remove or fail the
   nodes that no longer apply and add the new path, connected to the work it builds on. Do not
   leave stale pending nodes behind.
@@ -110,5 +109,4 @@ intend to do next. If it does not, fix it first.
 ## Finishing
 
 The plan is finished when every node is done, failed with a reason, or removed. End with a
-short summary in chat and the plan link. Do not turn on reviews (`set_plan_review_agent`,
-`review_node`, `review_plan`) unless the user asks.
+short summary in chat and the plan link.

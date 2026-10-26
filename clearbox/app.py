@@ -1,4 +1,5 @@
-"""FastAPI app: REST + Server-Sent Events for the UI, MCP at /mcp (and /mcp-agent/<token> for workers)."""
+"""FastAPI app: REST + Server-Sent Events for the UI, MCP at /mcp (/mcp/observe for a session
+tracking itself, /mcp-agent/<token> for workers)."""
 
 from __future__ import annotations
 
@@ -53,6 +54,11 @@ class Settings:
     def mcp_url(self) -> str:
         host = "127.0.0.1" if self.host in WILDCARD_HOSTS else self.host
         return f"http://{host}:{self.port}/mcp"
+
+    @property
+    def observe_mcp_url(self) -> str:
+        """The slim endpoint for a session that tracks its own work (executor "external")."""
+        return self.mcp_url + "/observe"
 
     @property
     def agent_mcp_url(self) -> str:
@@ -235,7 +241,7 @@ def is_loopback(host: str) -> bool:
 
 
 class HostCheck:
-    """ASGI middleware in front of everything (REST, /api/stream, /mcp, /mcp-agent, the UI).
+    """ASGI middleware in front of everything (REST, /api/stream, the MCP endpoints, the UI).
 
     A request whose Host is not one of ours is a DNS-rebinding page -- its own name resolving to
     127.0.0.1, so the browser calls it same-origin -- and gets a 421. A request whose Origin is
@@ -308,9 +314,9 @@ def create_app(settings: Settings) -> FastAPI:
             snapshot_dir=str(Path(settings.db).resolve().parent / "snapshots"),
         ),
     )
-    mcp, agent_mcp = build_mcp(engine)
+    mcp, agent_mcp, observe_mcp = build_mcp(engine)
     # The MCP SDK has a Host/Origin check of its own, on by default only for a loopback --host
-    # (and then for any port). HostCheck already covers /mcp and /mcp-agent; giving the SDK the
+    # (and then for any port). HostCheck already covers every MCP endpoint; giving the SDK the
     # same allowlist keeps the two from disagreeing, e.g. on an --allowed-host name.
     hosts = allowed_hosts(settings)
     security = TransportSecuritySettings(
@@ -319,6 +325,12 @@ def create_app(settings: Settings) -> FastAPI:
     )
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        transport_security=security,
+    )
+    observe_mcp_app = observe_mcp.streamable_http_app(
+        streamable_http_path="/mcp/observe",
         stateless_http=True,
         json_response=True,
         transport_security=security,
@@ -332,7 +344,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with mcp.session_manager.run(), agent_mcp.session_manager.run():
+        async with mcp.session_manager.run(), observe_mcp.session_manager.run(),                 agent_mcp.session_manager.run():
             await engine.start()
             try:
                 yield
@@ -347,6 +359,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp
+    app.router.routes.extend(observe_mcp_app.routes)  # /mcp/observe: exact routes, no mount, so no clash
     (agent_route,) = agent_mcp_app.routes
     app.router.routes.append(Route(agent_route.path, endpoint=AgentTokenGate(engine, agent_route.endpoint)))
 
