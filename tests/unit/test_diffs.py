@@ -169,7 +169,7 @@ async def test_undeclared_changes_alone_get_reviewed(store, tmp_path):
     write(wd, "a.txt", "a\n")
     pid = store.create_plan("p", cwd=str(wd))
     store.add_node(pid, "no files")
-    store.set_plan_review_agent(pid, store.create_profile(name="rev", harness="mock"))
+    store.set_plan_review_agent(pid, store.create_profile(name="rev", harness="mock", params={"speed": 1000}))
     async with running(store, mock_harness(), tmp_path) as engine:
         engine.start_plan(pid, executor="external")
         await settle(engine)
