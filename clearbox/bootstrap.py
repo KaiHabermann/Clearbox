@@ -1,4 +1,4 @@
-"""Startup bootstrap: built-in agent profiles, the server default, the banner line.
+"""Startup bootstrap: built-in agent profiles, the server default, the banner lines.
 
 A fresh install has an empty ``agent_profiles`` table, yet the operator should
 be able to pick a harness straight from the command line without opening the UI
@@ -152,3 +152,25 @@ def agents_line(registry: HarnessRegistry, store: Store, default_id: int | None)
             detail = f" ({p['harness']}" + (f" / {model}" if model else "") + ")"
         parts.append(f"{p['name']}{star}{detail}")
     return ", ".join(parts)
+
+
+CAPABILITY_TEXT = {
+    "read": "read and search files only; no edits, no commands",
+    "run": "read files and run any command in the plan's working directory; no edits",
+    "edit": "read and edit files; no commands",
+    "full": "edit files and run any command in the plan's working directory",
+}
+
+
+def capability_line(registry: HarnessRegistry, default: dict[str, Any]) -> str:
+    """What built-in workers may do, e.g. ``full -- edit files and run any command ... (--default-capability
+    to restrict)``, plus the default profile's own capability when it differs from the server default."""
+    cap = registry.defaults.default_capability
+    line = f"{cap} -- {CAPABILITY_TEXT[cap]}"
+    line += " (--default-capability to restrict)" if cap != "read" else ""
+    own = registry.capability_for(default)
+    if own["source"] == "custom":
+        line += f"; default profile {default['name']!r}: its own permission_mode/tools"
+    elif own["capability"] != cap:
+        line += f"; default profile {default['name']!r}: {own['capability']} -- {CAPABILITY_TEXT[own['capability']]}"
+    return line

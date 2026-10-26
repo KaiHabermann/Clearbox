@@ -57,6 +57,10 @@ def main() -> None:
     ap.add_argument("--permission-mode", default=env("CLEARBOX_PERMISSION_MODE", "acceptEdits"),
                     choices=["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"],
                     help="permission mode for built-in agents")
+    ap.add_argument("--default-capability", default=env("CLEARBOX_DEFAULT_CAPABILITY", "full"),
+                    choices=["read", "run", "edit", "full"],
+                    help="what built-in worker agents may do when their profile sets no capability "
+                         "(default: full -- edit files and run any command)")
     ap.add_argument("--model", default=env("CLEARBOX_MODEL"))
     ap.add_argument("--max-turns", type=int, default=None)
     ap.add_argument("--no-agent-mcp", action="store_true",
@@ -82,6 +86,7 @@ def main() -> None:
         mock_speed=args.mock_speed,
         max_concurrency=args.max_concurrency,
         permission_mode=args.permission_mode,
+        default_capability=args.default_capability,
         model=args.model,
         max_turns=args.max_turns,
         expose_mcp_to_agents=not args.no_agent_mcp,
@@ -100,6 +105,7 @@ def main() -> None:
     print(f"MCP endpoint:     {settings.mcp_url}   (agents: {settings.agent})")
     print(f"Observe endpoint: {settings.observe_mcp_url}   (a session tracking its own work)")
     print(f"Agents:           {app.state.agents_line}")
+    print(f"Built-in agents:  {app.state.capability_line}")
     print(f"Database:         {os.path.abspath(settings.db)}")
     if legacy and os.path.abspath(settings.db) == legacy:
         print(f"                  (a clearbox.db in this folder; the default is now "

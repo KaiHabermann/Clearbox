@@ -25,7 +25,7 @@ from .harness.registry import HarnessDefaults, HarnessRegistry
 from .engine import Bus, ConflictCache, Engine, EngineConfig
 from .export import plan_markdown
 from .mcp_tools import build_mcp
-from .store import PlanError, Store, keys_conflict, public_profile
+from .store import CAPABILITIES, PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
 WILDCARD_HOSTS = ("0.0.0.0", "::", "")
@@ -41,6 +41,7 @@ class Settings:
     default_agent: str | None = None  # --agent-profile: name of the server-wide default profile
     max_concurrency: int = 3
     permission_mode: str = "acceptEdits"
+    default_capability: str = "full"  # --default-capability: what an unset capability means for workers
     model: str | None = None
     max_turns: int | None = None
     expose_mcp_to_agents: bool = True
@@ -289,6 +290,9 @@ def review_view(r: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def create_app(settings: Settings) -> FastAPI:
+    if settings.default_capability not in CAPABILITIES:
+        raise bootstrap.StartupError(f"--default-capability {settings.default_capability!r}: "
+                                     f"expected one of {', '.join(CAPABILITIES)}")
     store = Store(settings.db)
     bus = Bus()
     bootstrap.ensure_profiles(store, bootstrap.OpenAiBootstrap(
@@ -304,6 +308,7 @@ def create_app(settings: Settings) -> FastAPI:
         max_turns=settings.max_turns,
         mock_speed=settings.mock_speed,
         default_profile=default["id"],
+        default_capability=settings.default_capability,
     ))
     bootstrap.validate(harnesses, store, default)
     engine = Engine(
@@ -362,6 +367,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.add_middleware(HostCheck, allowed=hosts)
     app.state.engine = engine
     app.state.agents_line = bootstrap.agents_line(harnesses, store, default["id"])
+    app.state.capability_line = bootstrap.capability_line(harnesses, default)
     app.router.routes.extend(mcp_app.routes)  # POST/GET /mcp
     app.router.routes.extend(observe_mcp_app.routes)  # /mcp/observe: exact routes, no mount, so no clash
     (agent_route,) = agent_mcp_app.routes
@@ -456,7 +462,13 @@ def create_app(settings: Settings) -> FastAPI:
         assert "api_key" not in out
         out["default"] = p["id"] == default_id
         out["in_use"] = usage.get(p["id"], 0)
-        return out
+        return {**out, **capability_fields(p)}
+
+    def capability_fields(p: dict[str, Any]) -> dict[str, Any]:
+        """What a worker (and a reviewer) on this profile may do, as resolved by the registry."""
+        cap = harnesses.capability_for(p)
+        return {"effective_capability": cap["capability"], "capability_source": cap["source"],
+                "review_capability": harnesses.review_capability_for(p)}
 
     def agent_usage() -> dict[int, int]:
         """profile id -> number of nodes and plans that reference it directly."""

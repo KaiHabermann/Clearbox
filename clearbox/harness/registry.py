@@ -31,10 +31,11 @@ for every harness:
 The registry maps it to each harness's own gating (``claude_access`` and
 ``openai_tools``). ``full`` means the agent can run arbitrary commands in the
 plan's working directory; that is the operator's choice, made when they pick the
-profile. When a profile sets no capability the default is ``full`` for worker
-agents and ``run`` for reviewers (a reviewer must run the suite but must not
-edit). A profile's raw ``permission_mode`` (claude-sdk) or ``tools`` config
-(openai) is still honoured as an escape hatch when set.
+profile. When a profile sets no capability, worker agents get the server's
+``--default-capability`` (default ``full``) and reviewers get ``run`` (a reviewer
+must run the suite but must not edit). A profile's raw ``permission_mode``
+(claude-sdk) or ``tools`` config (openai) is still honoured as an escape hatch
+when set.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ from .claude_sdk import ClaudeSdkHarness, _as_json
 from .mock import MockHarness
 from .openai_compat import OpenAiHarness
 
-DEFAULT_CAPABILITY = "full"         # worker agents
+DEFAULT_CAPABILITY = "full"         # worker agents, unless --default-capability says otherwise
 DEFAULT_REVIEW_CAPABILITY = "run"   # reviewers
 
 _READ_TOOLS = ["Read", "Grep", "Glob"]
@@ -97,6 +98,13 @@ def openai_tools(capability: str, tools_config: dict[str, Any] | None = None) ->
     return out
 
 
+def _openai_custom(profile: dict[str, Any]) -> bool:
+    """Whether an openai profile's own ``tools`` config chooses its tools (the escape hatch);
+    an ``mcp`` flag alone does not."""
+    cfg = _as_json(profile.get("tools"), {}) or {}
+    return any(cfg.get(k) for k in ("preset", "allow", "deny"))
+
+
 @dataclass
 class HarnessDefaults:
     """Server-wide settings: the implicit harness and the values profiles fall back to."""
@@ -107,6 +115,7 @@ class HarnessDefaults:
     max_turns: int | None = None
     mock_speed: float = 1.0
     default_profile: int | str | None = None  # id or name of the server-wide default profile
+    default_capability: str = DEFAULT_CAPABILITY  # what an unset capability means for workers
 
 
 class HarnessRegistry:
@@ -202,7 +211,7 @@ class HarnessRegistry:
             if d.agent == "mock":
                 self._implicit = MockHarness(speed=d.mock_speed)
             else:
-                mode, tools = claude_access(DEFAULT_CAPABILITY, d.permission_mode)
+                mode, tools = claude_access(d.default_capability, d.permission_mode)
                 self._implicit = ClaudeSdkHarness(
                     permission_mode=mode, model=d.model, max_turns=d.max_turns, allowed_tools=tools,
                 )
@@ -217,14 +226,35 @@ class HarnessRegistry:
         self._cache[profile["id"]] = (dict(profile), harness)
         return harness
 
+    def capability_for(self, profile: dict[str, Any] | None) -> dict[str, Any]:
+        """What a worker agent on ``profile`` (None: the implicit harness) may do, for
+        the banner and the UI: ``{capability, source}`` where ``source`` is ``"profile"``
+        (set on the profile), ``"default"`` (the server's ``--default-capability``) or
+        ``"custom"`` (the profile's raw ``permission_mode``/``tools`` decide instead)."""
+        if profile is None:
+            return {"capability": self.defaults.default_capability, "source": "default"}
+        own = profile.get("capability")
+        out = {"capability": own or self.defaults.default_capability, "source": "profile" if own else "default"}
+        if profile["harness"] == "claude-sdk" and (profile.get("permission_mode") or _as_json(profile.get("tools"), None)):
+            out["source"] = "custom"
+        elif profile["harness"] == "openai" and not own and _openai_custom(profile):
+            out["source"] = "custom"
+        return out
+
+    def review_capability_for(self, profile: dict[str, Any]) -> str:
+        """The capability a review session on ``profile`` gets: ``params.review_capability`` or ``run``."""
+        params = _as_json(profile.get("params"), {}) or {}
+        return params.get("review_capability") or DEFAULT_REVIEW_CAPABILITY
+
     def _build(self, profile: dict[str, Any]) -> Harness:
-        """A harness for a normal node run. The profile's ``capability`` (default
-        ``full``: the agent can run arbitrary commands in the plan's working directory,
-        the operator's choice) sets the tool access; an explicit ``permission_mode`` or
-        ``tools`` on the profile still overrides it as an escape hatch."""
+        """A harness for a normal node run. The profile's ``capability`` (unset: the
+        server's ``--default-capability``, by default ``full``: the agent can run arbitrary
+        commands in the plan's working directory, the operator's choice) sets the tool
+        access; an explicit ``permission_mode`` or ``tools`` on the profile still overrides
+        it as an escape hatch."""
         d = self.defaults
         kind = profile["harness"]
-        capability = _check_capability(profile.get("capability") or DEFAULT_CAPABILITY, profile["name"])
+        capability = _check_capability(profile.get("capability") or d.default_capability, profile["name"])
         if kind == "claude-sdk":
             mode, tools = claude_access(capability, d.permission_mode)
             return ClaudeSdkHarness(  # the profile's own permission_mode / tools win inside, when set
@@ -232,7 +262,7 @@ class HarnessRegistry:
                 allowed_tools=tools, profile=profile,
             )
         if kind == "openai":
-            if profile.get("capability"):
+            if profile.get("capability") or not _openai_custom(profile):
                 profile = {**profile, "tools": openai_tools(capability, _as_json(profile.get("tools"), {}))}
             return OpenAiHarness(profile=profile)
         if kind == "mock":
@@ -252,8 +282,7 @@ class HarnessRegistry:
         """
         d = self.defaults
         kind = profile["harness"]
-        params = _as_json(profile.get("params"), {}) or {}
-        capability = _check_capability(params.get("review_capability") or DEFAULT_REVIEW_CAPABILITY, profile["name"])
+        capability = _check_capability(self.review_capability_for(profile), profile["name"])
         if kind == "claude-sdk":
             mode, tools = claude_access(capability, d.permission_mode)
             return ClaudeSdkHarness(
@@ -276,15 +305,19 @@ class HarnessRegistry:
         return "mock" if self.defaults.agent == "mock" else "claude"
 
     def describe(self, profile: dict[str, Any] | None) -> dict[str, Any]:
-        """Name, harness and model of the agent, for the "agent: ..." transcript line."""
+        """Name, harness, model and effective capability of the agent, for the "agent: ..."
+        transcript line and the node views."""
+        cap = self.capability_for(profile)
+        caps = {"capability": cap["capability"], "capability_source": cap["source"]}
         if profile is None:
             harness = "mock" if self.defaults.agent == "mock" else "claude-sdk"
             model = None if harness == "mock" else self.defaults.model
-            return {"name": self.agent_name(None), "harness": harness, "model": model, "profile_id": None}
+            return {"name": self.agent_name(None), "harness": harness, "model": model, "profile_id": None, **caps}
         model = profile.get("model")
         if not model and profile["harness"] == "claude-sdk":
             model = self.defaults.model
-        return {"name": profile["name"], "harness": profile["harness"], "model": model, "profile_id": profile["id"]}
+        return {"name": profile["name"], "harness": profile["harness"], "model": model,
+                "profile_id": profile["id"], **caps}
 
     def label(self, profile: dict[str, Any] | None) -> str:
         """e.g. ``agent: gpt-cheap (openai / gpt-4o-mini)`` or ``agent: claude (claude-sdk / default model)``."""
