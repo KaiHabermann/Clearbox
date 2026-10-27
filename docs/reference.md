@@ -635,8 +635,20 @@ the graph in step with the work. In Claude Code:
 ```
 
 The same works from a shell with `claude plugin marketplace add …` and `claude plugin install …`.
-The server must be running (`clearbox`); without it the skill says so in one line and Claude works
-normally.
+**The plugin starts the server.** Its SessionStart hook runs `clearbox ensure --port <the plugin's
+port>` whenever a session starts. `clearbox ensure [options]` takes the same options as `clearbox`:
+if a Clearbox already answers on the port (it asks `GET /api/health`), it only says so; if something
+else holds the port, it says that and exits with 1; otherwise it starts the server in the
+background with those options, waits until it answers (up to 20 s) and exits. So the first session
+brings the server up, later ones just connect, and the server keeps running after the sessions end.
+It needs `clearbox` on `PATH`; without it the hook fails with a short error and the skill says in
+one line that the tools are missing.
+
+A background server writes its output to `server.log` in the data directory (see
+[Where Clearbox keeps its data](#where-clearbox-keeps-its-data)). To stop it, end the process that
+listens on the port, e.g. on Windows `Get-NetTCPConnection -LocalPort 8765 -State Listen |
+ForEach-Object { Stop-Process -Id $_.OwningProcess }`, elsewhere `kill $(lsof -ti tcp:8765)`. A
+server you start yourself with `clearbox` in a terminal is found by `ensure` like any other.
 
 **Without the plugin**, add the MCP server by hand. For your session tracking its own work, the
 observe endpoint is enough, and its instructions already carry the workflow:

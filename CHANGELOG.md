@@ -11,7 +11,9 @@ All notable changes to Clearbox are recorded here. The format follows
 - **Claude Code plugin.** The repository is a plugin marketplace: `/plugin marketplace add
   KaiHabermann/Clearbox` and `/plugin install clearbox@clearbox` set up the MCP connection and
   the skill that has Claude plan multi-step tasks in Clearbox. The manual `claude mcp add` route
-  still works.
+  still works. The plugin's port is an option (`/config`, default 8765), and the plugin starts
+  the server: its SessionStart hook runs the new `clearbox ensure`, which starts Clearbox in the
+  background unless one already answers on the port (`GET /api/health`).
 - **`/mcp/observe`**, a slim MCP endpoint for a session that tracks its own work: ten tools and
   short self-tracking instructions instead of the full set, and its `submit_plan` starts the plan
   for the session right away. `/mcp` stays for built-in execution, agent profiles and reviews.
