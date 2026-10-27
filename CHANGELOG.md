@@ -6,6 +6,8 @@ All notable changes to Clearbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
 ### Added
 
 - **Claude Code plugin.** The repository is a plugin marketplace: `/plugin marketplace add
@@ -141,7 +143,8 @@ Removed).
   OpenAI-compatible) or claimed by an outside session, with a live browser UI, per-step diffs,
   token counters and optional reviews.
 
-[Unreleased]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/KaiHabermann/Clearbox/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.0...v0.3.1
