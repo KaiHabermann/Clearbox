@@ -429,9 +429,17 @@ export async function triggerNodeReview(planId, nodeId) {
 }
 
 // ----------------------------------------------------------- live feed
+// the serving version, re-read on every (re)connect so an upgraded server shows after its restart
+function loadVersion() {
+  api("/api/health").then((h) => {
+    const v = $("#version");
+    v.textContent = h.version && h.version !== "unknown" ? `v${h.version}` : "";
+    v.title = `Clearbox ${h.version}`;
+  }).catch(() => {});
+}
 function connect() {
   const es = new EventSource("/api/stream");
-  es.addEventListener("hello", () => { $("#conn").className = "conn on"; $("#conn-text").textContent = "live"; loadAgentsSoon(); loadPlans(); });
+  es.addEventListener("hello", () => { $("#conn").className = "conn on"; $("#conn-text").textContent = "live"; loadVersion(); loadAgentsSoon(); loadPlans(); });
   es.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.type === "plan") {
