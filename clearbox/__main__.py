@@ -42,7 +42,9 @@ def build_parser(data_dir: str, legacy: str | None) -> argparse.ArgumentParser:
     env = os.environ.get
     ap = argparse.ArgumentParser(prog="clearbox", description=__doc__,
                                  epilog="clearbox ensure [options]: start a background server with these "
-                                        "options unless one already answers on the port")
+                                        "options unless one already answers on the port. "
+                                        "clearbox stop [--port N]: stop the server on that port. "
+                                        "clearbox restart [options]: stop, then ensure")
     ap.add_argument("--host", default=env("CLEARBOX_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(env("CLEARBOX_PORT", "8765")))
     ap.add_argument("--allowed-host", action="append", metavar="NAME[:PORT]",
@@ -149,13 +151,51 @@ def ensure(argv: list[str], data_dir: str, legacy: str | None, wait: float = 20.
     return 1
 
 
+def stop(argv: list[str], data_dir: str, legacy: str | None, wait: float = 15.0) -> int:
+    """`clearbox stop [--host H] [--port N]`: ask the Clearbox on that port to shut down (as Ctrl+C
+    would) and wait until the port is free. Nothing running is not an error."""
+    args = build_parser(data_dir, legacy).parse_args(argv)
+    host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    state = probe(host, args.port)
+    if state is None:
+        print(f"No Clearbox is running on port {args.port}")
+        return 0
+    if state == "other":
+        print(f"clearbox: port {args.port} is held by something that is not Clearbox; not touching it",
+              file=sys.stderr)
+        return 1
+    try:
+        req = urllib.request.Request(f"http://{host}:{args.port}/api/shutdown", data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=5).close()
+    except urllib.error.HTTPError as e:
+        hint = ("it predates `clearbox stop` (0.4.1); end its process instead" if e.code in (404, 405)
+                else f"it answered {e.code}")
+        print(f"clearbox: could not stop the server on port {args.port}: {hint}", file=sys.stderr)
+        return 1
+    except OSError:
+        pass  # it may close the connection while going down; the wait below decides
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if probe(host, args.port, timeout=0.5) is None:
+            print(f"Stopped Clearbox on port {args.port}")
+            return 0
+        time.sleep(0.25)
+    print(f"clearbox: the server on port {args.port} did not stop within {wait:.0f} s", file=sys.stderr)
+    return 1
+
+
 def main() -> None:
     data_dir = default_data_dir()
     # A database left in the current directory by an older version still wins, so nobody's
     # plans disappear on upgrade. The banner says where the new default lives.
     legacy = os.path.abspath(LEGACY_DB) if os.path.isfile(LEGACY_DB) else None
-    if sys.argv[1:2] == ["ensure"]:
-        sys.exit(ensure(sys.argv[2:], data_dir, legacy))
+    command, argv = sys.argv[1:2], sys.argv[2:]
+    if command == ["ensure"]:
+        sys.exit(ensure(argv, data_dir, legacy))
+    if command == ["stop"]:
+        sys.exit(stop(argv, data_dir, legacy))
+    if command == ["restart"]:  # stop whatever runs on the port, then start it again in the background
+        sys.exit(stop(argv, data_dir, legacy) or ensure(argv, data_dir, legacy))
     args = build_parser(data_dir, legacy).parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

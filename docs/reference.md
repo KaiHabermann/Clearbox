@@ -645,10 +645,11 @@ It needs `clearbox` on `PATH`; without it the hook fails with a short error and 
 one line that the tools are missing.
 
 A background server writes its output to `server.log` in the data directory (see
-[Where Clearbox keeps its data](#where-clearbox-keeps-its-data)). To stop it, end the process that
-listens on the port, e.g. on Windows `Get-NetTCPConnection -LocalPort 8765 -State Listen |
-ForEach-Object { Stop-Process -Id $_.OwningProcess }`, elsewhere `kill $(lsof -ti tcp:8765)`. A
-server you start yourself with `clearbox` in a terminal is found by `ensure` like any other.
+[Where Clearbox keeps its data](#where-clearbox-keeps-its-data)). `clearbox stop [--port N]` stops
+the Clearbox on that port (it asks the server to shut down, as Ctrl+C would, via `POST
+/api/shutdown`, and leaves anything that is not Clearbox alone); `clearbox restart [options]`
+stops it and starts it again in the background, e.g. after an upgrade. A server you start yourself
+with `clearbox` in a terminal is found, stopped and restarted the same way.
 
 **Without the plugin**, add the MCP server by hand. For your session tracking its own work, the
 observe endpoint is enough, and its instructions already carry the workflow:

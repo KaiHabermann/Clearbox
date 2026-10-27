@@ -541,6 +541,15 @@ def create_app(settings: Settings) -> FastAPI:
         # `clearbox ensure` asks this to tell a running Clearbox from something else on the port
         return {"app": "clearbox", "version": _version()}
 
+    @app.post("/api/shutdown")
+    def shutdown() -> dict[str, Any]:
+        # `clearbox stop`: end the server the way Ctrl+C does (the same Host/Origin checks apply)
+        server = getattr(app.state, "server", None)
+        if server is None:
+            raise HTTPException(409, "this server was not started by the clearbox command")
+        server.should_exit = True
+        return {"stopping": True}
+
     @app.get("/api/plans")
     def list_plans() -> list[dict[str, Any]]:
         return [

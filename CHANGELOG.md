@@ -6,6 +6,16 @@ All notable changes to Clearbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-27
+
+### Added
+
+- **`clearbox stop` and `clearbox restart`.** `stop [--port N]` shuts down the Clearbox on that
+  port (through the new `POST /api/shutdown`, the way Ctrl+C would) and leaves anything else
+  alone; `restart [options]` stops it and starts it again in the background. No more hunting
+  for the process of a server the plugin started.
+- **The version in the UI.** The sidebar footer shows the version of the server it talks to.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added
@@ -143,7 +153,8 @@ Removed).
   OpenAI-compatible) or claimed by an outside session, with a live browser UI, per-step diffs,
   token counters and optional reviews.
 
-[Unreleased]: https://github.com/KaiHabermann/Clearbox/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/KaiHabermann/Clearbox/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/KaiHabermann/Clearbox/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/KaiHabermann/Clearbox/compare/v0.3.1...v0.3.2

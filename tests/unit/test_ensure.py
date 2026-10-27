@@ -1,5 +1,6 @@
 """`clearbox ensure`: leave a running Clearbox alone, refuse a port held by something else, and
-otherwise start a background server with the same options and wait until it answers."""
+otherwise start a background server with the same options and wait until it answers.
+`clearbox stop` ends a Clearbox on the port (and only a Clearbox); `restart` is stop, then ensure."""
 
 from __future__ import annotations
 
@@ -96,3 +97,42 @@ def test_real_background_server(tmp_path, monkeypatch):
         for p in procs:
             p.kill()
             p.wait(timeout=10)
+
+
+def test_stop_with_nothing_running(tmp_path, capsys):
+    assert cli.stop(["--port", str(free_port())], str(tmp_path), None) == 0
+    assert "No Clearbox is running" in capsys.readouterr().out
+
+
+def test_stop_leaves_other_servers_alone(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "probe", lambda *a, **k: "other")
+    assert cli.stop(["--port", "9123"], str(tmp_path), None) == 1
+    assert "not touching it" in capsys.readouterr().err
+
+
+def test_real_stop_and_restart(tmp_path, monkeypatch):
+    procs = []
+    real_popen = subprocess.Popen
+
+    def popen(*a, **kw):
+        procs.append(real_popen(*a, **kw))
+        return procs[-1]
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    port = free_port()
+    argv = ["--port", str(port), "--mock", "--max-concurrency", "0",
+            "--db", str(tmp_path / "t.db"), "--workdir", str(tmp_path / "ws")]
+    try:
+        assert cli.ensure(argv, str(tmp_path), None, wait=30) == 0
+        assert cli.stop(["--port", str(port)], str(tmp_path), None) == 0
+        assert cli.probe("127.0.0.1", port) is None
+        procs[0].wait(timeout=15)  # the process itself ended, not just its port
+        # restart = stop (nothing running now) + ensure
+        assert (cli.stop(argv, str(tmp_path), None) or cli.ensure(argv, str(tmp_path), None, wait=30)) == 0
+        assert cli.probe("127.0.0.1", port) == "clearbox" and len(procs) == 2
+        assert cli.stop(["--port", str(port)], str(tmp_path), None) == 0
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=10)
