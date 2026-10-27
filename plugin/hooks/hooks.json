@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clearbox",
+            "args": ["ensure", "--port", "${user_config.port}"],
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

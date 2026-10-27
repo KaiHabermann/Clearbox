@@ -21,9 +21,10 @@ you claim and complete its nodes yourself. Clearbox runs no agents of its own he
   become the first nodes, completed right away with their results.
 - Skip it for questions, explanations, and one-step edits.
 
-The tools come from the Clearbox server, which the user starts with `clearbox` (it serves the UI
-and the MCP endpoint `/mcp/observe` on port ${user_config.port}). If the Clearbox MCP tools are not available (server not
-running), say so once in one line, suggesting `clearbox`, and work normally. Do not stall on it.
+The tools come from the Clearbox server (UI and the MCP endpoint `/mcp/observe` on port
+${user_config.port}). The plugin starts it in the background when a session starts, if `clearbox` is
+installed. If the Clearbox MCP tools are not available anyway, say so once in one line,
+suggesting `clearbox ensure` (or installing clearbox), and work normally. Do not stall on it.
 
 ## Starting a plan
 

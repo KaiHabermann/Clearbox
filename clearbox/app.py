@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import ipaddress
 import json
 import time
@@ -28,6 +29,13 @@ from .mcp_tools import build_mcp
 from .store import CAPABILITIES, PlanError, Store, keys_conflict, public_profile
 
 STATIC = Path(__file__).parent / "static"
+
+
+def _version() -> str:
+    try:
+        return importlib.metadata.version("clearbox")
+    except importlib.metadata.PackageNotFoundError:  # running from a plain checkout
+        return "unknown"
 WILDCARD_HOSTS = ("0.0.0.0", "::", "")
 
 
@@ -527,6 +535,11 @@ def create_app(settings: Settings) -> FastAPI:
             for pid in store.descendant_plans(root_id)
             for n in store.nodes(pid) if engine.waiting_for_user(n)
         ]
+
+    @app.get("/api/health")
+    def health() -> dict[str, Any]:
+        # `clearbox ensure` asks this to tell a running Clearbox from something else on the port
+        return {"app": "clearbox", "version": _version()}
 
     @app.get("/api/plans")
     def list_plans() -> list[dict[str, Any]]:

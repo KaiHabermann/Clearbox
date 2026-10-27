@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import socket
+import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 
 import uvicorn
 
@@ -32,13 +38,11 @@ def default_data_dir() -> str:
     return os.path.join(base, "clearbox")
 
 
-def main() -> None:
+def build_parser(data_dir: str, legacy: str | None) -> argparse.ArgumentParser:
     env = os.environ.get
-    data_dir = default_data_dir()
-    # A database left in the current directory by an older version still wins, so nobody's
-    # plans disappear on upgrade. The banner says where the new default lives.
-    legacy = os.path.abspath(LEGACY_DB) if os.path.isfile(LEGACY_DB) else None
-    ap = argparse.ArgumentParser(prog="clearbox", description=__doc__)
+    ap = argparse.ArgumentParser(prog="clearbox", description=__doc__,
+                                 epilog="clearbox ensure [options]: start a background server with these "
+                                        "options unless one already answers on the port")
     ap.add_argument("--host", default=env("CLEARBOX_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(env("CLEARBOX_PORT", "8765")))
     ap.add_argument("--allowed-host", action="append", metavar="NAME[:PORT]",
@@ -74,7 +78,85 @@ def main() -> None:
                     help="model of the bootstrapped 'openai' profile")
     ap.add_argument("--openai-api-key-env", default="OPENAI_API_KEY", metavar="NAME",
                     help="NAME of the environment variable holding the 'openai' profile's api key")
-    args = ap.parse_args()
+    return ap
+
+
+def probe(host: str, port: int, timeout: float = 1.0) -> str | None:
+    """What answers on host:port: "clearbox", "other" (something that is not Clearbox), or None
+    (nothing listening)."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=timeout) as r:
+            return "clearbox" if json.loads(r.read() or b"{}").get("app") == "clearbox" else "other"
+    except urllib.error.HTTPError:
+        return "other"  # it speaks HTTP, but has no Clearbox health route
+    except (OSError, ValueError):
+        # refused / timed out: nothing there; ValueError: an answer that is not JSON
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return "other"
+        except OSError:
+            return None
+
+
+def ensure(argv: list[str], data_dir: str, legacy: str | None, wait: float = 20.0) -> int:
+    """`clearbox ensure [options]`: make sure a Clearbox server answers on the port, starting one
+    in the background with the same options if none does, and return at once. Run from the Claude
+    Code plugin's SessionStart hook, so the first session brings the server up and later ones just
+    connect; it outlives the session that started it. Prints one line (a hook's output reaches the
+    model's context, so it stays short)."""
+    args = build_parser(data_dir, legacy).parse_args(argv)  # bad options fail here, not in the background
+    host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    url = f"http://{host}:{args.port}/"
+    state = probe(host, args.port)
+    if state == "clearbox":
+        print(f"Clearbox is running: {url}")
+        return 0
+    if state == "other":
+        print(f"clearbox: port {args.port} is taken by something that is not Clearbox; run it on another "
+              f"port (clearbox --port N) and set the plugin's Clearbox port to match", file=sys.stderr)
+        return 1
+    os.makedirs(data_dir, exist_ok=True)
+    log_path = os.path.join(data_dir, "server.log")
+    kw: dict = {}
+    if sys.platform == "win32":
+        # its own process group, no console, and out of the hook's job object so it survives the hook
+        kw["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                               | subprocess.CREATE_BREAKAWAY_FROM_JOB)
+    else:
+        kw["start_new_session"] = True
+    with open(log_path, "ab") as log:
+        cmd = [sys.executable, "-m", "clearbox", *argv]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    cwd=data_dir, **kw)
+        except OSError:
+            if sys.platform != "win32":
+                raise
+            # the job does not allow breaking away: start it anyway, it may then end with the hook
+            kw["creationflags"] &= ~subprocess.CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    cwd=data_dir, **kw)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            print(f"clearbox: the server exited at once (code {proc.returncode}); see {log_path}", file=sys.stderr)
+            return 1
+        if probe(host, args.port, timeout=0.5) == "clearbox":
+            print(f"Started Clearbox in the background: {url} (log: {log_path})")
+            return 0
+        time.sleep(0.25)
+    print(f"clearbox: started, but it did not answer within {wait:.0f} s; see {log_path}", file=sys.stderr)
+    return 1
+
+
+def main() -> None:
+    data_dir = default_data_dir()
+    # A database left in the current directory by an older version still wins, so nobody's
+    # plans disappear on upgrade. The banner says where the new default lives.
+    legacy = os.path.abspath(LEGACY_DB) if os.path.isfile(LEGACY_DB) else None
+    if sys.argv[1:2] == ["ensure"]:
+        sys.exit(ensure(sys.argv[2:], data_dir, legacy))
+    args = build_parser(data_dir, legacy).parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = Settings(
